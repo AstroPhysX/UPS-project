@@ -99,7 +99,7 @@ def line_extract(filename,dflist1,dflist2):
     
     pdf=open(filename,'rb')
     lastpage=PyPDF2.PdfFileReader(pdf).getNumPages()
-    startpage=3
+    startpage=1
     pgrange=str(startpage)+'-'+str(lastpage)
     pdf.close()
     
