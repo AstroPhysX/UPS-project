@@ -4,6 +4,7 @@ import pandas as pd
 import re
 import datetime
 import PyPDF2
+import threading
 
 def check_duplicate_columns(df):
     """
@@ -45,6 +46,17 @@ def export_to_excel(all_lines, filename):
 
     worksheet.add_table(0, 0, max_row, max_col-1, {'columns': column_settings})
     writer.close()
+
+def find_df_with_string(dataframes,string):
+    result = []
+    
+    for df in dataframes:
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            first_row = df.iloc[0]
+            if any(first_row.astype(str).str.contains(string)):
+                result.append(df)
+    
+    return result
 
 def trip_extract(filename,dflist):  
     print("Extracting Trips")
@@ -98,34 +110,55 @@ def line_extract(filename,dflist1,dflist2):
     print("Extracting lines")
     
     pdf=open(filename,'rb')
-    lastpage=PyPDF2.PdfFileReader(pdf).getNumPages()
-    startpage=1
-    pgrange=str(startpage)+'-'+str(lastpage)
+    startpg=2
+    lastpg=PyPDF2.PdfFileReader(pdf).getNumPages()
+    beforelastpg=lastpg-1
+    pgrange=str(startpg)+'-'+str(beforelastpg)
     pdf.close()
     
     print("  Obtained the page range: ",pgrange)
     print("  Reading pdf. Getting Lines this may take a few minutes....")
     
+    tables=[]
     while True:
         try:
-            tables1= camelot.read_pdf(filename,flavor='stream',pages=pgrange,table_areas=['79.6,456,779.7,384.8','79.6,302.0,779.7,230.98','79.6,384.8,779.7,314.0','79.6,230.98,779.7,159.0'],columns=['104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3'],strip_text='--\n')
-            print("  Getting Line info this may take a few minutes....")
-            tables2= camelot.read_pdf(filename,flavor='stream',pages=pgrange,table_areas=['42.4,466,80.5,314.5','42.4,314,80.5,159.0'],strip_text='--\n')
+            extract=camelot.read_pdf(filename,flavor='stream',pages=pgrange,table_areas=['79.6,468,779.7,384.8','42.4,466,80.5,314.5','79.6,313,779.7,230.98','79.6,384.8,779.7,314.0','79.6,230.98,779.7,159.0','42.4,314,80.5,159.0'],columns=['104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','42.4','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','42.4'],strip_text='--\n')
+            for i in range(0,len(extract)):
+                tables.append(extract[i].df)
             break
         except:
-            startpage=startpage+1
-            pgrange=str(startpage)+'-'+str(lastpage)
+            startpg+=1
+            pgrange=str(startpg)+'-'+str(beforelastpg)
             print("  Updated page range:",pgrange)
-    print("  Done reading pdfs")        
+    try:
+        pgrange=str(lastpg)
+        extractlast=camelot.read_pdf(filename,flavor='stream',pages=pgrange,table_areas=['79.6,468,779.7,384.8','42.4,466,80.5,314.5','79.6,313,779.7,230.98','79.6,384.8,779.7,314.0','79.6,230.98,779.7,159.0','42.4,314,80.5,159.0'],columns=['104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','42.4','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','42.4'],strip_text='--\n')
+        for i in range(0,len(extractlast)):
+                tables.append(extractlast[i].df)
+    except:
+        extractlast=camelot.read_pdf(filename,flavor='stream',pages=pgrange,table_areas=['79.6,468,779.7,384.8','42.4,466,80.5,314.5','79.6,384.8,779.7,314.0'],columns=['104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3','42.4','104.6,128.8,152.9,177.1,201.2,225,249.5,273.4,297.6,321.6,345.6,369.8,393.9,418.2,442.1,466.4,490.4,514.3,538.6,562.7,586.8,611,635,659.1,683.4,707.3,731.3'],strip_text='--\n')
+        for i in range(0,len(extractlast)):
+            tables.append(extractlast[i].df)
     
+    print("  Done reading pdfs")        
+    #cut here
     print("  Parsing lines")
-    #Lines
-    for i in range(0,len(tables1),2):
-        if tables1[i].df.iloc[0,0] in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] and tables1[i+1].df.iloc[0,0] in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]:
-            df=pd.concat([tables1[i].df,tables1[i+1].df],axis=1)
+    #Parsing Lines
+    for i in range(0,int(len(tables)),6):
+        
+        no_com_table=tables[i].loc[1:].reset_index(drop=True)
+        
+        if no_com_table.iloc[0,0] in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] and tables[i+2].iloc[0,0] in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]:
+            df=pd.concat([tables[i].loc[1:].reset_index(drop=True),tables[i+2]],axis=1,ignore_index=True)
             dflist1.append(df)
+            try:
+                df=pd.concat([tables[i+3].loc[1:].reset_index(drop=True),tables[i+4]],axis=1,ignore_index=True)
+                dflist1.append(df)
+            except:
+                break
             
     for i in range (0,len(dflist1)):   
+        
         if len(dflist1[i].index)==5:
             empty_row=pd.DataFrame({}, index=[2.5])
             dflist1[i]=pd.concat([dflist1[i].loc[:2],empty_row, dflist1[i].loc[3:]]).reset_index(drop=True)
@@ -134,34 +167,37 @@ def line_extract(filename,dflist1,dflist2):
         dflist1[i].rename(index={0:"Day",1:"Date",2:"trip #",3:"Destination",4:"Time",5:"# Hours"},inplace=True)
     print("  Lines obtained")
     
-    print("  Parsing line info")
-    #lineinfo
-    for i in range(0,len(tables2)):
-        SDF=None
-        CT=None
-        for index, row in tables2[i].df.iterrows():
+    #Paring line info
+    print("  Parsing lineinfo")
+    lineinfo=find_df_with_string(tables,"SDF")
+    PP1=find_df_with_string(tables,"Comment:")
+    
+    for i in range(0,len(lineinfo)):
+        emptydf=pd.DataFrame(columns=["Line #","CT","Comment:"])
+        dflist2.append(emptydf)
+        comment=re.search(r'Comment:(.*)',str(PP1[i].loc[0,0]))
+        
+        for index, row in lineinfo[i].iterrows():
             row_str=' '.join(row.astype(str))
             SDF=re.search(r"SDF  (\d+)",row_str)
             CT=re.search(r"CT: (\d{2}):(\d{2})",row_str)
-        
+            
             if SDF:
-                dflist2.append(pd.DataFrame(columns=["Line #","CT"]))
                 dflist2[i].loc[0,"Line #"]=int(SDF.group(1))
-            
+                dflist2[i].loc[0,"Comment:"]=str(comment.group(1))
             elif CT:
-                h=int(CT.group(1))
-                min=int(CT.group(2))
-            
+                h=float(CT.group(1))
+                min=float(CT.group(2))
+                CT=h + min/60
                 if index>5:
-                    CT2=datetime.timedelta(hours=h, minutes=min)
+                    CT2= CT
                     dflist2[i].loc[0,"CT"]= CT1+CT2
-                
-                CT1=datetime.timedelta(hours=h, minutes=min)
-    print("  Line info Obtained")
+                CT1=CT
+    print("  Lineinfo obtained")
                 
 
-linesfile="A:/Jerome/Python Project/SamplePDFs/2304 Lines.pdf"
-tripsfile="A:/Jerome/Python Project/SamplePDFs/2304 Trips.pdf"
+linesfile="A:/Github Repos/UPS-project/SamplePDFs/2304 Lines.pdf"
+tripsfile="A:/Github Repos/UPS-project/SamplePDFs/2304 Trips.pdf"
 trips=[]
 lines=[]
 lineinfo=[]
