@@ -12,14 +12,14 @@ pdf=open(filename,'rb')
 pagenum=PyPDF2.PdfFileReader(pdf).getNumPages()
 pgrange='1-'+str(pagenum)
 pdf.close()
-pgrange='141'
+pgrange='140'
 #%%
-tables_stream = camelot.read_pdf(filename,pages=pgrange,flavor='stream',table_areas=['13.4,573,390,61','390,573,774,61'],columns=['47.5,92.9,136.1,168.9,196.6,214.7,231.2,249.2,265,288.7,317.5,353.2','443.4,488.9,531.4,565,594.9,613.1,629.1,644.5,663.2,686.2,713.4,749.1'],strip_text='--\n',split_text=True)
+tables_stream = camelot.read_pdf(filename,pages=pgrange,flavor='stream',table_areas=['13.4,573,390,61','390,573,774,61'],columns=['47.5,81.5,123.6,160,187.7,197.1,214.8,230.2,247.1,267,300,333.1','442.6,486,527.9,556.5,583.7,546.8,619.7,635.9,653.5,671.1,704.9,738.7'],strip_text='--\n',split_text=True)
 #tables_lattice = camelot.read_pdf(File,pages='3',process_background=True,strip_text='--\n')
 
 #tables_lattice= camelot.read_pdf(filename,pages=pgrange,strip_text='--\n')
 #tables_stream=camelot.read_pdf(filename,flavor='stream',pages=pgrange,table_areas=['42.4,466,80.5,314.5','42.4,314,80.5,159.0'],strip_text='--\n')
-s=1 
+s=1
 l=0
 print(tables_stream[s].df)
 #print(tables_stream[n].df)
