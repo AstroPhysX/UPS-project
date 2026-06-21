@@ -1,4 +1,5 @@
 #simply run: trips = extract_trips_from_pdf(pdf_path,first_page=2)
+#Working
 import re
 import pdfplumber
 
@@ -245,12 +246,19 @@ def parse_trip_text(text):
         # Block ends with something like:
         # (00)04:09 0h15 Credit 4h13D
         block_end_match = re.match(
-            rf"^(?P<block_end>{TIME_RE})\s+0h15",
+            rf"^(?P<block_end>{TIME_RE})\s+"
+            rf"(?P<ground_time>{DUR_RE})"
+            rf"(?:\s+(?P<after>.*))?$",
             line,
         )
 
         if block_end_match:
-            current_block["end"] = clean_time(block_end_match.group("block_end"))
+            after = block_end_match.group("after") or ""
+
+            # If the word immediately after the duration is Duty,
+            # this is a new block start, not a block end.
+            if not after.startswith("Duty"):
+                current_block["end"] = clean_time(block_end_match.group("block_end"))
 
         flight = parse_flight_line(line)
 
