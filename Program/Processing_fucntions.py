@@ -28,13 +28,13 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
         bid_end = date.fromisoformat(bid_end)
 
     category_base_scores = {
-        "TRIP": 10,
-        "VTO": 1,
-        "RB": 8,
-        "RA": 6,
-        "SB": 4,
-        "SA": 2,
-        "VOR": 0.5,
+        "TRIP": 700,
+        "VTO": 600,
+        "RB": 500,
+        "RA": 400,
+        "SB": 300,
+        "SA": 200,
+        "VOR": 100,
         "UNKNOWN": 0,
     }
 
@@ -161,7 +161,7 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
                 # Treat it as one big clean off block.
                 vto_fixed_score = 60
 
-                pp_scores.append(vto_fixed_score) # Change this line to multiplication if desired
+                pp_scores.append(base_score + vto_fixed_score) # Change this line to multiplication if desired
                 continue
 
             # --------------------------------------------------------
@@ -224,7 +224,7 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
                 + 0.5 * days_between_component
             )
 
-            pp_scores.append(base_score * blockiness_bonus) # Change this line to multiplication if desired
+            pp_scores.append(base_score + blockiness_bonus) # Change this line to multiplication if desired
 
         if pp_scores:
             line["blockiness_score"] = sum(pp_scores) / len(pp_scores)
