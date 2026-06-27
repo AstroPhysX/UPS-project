@@ -372,34 +372,37 @@ def add_training_fit_score(
     bid_end,
     trip_weight=0.80,
     off_edge_weight=0.20,
+    category_base_scores=None,
 ):
     """
-    Adds a training fit score to each line.
+    Adds training_fit_score to each line.
 
-    Higher score = better.
+    Final score:
+        training_fit_score = category_base_score + fit_score
 
-    Main idea:
-        1. Reward training dates that fall on trip days.
-        2. Penalize training dates that fall in the middle of days-off blocks.
-        3. Prefer training that either replaces work or touches the edge of an off block.
+    Category base score:
+        Based on the best/highest category touched by the training dates.
 
-    Date logic:
-        Uses inclusive calendar dates.
-
-        Example:
-            training_start = "2023-06-01"
-            training_end   = "2023-06-03"
-
-        Means:
-            Jun 01, Jun 02, Jun 03
-
-    Adds:
-        line["training_fit_score"]
-
-    Optional debug fields if save_details=True:
-        line["training_trip_overlap_pct"]
-        line["training_off_middle_penalty_pct"]
+    Fit score:
+        0 to 100 score that rewards training replacing work/reserve days
+        and penalizes training falling in the middle of true days-off blocks.
     """
+
+    if category_base_scores is None:
+        category_base_scores = {
+            "TRIP": 700,
+            "VTO": 200,
+            "RB": 600,
+            "RA": 500,
+            "SB": 400,
+            "SA": 300,
+            "VOR": 100,
+            "UNKNOWN": 0,
+        }
+
+    # Codes that should count as "on/work" days for training replacement.
+    # VTO is intentionally excluded because it is time off.
+    work_codes = {"TRIP", "RB", "RA", "SB", "SA", "VOR"}
 
     def date_range_inclusive(start, end):
         current = start
@@ -407,14 +410,88 @@ def add_training_fit_score(
             yield current
             current += timedelta(days=1)
 
-    def build_off_blocks(bid_days, trip_days):
+    def add_day_category(day_categories, day, category):
+        """
+        Saves the highest-value category for a given day.
+
+        Example:
+            If a day somehow has both TRIP and RB,
+            TRIP wins because 700 > 500.
+        """
+        current_category = day_categories.get(day, "UNKNOWN")
+
+        if category_base_scores.get(category, 0) > category_base_scores.get(current_category, 0):
+            day_categories[day] = category
+
+    def get_day_categories_for_line(line):
+        """
+        Builds a dictionary like:
+
+            {
+                date(2023, 7, 6): "TRIP",
+                date(2023, 7, 7): "RB",
+                date(2023, 7, 8): "VTO",
+            }
+
+        True days off will simply not appear and later become UNKNOWN.
+        """
+
+        day_categories = {}
+
+        for pp in line.get("PPs", []):
+            for assignment in pp.get("assignments", []):
+
+                flights = assignment.get("flights")
+
+                # Case 1: real trip
+                if flights:
+                    start_dates = [
+                        to_date(flight["start_date"])
+                        for flight in flights
+                        if flight.get("start_date")
+                    ]
+
+                    end_dates = [
+                        to_date(flight["end_date"])
+                        for flight in flights
+                        if flight.get("end_date")
+                    ]
+
+                    if not start_dates or not end_dates:
+                        continue
+
+                    trip_start = min(start_dates)
+                    trip_end = max(end_dates)
+
+                    for day in date_range_inclusive(trip_start, trip_end):
+                        add_day_category(day_categories, day, "TRIP")
+
+                    continue
+
+                # Case 2: coded assignment such as VTO, RB, RA, SB, SA, VOR
+                code = assignment.get("code")
+                assignment_date = assignment.get("date")
+
+                if code and assignment_date:
+                    code = str(code).strip().upper()
+
+                    if code in category_base_scores:
+                        add_day_category(
+                            day_categories,
+                            to_date(assignment_date),
+                            code,
+                        )
+
+        return day_categories
+
+    def build_off_blocks(bid_days, work_days):
         off_blocks = []
 
         current_start = None
         previous_day = None
 
         for day in sorted(bid_days):
-            is_off_day = day not in trip_days
+            is_off_day = day not in work_days
 
             if is_off_day:
                 if current_start is None:
@@ -433,41 +510,6 @@ def add_training_fit_score(
 
         return off_blocks
 
-    def get_trip_days_for_line(line):
-        trip_days = set()
-
-        for pp in line.get("PPs", []):
-            for assignment in pp.get("assignments", []):
-
-                flights = assignment.get("flights")
-
-                # Skip VTO, VOR, RA, RB, SA, SB, etc.
-                if not flights:
-                    continue
-
-                start_dates = [
-                    to_date(flight["start_date"])
-                    for flight in flights
-                    if flight.get("start_date")
-                ]
-
-                end_dates = [
-                    to_date(flight["end_date"])
-                    for flight in flights
-                    if flight.get("end_date")
-                ]
-
-                if not start_dates or not end_dates:
-                    continue
-
-                trip_start = min(start_dates)
-                trip_end = max(end_dates)
-
-                for day in date_range_inclusive(trip_start, trip_end):
-                    trip_days.add(day)
-
-        return trip_days
-
     training_start = to_date(training_start)
     training_end = to_date(training_end)
     bid_start = to_date(bid_start)
@@ -481,30 +523,51 @@ def add_training_fit_score(
 
     training_days = list(date_range_inclusive(training_start, training_end))
     bid_days = set(date_range_inclusive(bid_start, bid_end))
-
     training_total_days = len(training_days)
 
     for line_num, line in master_lines.items():
 
-        trip_days = get_trip_days_for_line(line)
+        day_categories = get_day_categories_for_line(line)
 
-        # 1. Reward training that overlaps trips
-        training_trip_days = [
-            day for day in training_days
-            if day in trip_days
+        # Determine the category for each training day.
+        training_day_categories = [
+            day_categories.get(day, "UNKNOWN")
+            for day in training_days
         ]
 
-        trip_overlap_pct = (
-            len(training_trip_days) / training_total_days
+        # Pick the best/highest category touched during training.
+        best_training_category = max(
+            training_day_categories,
+            key=lambda category: category_base_scores.get(category, 0),
+        )
+
+        category_base_score = category_base_scores.get(best_training_category, 0)
+
+        # Work days are TRIP, RB, RA, SB, SA, VOR.
+        # VTO and UNKNOWN are treated as off days.
+        work_days = {
+            day
+            for day, category in day_categories.items()
+            if category in work_codes
+        }
+
+        # 1. Reward training that overlaps work/reserve days.
+        training_work_days = [
+            day for day in training_days
+            if day in work_days
+        ]
+
+        work_overlap_pct = (
+            len(training_work_days) / training_total_days
         ) * 100
 
-        # 2. Look at training days that fall on days off
+        # 2. Penalize training that falls in the middle of true days-off blocks.
         training_off_days = [
             day for day in training_days
-            if day not in trip_days
+            if day not in work_days
         ]
 
-        off_blocks = build_off_blocks(bid_days, trip_days)
+        off_blocks = build_off_blocks(bid_days, work_days)
 
         off_day_to_block = {}
 
@@ -517,8 +580,6 @@ def add_training_fit_score(
         for day in training_off_days:
             block = off_day_to_block.get(day)
 
-            # If the training day is outside the bid period,
-            # treat it as a bad off-day placement.
             if block is None:
                 middle_penalty_values.append(1.0)
                 continue
@@ -534,11 +595,9 @@ def add_training_fit_score(
             days_from_right_edge = (block_end - day).days
 
             edge_distance = min(days_from_left_edge, days_from_right_edge)
-
             max_possible_edge_distance = (block_length - 1) / 2
 
             middle_penalty = edge_distance / max_possible_edge_distance
-
             middle_penalty_values.append(middle_penalty)
 
         if middle_penalty_values:
@@ -550,12 +609,12 @@ def add_training_fit_score(
 
         off_edge_score = 100 - off_middle_penalty_pct
 
-        training_fit_score = (
-            trip_weight * trip_overlap_pct
+        fit_score = (
+            trip_weight * work_overlap_pct
             + off_edge_weight * off_edge_score
         )
 
-        line["training_fit_score"] = round(training_fit_score, 1)
+        line["training_fit_score"] = round(category_base_score + fit_score, 1)
 
 
 
@@ -615,9 +674,8 @@ def count_days_off_around_date(assignments, target_date, before_or_after, bid_st
             assignment_date = to_date(assignment["date"])
             code = assignment.get("code")
 
-            # VTO is treated as a day off.
-            # Other codes are treated as not off.
-            if code != "VTO":
+            # RA, RB, SA, SB, VOR, VTO, etc. are not counted as normal days off.
+            if code is not None:
                 busy_dates.add(assignment_date)
 
     if before_or_after == "before":
