@@ -577,7 +577,7 @@ def get_output_file_from_user_or_saved(config, extension=".xlsx"):
     filename = prompt_output_filename()
     output_folder = prompt_output_folder(config)
 
-    output_file = output_folder / f"{filename}"
+    output_file = output_folder / f"{filename}{extension}"
 
     return str(output_file)
 
@@ -601,7 +601,7 @@ def main():
             print("Please wait for PDF Extraction to complete, this may take a few minutes.....")
 
         lines = extracted_lines.result()
-        trips = extracted_lines.result()
+        trips = extracted_trips.result()
     
     bid_period_info = {x: lines[x] for x in ('bid_period_date_range','pay_period_date_ranges')}
 
@@ -611,7 +611,8 @@ def main():
     pf.add_company_ticket_percentages(master_lines)
     new_vacation_range = pf.add_vacation_days_off_score(master_lines,vacation_ranges,bid_period_info,save_details=False)
     pf.add_training_fit_score(master_lines,training_start,training_end,bid_period_info)
-    pf.add_bid_edge_days_off(master_lines, bid_period_info,edge=bid_period_DO_preference)
+    if bid_period_DO_preference is not "none":
+        pf.add_bid_edge_days_off(master_lines, bid_period_info,edge=bid_period_DO_preference)
 
     df = master_lines_to_dataframe(master_lines,bid_period_info)
 
@@ -620,6 +621,8 @@ def main():
     df = sort_dataframe_by_conditions(df, sort_order)
 
     output_path = get_output_file_from_user_or_saved(config)
+
+    print(output_path)
 
     export_master_lines_to_excel_table(df,output_path, training_start=training_start, training_end=training_end, vacation_ranges=new_vacation_range)
 

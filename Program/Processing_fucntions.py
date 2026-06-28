@@ -91,7 +91,7 @@ def add_blockiness_scores(master_lines, bid_period_info):
                     for flight in assignment["flights"]:
                         start_dates.append(date.fromisoformat(flight["start_date"]))
                         end_dates.append(date.fromisoformat(flight["end_date"]))
-
+                    
                     trip_start = min(start_dates)
                     trip_end = max(end_dates)
 

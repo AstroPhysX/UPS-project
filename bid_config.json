@@ -6,5 +6,34 @@
         }
     ],
     "training_start": "2023-07-10",
-    "training_end": "2023-07-15"
+    "training_end": "2023-07-15",
+    "sort_order": [
+        [
+            "Extra Vacation Days",
+            "desc"
+        ],
+        [
+            "Training",
+            "desc"
+        ],
+        [
+            "Blockiness",
+            "desc"
+        ],
+        [
+            "Total DO",
+            "desc"
+        ],
+        [
+            "% tickets paid",
+            "desc"
+        ],
+        [
+            "Total CT",
+            "desc"
+        ]
+    ],
+    "output_paths": {
+        "Linux": "/home/aleluc/Github_repos/UPS-project"
+    }
 }
