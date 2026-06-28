@@ -42,6 +42,7 @@
         ]
     ],
     "output_paths": {
-        "Linux": "/home/aleluc/Github_repos/UPS-project"
+        "Linux": "/home/aleluc/Github_repos/UPS-project",
+        "Windows": "A:\\Github Repos\\Personal Projects\\UPS-project"
     }
 }

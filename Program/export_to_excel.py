@@ -50,6 +50,40 @@ def export_master_lines_to_excel_table(
 
     df = df.copy()
 
+    def make_unique_excel_headers(headers):
+        """
+        Excel tables need valid, unique string headers.
+        This avoids Excel repair/removing the table.
+        """
+
+        used = set()
+        result = []
+
+        for idx, header in enumerate(headers, start=1):
+            if header is None:
+                base = f"Column{idx}"
+            else:
+                base = str(header).strip()
+
+            if base == "":
+                base = f"Column{idx}"
+
+            # Excel table headers should not be excessively long
+            base = base[:240]
+
+            candidate = base
+            counter = 2
+
+            while candidate in used:
+                suffix = f"_{counter}"
+                candidate = f"{base[:240 - len(suffix)]}{suffix}"
+                counter += 1
+
+            used.add(candidate)
+            result.append(candidate)
+
+        return result
+
     def normalize_date(value):
         if value is None or value == "":
             return None
@@ -176,22 +210,31 @@ def export_master_lines_to_excel_table(
         }
 
     # Rename calendar columns to visible headers like "Wed, May 27".
-    new_columns = []
-    display_header_to_date = {}
+    # Also keep a map from the final visible Excel header back to the real date.
+    preliminary_columns = []
+    date_by_column_position = {}
 
-    for col in df.columns:
+    for idx, col in enumerate(df.columns):
         col_date = normalize_date(col)
 
         if col_date in calendar_date_set:
             display_header = format_calendar_header(col_date)
-
-            new_columns.append(display_header)
-            display_header_to_date[display_header] = col_date
+            preliminary_columns.append(display_header)
+            date_by_column_position[idx] = col_date
         else:
-            new_columns.append(str(col))
+            preliminary_columns.append(col)
 
-    df.columns = new_columns
+    # This is important for Excel tables.
+    # It guarantees every header is a unique string.
+    final_columns = make_unique_excel_headers(preliminary_columns)
 
+    display_header_to_date = {}
+
+    for idx, final_header in enumerate(final_columns):
+        if idx in date_by_column_position:
+            display_header_to_date[final_header] = date_by_column_position[idx]
+
+    df.columns = final_columns
     # Write DataFrame
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -221,8 +264,6 @@ def export_master_lines_to_excel_table(
     tab.tableStyleInfo = style
     ws.add_table(tab)
 
-    # Helps some spreadsheet programs recognize the filterable range.
-    ws.auto_filter.ref = table_ref
 
     # Fills
     green_fill = PatternFill(
