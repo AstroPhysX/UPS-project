@@ -235,6 +235,14 @@ def build_master_assignment(assignment, trips):
         "flights": flight_records
     }
 
+def minutes_to_decimal_hours(total_minutes, decimals=2):
+    """
+    Converts:
+        4350 -> 72.5
+        2559 -> 42.65
+    """
+    return round(total_minutes / 60, decimals)
+
 def hhmm_to_minutes(value):
     """
     Converts:
@@ -259,47 +267,63 @@ def minutes_to_hhmm(total_minutes):
 
 def creating_master_line(trips, lines):
     master_lines = {}
-    for line in lines['lines']:
-        
+
+    for line in lines["lines"]:
+
         total_BT_minutes = 0
         total_CT_minutes = 0
         total_DD = 0
         total_DO = 0
         total_premium = 0.0
 
-        line_num = line['line_number']
-        master_lines[line_num] = {'tot_BT':None, 'tot_CT':None, 'tot_DD':None, 'tot_DO':None, 'tot_Premium':None, 'PPs':[]}
+        line_num = line["line_number"]
+
+        master_lines[line_num] = {
+            "tot_BT": None,
+            "tot_CT": None,
+            "tot_DD": None,
+            "tot_DO": None,
+            "tot_Premium": None,
+            "PPs": []
+        }
 
         for pp in line["pay_periods"]:
+            pp_DD = int(pp.get("DD") or 0)
+
+            if pp.get("DO") is None:
+                pp_DO = 28 - pp_DD
+            else:
+                pp_DO = int(pp.get("DO"))
+
             total_BT_minutes += hhmm_to_minutes(pp.get("BT"))
             total_CT_minutes += hhmm_to_minutes(pp.get("CT"))
-            total_DD += int(pp.get("DD"))
-            total_DO += int(pp.get("DO") if pp.get("DO") is not None else (28-int(pp.get("DD"))))
+            total_DD += pp_DD
+            total_DO += pp_DO
 
             master_pp = {
                 "pp": pp.get("pp"),
                 "BT": pp.get("BT"),
                 "CT": pp.get("CT"),
-                "DD": int(pp.get("DD")),
-                "DO": pp.get("DO") if pp.get("DO") is not None else (28-int(pp.get("DD"))),
+                "DD": pp_DD,
+                "DO": pp_DO,
                 "assignments": []
             }
 
             for assignment in pp["assignments"]:
                 master_assignment = build_master_assignment(assignment, trips)
                 master_pp["assignments"].append(master_assignment)
-                
-                if "premium" in master_assignment:
-                    total_premium += float(master_assignment.get("premium"))
+
+                premium = master_assignment.get("premium")
+
+                if premium is not None:
+                    total_premium += float(premium)
 
             master_lines[line_num]["PPs"].append(master_pp)
 
-        master_lines[line_num]["tot_BT"] = minutes_to_hhmm(total_BT_minutes)
-        master_lines[line_num]["tot_BT_mins"] = total_BT_minutes
-        master_lines[line_num]["tot_CT"] = minutes_to_hhmm(total_CT_minutes)
-        master_lines[line_num]["tot_CT_mins"] = total_CT_minutes
+        master_lines[line_num]["tot_BT"] = minutes_to_decimal_hours(total_BT_minutes)
+        master_lines[line_num]["tot_CT"] = minutes_to_decimal_hours(total_CT_minutes)
         master_lines[line_num]["tot_DD"] = total_DD
         master_lines[line_num]["tot_DO"] = total_DO
         master_lines[line_num]["tot_Premium"] = total_premium
-    
+
     return master_lines

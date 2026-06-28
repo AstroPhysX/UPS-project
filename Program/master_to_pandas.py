@@ -260,13 +260,27 @@ def _to_date(value):
 
 def master_lines_to_dataframe(
     master_lines,
-    bid_start,
-    bid_end,
+    bid_period_info,
     *,
-    off_value="",
     date_col_format="%Y-%m-%d",
+    start_bid_off = False,
+    end_bid_off = False,
 ):
+
+    bid_start = bid_period_info["bid_period_date_range"]["start"]
+    bid_end = bid_period_info["bid_period_date_range"]["end"]
     bid_dates = _date_range_inclusive(bid_start, bid_end)
+
+    include_start_bid_off = start_bid_off or any(
+        "bid_start_days_off" in line_data
+        for line_data in master_lines.values()
+    )
+
+    include_end_bid_off = end_bid_off or any(
+        "bid_end_days_off" in line_data
+        for line_data in master_lines.values()
+    )
+
     rows = []
 
     for line_number, line_data in master_lines.items():
@@ -274,7 +288,7 @@ def master_lines_to_dataframe(
         date_values = build_line_calendar_values(
             line_data,
             bid_dates,
-            off_value=off_value,
+            off_value="",
         )
         
         row = {
@@ -292,8 +306,16 @@ def master_lines_to_dataframe(
             "Blockiness": line_data.get("blockiness_score", 0),
             "Total DO": line_data.get("tot_DO", 0),
             "% tickets paid": line_data.get("company_ticket_pct", 0),
-            "Premium": line_data.get("tot_Premium", line_data.get("tot_premium", 0)),
+            "Total CT": line_data.get("tot_CT",0),
+            "Premium": int(line_data.get("tot_Premium", line_data.get("tot_premium", 0))),
         })
+
+        if include_start_bid_off:
+            row.update({"Start bid off":line_data.get("bid_start_days_off",0)})
+        
+        if include_end_bid_off:
+            row.update({"End bid off":line_data.get("bid_end_days_off",0)})
+
         """
         row = {
             "Line Number": line_number,
@@ -311,7 +333,6 @@ def master_lines_to_dataframe(
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values("Line Number").reset_index(drop=True)
-
 
 
 def sort_dataframe_by_conditions(

@@ -1,0 +1,10 @@
+{
+    "vacation_ranges": [
+        {
+            "start": "2023-06-10",
+            "end": "2023-06-20"
+        }
+    ],
+    "training_start": "2023-07-10",
+    "training_end": "2023-07-15"
+}

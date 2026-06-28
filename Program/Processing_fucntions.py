@@ -1,11 +1,32 @@
 from datetime import date, datetime, timedelta
 import re
 
-def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
+def add_blockiness_scores(master_lines, bid_period_info):
     """
     Adds one top-level key to each line:
 
         line["blockiness_score"]
+
+    Uses bid_period_info instead of bid_start / bid_end.
+
+    bid_period_info format:
+
+        {
+            "bid_period_date_range": {
+                "start": "2023-05-21",
+                "end": "2023-07-16"
+            },
+            "pay_period_date_ranges": {
+                "PP1": {
+                    "start": "2023-05-21",
+                    "end": "2023-06-17"
+                },
+                "PP2": {
+                    "start": "2023-06-18",
+                    "end": "2023-07-15"
+                }
+            }
+        }
 
     Scoring:
         - Each PP gets its own score.
@@ -15,17 +36,11 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
         TRIP > VTO > RB > RA > SB > SA > VOR
 
     Method:
-        PP score = category_base_score + blockiness_bonus
-
-    The category base keeps your preference order dominant.
-    The blockiness bonus ranks lines within the same category.
+        PP score = category_multiplier * blockiness_bonus
+        except VTO, which currently uses a fixed score.
     """
 
-    if isinstance(bid_start, str):
-        bid_start = date.fromisoformat(bid_start)
-
-    if isinstance(bid_end, str):
-        bid_end = date.fromisoformat(bid_end)
+    pay_period_ranges = bid_period_info["pay_period_date_ranges"]
 
     category_base_scores = {
         "TRIP": 700,
@@ -47,17 +62,23 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
 
         for pp_index, pp in enumerate(line["PPs"]):
 
-            pp_start = bid_start + timedelta(days=pp_index * pp_length_days)
-            pp_end = pp_start + timedelta(days=pp_length_days - 1)
+            # --------------------------------------------------------
+            # 1. Get PP date range from bid_period_info
+            # --------------------------------------------------------
+            pp_name = pp.get("pp", f"PP{pp_index + 1}")
 
-            if pp_end > bid_end:
-                pp_end = bid_end
+            if pp_name not in pay_period_ranges:
+                pp_scores.append(0)
+                continue
+
+            pp_start = date.fromisoformat(pay_period_ranges[pp_name]["start"])
+            pp_end = date.fromisoformat(pay_period_ranges[pp_name]["end"])
 
             trip_blocks = []
             code_dates = {}
 
             # --------------------------------------------------------
-            # 1. Read assignments using your actual master_lines format
+            # 2. Read assignments using your actual master_lines format
             # --------------------------------------------------------
             for assignment in pp["assignments"]:
 
@@ -89,7 +110,7 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
                     code_dates.setdefault(code, []).append(code_date)
 
             # --------------------------------------------------------
-            # 2. Determine PP category and work blocks
+            # 3. Determine PP category and work blocks
             # --------------------------------------------------------
             if trip_blocks:
                 pp_category = "TRIP"
@@ -121,8 +142,6 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
                     all_code_work_dates = sorted(set(all_code_work_dates))
 
                     # Group consecutive code dates into blocks.
-                    # Example:
-                    #   Jun 01, Jun 02, Jun 03 becomes one 3-day block.
                     if all_code_work_dates:
                         block_start = all_code_work_dates[0]
                         previous_date = all_code_work_dates[0]
@@ -154,7 +173,7 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
             base_score = category_base_scores.get(pp_category, 0)
 
             # --------------------------------------------------------
-            # 3. Special handling for VTO
+            # 4. Special handling for VTO
             # --------------------------------------------------------
             if pp_category == "VTO":
                 # VTO usually covers the whole PP.
@@ -165,7 +184,7 @@ def add_blockiness_scores(master_lines, bid_start, bid_end, pp_length_days=28):
                 continue
 
             # --------------------------------------------------------
-            # 4. Calculate blockiness bonus
+            # 5. Calculate blockiness bonus
             # --------------------------------------------------------
             work_blocks.sort(key=lambda block: block["start_date"])
 
@@ -350,7 +369,6 @@ def add_company_ticket_percentages(master_lines):
 
         line["company_ticket_pct"] = line_ticket_pct
 
-from datetime import date, datetime, timedelta
 
 def to_date(value):
     if isinstance(value, datetime):
@@ -368,8 +386,7 @@ def add_training_fit_score(
     master_lines,
     training_start,
     training_end,
-    bid_start,
-    bid_end,
+    bid_period_info,
     trip_weight=0.80,
     off_edge_weight=0.20,
     category_base_scores=None,
@@ -512,8 +529,8 @@ def add_training_fit_score(
 
     training_start = to_date(training_start)
     training_end = to_date(training_end)
-    bid_start = to_date(bid_start)
-    bid_end = to_date(bid_end)
+    bid_start = to_date(bid_period_info['bid_period_date_range']['start'])
+    bid_end = to_date(bid_period_info['bid_period_date_range']['end'])
 
     if training_end < training_start:
         raise ValueError("training_end must be on or after training_start")
@@ -914,9 +931,6 @@ def add_vacation_days_off_score(
             if save_details:
                 line_data[f"{score_field}_details"] = None
     return new_vacation_ranges
-
-from datetime import date, datetime, timedelta
-
 
 def add_bid_edge_days_off(
     master_lines,
