@@ -697,6 +697,14 @@ def count_days_off_around_date(assignments, target_date, before_or_after, bid_st
     return days_off
 
 
+def get_all_assignments(line_data):
+    assignments = []
+
+    for pp in line_data.get("PPs", []):
+        assignments.extend(pp.get("assignments", []))
+
+    return assignments
+
 
 def add_vacation_days_off_score(
     master_lines,
@@ -744,14 +752,6 @@ def add_vacation_days_off_score(
 
     def range_length(date_range):
         return (date_range["end"] - date_range["start"]).days + 1
-
-    def get_all_assignments(line_data):
-        assignments = []
-
-        for pp in line_data.get("PPs", []):
-            assignments.extend(pp.get("assignments", []))
-
-        return assignments
 
     def merge_blocks(blocks):
         """
@@ -843,6 +843,14 @@ def add_vacation_days_off_score(
 
     protected_blocks = merge_blocks(protected_blocks)
 
+    new_vacation_ranges = [
+        {
+            "start": block["start"].isoformat(),
+            "end": block["end"].isoformat(),
+        }
+        for block in protected_blocks
+    ]
+
     for line_num, line_data in master_lines.items():
         assignments = get_all_assignments(line_data)
 
@@ -905,3 +913,69 @@ def add_vacation_days_off_score(
 
             if save_details:
                 line_data[f"{score_field}_details"] = None
+    return new_vacation_ranges
+
+from datetime import date, datetime, timedelta
+
+
+def add_bid_edge_days_off(
+    master_lines,
+    bid_period_info,
+    edge="both",
+    start_field="bid_start_days_off",
+    end_field="bid_end_days_off",
+):
+    """
+    Adds days-off counts at the start and/or end of the bid period.
+
+    Uses count_days_off_around_date().
+
+    Parameters:
+        master_lines:
+            Dictionary of master lines.
+
+        bid_period_info:
+            Dictionary containing:
+                bid_period_info["bid_period_date_range"]["start"]
+                bid_period_info["bid_period_date_range"]["end"]
+
+        edge:
+            "start", "end", or "both"
+
+        start_field:
+            Field name saved in each line for days off at bid start.
+
+        end_field:
+            Field name saved in each line for days off at bid end.
+
+    Returns:
+        master_lines, modified in place.
+    """
+
+    if edge not in {"start", "end", "both"}:
+        raise ValueError("edge must be 'start', 'end', or 'both'")
+
+    bid_start = to_date(bid_period_info["bid_period_date_range"]["start"])
+    bid_end = to_date(bid_period_info["bid_period_date_range"]["end"])
+
+    for line_number, line_data in master_lines.items():
+
+        assignments = get_all_assignments(line_data)
+
+        if edge in {"start", "both"}:
+            line_data[start_field] = count_days_off_around_date(
+                assignments=assignments,
+                target_date=bid_start - timedelta(days=1),
+                before_or_after="after",
+                bid_start=bid_start,
+                bid_end=bid_end,
+            )
+
+        if edge in {"end", "both"}:
+            line_data[end_field] = count_days_off_around_date(
+                assignments=assignments,
+                target_date=bid_end + timedelta(days=1),
+                before_or_after="before",
+                bid_start=bid_start,
+                bid_end=bid_end,
+            )
