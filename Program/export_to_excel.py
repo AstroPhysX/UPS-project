@@ -1,10 +1,10 @@
 import re
 import pandas as pd
 from copy import copy
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Border, Side, Alignment
+from openpyxl.styles import PatternFill, Border, Side, Alignment, Font
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
 
@@ -13,8 +13,8 @@ def export_master_lines_to_excel_table(
     df,
     output_path,
     *,
-    sheet_name="Lines",
-    table_name="LinesTable",
+    sheet_name="Master Lines",
+    table_name="MasterLinesTable",
     calendar_cols=None,
     training_start=None,
     training_end=None,
@@ -31,21 +31,21 @@ def export_master_lines_to_excel_table(
     Calendar formatting:
         - Calendar headers are displayed like: Wed, May 27
         - Any non-empty calendar cell is highlighted green.
-        - Training start date gets thick red LEFT border.
-        - Training end date gets thick red RIGHT border.
-        - Vacation start date gets thick royal blue LEFT border.
-        - Vacation end date gets thick royal blue RIGHT border.
+        - Training start date gets thick solid red LEFT border.
+        - Training end date gets dashed red RIGHT border.
+        - Vacation start date gets thick solid royal blue LEFT border.
+        - Vacation end date gets dashed royal blue RIGHT border.
+        - Vacation date headers are royal blue.
+        - Training date headers are red.
+        - Training header color wins if it overlaps vacation.
         - Calendar columns all get the same fixed width.
-        - Rows all get the same fixed height.
+        - Data rows all get the same fixed height.
 
-    vacation_ranges:
-        Can be:
-            [("2026-08-02", "2026-08-08")]
-        or:
-            [
-                ("2026-08-02", "2026-08-08"),
-                ("2026-08-16", "2026-08-22"),
-            ]
+    vacation_ranges format:
+        vacation_ranges=[
+            {"start": "2023-05-01", "end": "2023-05-21"},
+            {"start": "2023-06-01", "end": "2023-06-08"},
+        ]
     """
 
     df = df.copy()
@@ -79,19 +79,11 @@ def export_master_lines_to_excel_table(
 
     def normalize_date_ranges(ranges):
         """
-        Accepts vacation ranges in either format:
+        Accepts:
+            [{"start": "2023-05-01", "end": "2023-05-21"}]
 
-            vacation_ranges=[
-                {"start": "2023-05-01", "end": "2023-05-21"},
-                {"start": "2023-06-01", "end": "2023-06-08"},
-            ]
-
-        Also still accepts the older tuple format:
-
-            vacation_ranges=[
-                ("2023-05-01", "2023-05-21"),
-                ("2023-06-01", "2023-06-08"),
-            ]
+        Also accepts:
+            [("2023-05-01", "2023-05-21")]
         """
 
         if not ranges:
@@ -100,11 +92,9 @@ def export_master_lines_to_excel_table(
         normalized = []
 
         for item in ranges:
-
             if isinstance(item, dict):
                 start = item.get("start")
                 end = item.get("end")
-
             else:
                 try:
                     start, end = item
@@ -164,11 +154,14 @@ def export_master_lines_to_excel_table(
             horizontal=copy(old.horizontal),
         )
 
+    def date_in_any_range(d, ranges):
+        return any(start <= d <= end for start, end in ranges)
+
     training_start = normalize_date(training_start)
     training_end = normalize_date(training_end)
     vacation_ranges = normalize_date_ranges(vacation_ranges)
 
-    # Determine which DataFrame columns are calendar columns.
+    # Determine calendar columns.
     if calendar_cols is None:
         calendar_date_set = {
             normalize_date(col)
@@ -182,10 +175,8 @@ def export_master_lines_to_excel_table(
             if normalize_date(col) is not None
         }
 
-    # Rename calendar columns to visible Excel headers like "Wed, May 27".
-    # Also keep an internal map from real date -> displayed header.
+    # Rename calendar columns to visible headers like "Wed, May 27".
     new_columns = []
-    date_to_display_header = {}
     display_header_to_date = {}
 
     for col in df.columns:
@@ -195,7 +186,6 @@ def export_master_lines_to_excel_table(
             display_header = format_calendar_header(col_date)
 
             new_columns.append(display_header)
-            date_to_display_header[col_date] = display_header
             display_header_to_date[display_header] = col_date
         else:
             new_columns.append(str(col))
@@ -214,14 +204,14 @@ def export_master_lines_to_excel_table(
 
     ws.freeze_panes = "A2"
 
-    # Create real Excel Table
+    # Create Excel table
     table_name = sanitize_table_name(table_name)
     table_ref = f"A1:{get_column_letter(max_col)}{max_row}"
 
     tab = Table(displayName=table_name, ref=table_ref)
 
     style = TableStyleInfo(
-        name=table_style,          # TableStyleLight9
+        name=table_style,  # TableStyleLight9
         showFirstColumn=False,
         showLastColumn=False,
         showRowStripes=True,
@@ -234,22 +224,49 @@ def export_master_lines_to_excel_table(
     # Helps some spreadsheet programs recognize the filterable range.
     ws.auto_filter.ref = table_ref
 
+    # Fills
     green_fill = PatternFill(
         fill_type="solid",
         fgColor="FFC6EFCE",
     )
 
-    thick_red = Side(
-        style="thick",
-        color="FFFF0000",
+    vacation_header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="FF800080",  # Royal blue
     )
 
-    royal_blue = Side(
-        style="thick",
-        color="FF4169E1",  # Royal Blue
+    training_header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="FFFFA500",  # Red
     )
 
-    # Build real-date -> Excel column index map from the displayed headers.
+    white_bold_font = Font(
+        color="FFFFFFFF",
+        bold=True,
+    )
+
+    # Borders
+    training_start_side = Side(
+        style="thick",
+        color="FFFFA500",
+    )
+
+    training_end_side = Side(
+        style="mediumDashed",
+        color="FFFFA500",
+    )
+
+    vacation_start_side = Side(
+        style="thick",
+        color="FF800080",
+    )
+
+    vacation_end_side = Side(
+        style="mediumDashed",
+        color="FF800080",
+    )
+
+    # Build real-date -> Excel column index map.
     date_to_excel_col = {}
 
     for col_idx in range(1, max_col + 1):
@@ -261,10 +278,17 @@ def export_master_lines_to_excel_table(
 
     calendar_excel_cols = set(date_to_excel_col.values())
 
-    # Fixed header row height
+    if date_to_excel_col:
+        first_bid_date = min(date_to_excel_col)
+        last_bid_date = max(date_to_excel_col)
+    else:
+        first_bid_date = None
+        last_bid_date = None
+
+    # Header row height
     ws.row_dimensions[1].height = header_row_height
 
-    # Header formatting
+    # Basic header formatting
     for cell in ws[1]:
         cell.alignment = Alignment(
             horizontal="center",
@@ -272,8 +296,8 @@ def export_master_lines_to_excel_table(
             wrap_text=True,
         )
 
-    # Fixed row height for all data rows.
-    # Note: Excel row height applies to the entire row, not only calendar cells.
+    # Fixed row height for data rows.
+    # Excel row height applies to the whole row.
     for row in range(2, max_row + 1):
         ws.row_dimensions[row].height = calendar_row_height
 
@@ -294,48 +318,95 @@ def export_master_lines_to_excel_table(
                 wrap_text=True,
             )
 
-    # Training start: thick red LEFT border
+    # Color vacation headers royal blue
+    for d, excel_col in date_to_excel_col.items():
+        if date_in_any_range(d, vacation_ranges):
+            header_cell = ws.cell(row=1, column=excel_col)
+            header_cell.fill = vacation_header_fill
+            header_cell.font = white_bold_font
+
+    # Color training headers red.
+    # This is done after vacation so training wins if there is overlap.
+    if training_start is not None and training_end is not None:
+        start = min(training_start, training_end)
+        end = max(training_start, training_end)
+
+        for d, excel_col in date_to_excel_col.items():
+            if start <= d <= end:
+                header_cell = ws.cell(row=1, column=excel_col)
+                header_cell.fill = training_header_fill
+                header_cell.font = white_bold_font
+
+    # Training start: thick solid red LEFT border
     if training_start in date_to_excel_col:
         excel_col = date_to_excel_col[training_start]
 
         for row in range(1, max_row + 1):
             add_border_side(
                 ws.cell(row=row, column=excel_col),
-                left=thick_red,
+                left=training_start_side,
             )
 
-    # Training end: thick red RIGHT border
+    # Training end: dashed red RIGHT border
     if training_end in date_to_excel_col:
         excel_col = date_to_excel_col[training_end]
 
         for row in range(1, max_row + 1):
             add_border_side(
                 ws.cell(row=row, column=excel_col),
-                right=thick_red,
+                right=training_end_side,
             )
 
-    # Vacation start/end borders
+    # Vacation start/end borders inside the bid period
     for vacation_start, vacation_end in vacation_ranges:
 
-        # Vacation start: thick royal blue LEFT border
+        # Vacation start inside bid period:
+        # thick solid royal blue LEFT border
         if vacation_start in date_to_excel_col:
             excel_col = date_to_excel_col[vacation_start]
 
             for row in range(1, max_row + 1):
                 add_border_side(
                     ws.cell(row=row, column=excel_col),
-                    left=royal_blue,
+                    left=vacation_start_side,
                 )
 
-        # Vacation end: thick royal blue RIGHT border
+        # Vacation end inside bid period:
+        # dashed royal blue RIGHT border
         if vacation_end in date_to_excel_col:
             excel_col = date_to_excel_col[vacation_end]
 
             for row in range(1, max_row + 1):
                 add_border_side(
                     ws.cell(row=row, column=excel_col),
-                    right=royal_blue,
+                    right=vacation_end_side,
                 )
+
+        # Special case:
+        # Vacation ended the day before the bid period starts.
+        # Put dashed royal blue LEFT border on first bid date.
+        if first_bid_date is not None:
+            if vacation_end == first_bid_date - timedelta(days=1):
+                excel_col = date_to_excel_col[first_bid_date]
+
+                for row in range(1, max_row + 1):
+                    add_border_side(
+                        ws.cell(row=row, column=excel_col),
+                        left=vacation_end_side,
+                    )
+
+        # Special case:
+        # Vacation starts the day after the bid period ends.
+        # Put thick solid royal blue RIGHT border on last bid date.
+        if last_bid_date is not None:
+            if vacation_start == last_bid_date + timedelta(days=1):
+                excel_col = date_to_excel_col[last_bid_date]
+
+                for row in range(1, max_row + 1):
+                    add_border_side(
+                        ws.cell(row=row, column=excel_col),
+                        right=vacation_start_side,
+                    )
 
     # Auto-size only the non-calendar columns
     for col_idx in range(1, max_col + 1):

@@ -207,9 +207,23 @@ from datetime import date, datetime
 import pandas as pd
 
 
+from datetime import date, datetime
+import pandas as pd
+
+
 def is_calendar_date_column(col):
     """
     Returns True if the DataFrame column looks like a calendar date column.
+
+    Handles:
+        date/datetime objects
+        2026-07-12
+        07/12/2026
+        07/12/26
+        Wed, May 27
+        Wednesday, May 27
+
+    Avoids Python's warning about parsing month/day without a year.
     """
 
     if isinstance(col, (date, datetime, pd.Timestamp)):
@@ -220,19 +234,33 @@ def is_calendar_date_column(col):
 
     text = col.strip()
 
-    date_formats = [
-        "%Y-%m-%d",      # 2023-05-27
-        "%m/%d/%Y",      # 05/27/2023
-        "%m/%d/%y",      # 05/27/23
+    formats_with_year = [
+        "%Y-%m-%d",      # 2026-07-12
+        "%m/%d/%Y",      # 07/12/2026
+        "%m/%d/%y",      # 07/12/26
+    ]
+
+    formats_without_year = [
         "%a, %b %d",     # Wed, May 27
         "%A, %b %d",     # Wednesday, May 27
         "%a, %B %d",     # Wed, May 27
         "%A, %B %d",     # Wednesday, May 27
     ]
 
-    for fmt in date_formats:
+    # Normal date formats that already include a year
+    for fmt in formats_with_year:
         try:
             datetime.strptime(text, fmt)
+            return True
+        except ValueError:
+            pass
+
+    # Month/day formats without a year:
+    # Add a safe dummy year to avoid Python's deprecation warning.
+    # Use 2000 because it is a leap year, so Feb 29 remains valid.
+    for fmt in formats_without_year:
+        try:
+            datetime.strptime(f"{text} 2000", f"{fmt} %Y")
             return True
         except ValueError:
             pass
@@ -585,11 +613,12 @@ def main():
     config = load_saved_config()
 
     with ThreadPoolExecutor(max_workers=3) as executor:
-        lines_pdf_path = input("Enter the file path of LINES pdf (can be dragged and dropped onto this window): ").strip().strip('"\'')
-        extracted_lines = executor.submit(parse_line_report_pdf, lines_pdf_path, first_calendar_page=3)
 
         trips_pdf_path = input("Enter the file path of TRIPS pdf (can be dragged and dropped onto this window): ").strip().strip('"\'')
         extracted_trips = executor.submit(extract_trips_from_pdf, trips_pdf_path, first_page=2)
+
+        lines_pdf_path = input("Enter the file path of LINES pdf (can be dragged and dropped onto this window): ").strip().strip('"\'')
+        extracted_lines = executor.submit(parse_line_report_pdf, lines_pdf_path, first_calendar_page=3)
 
         vacation_ranges = get_vacation_ranges_from_user_or_saved(config)
         
@@ -611,7 +640,7 @@ def main():
     pf.add_company_ticket_percentages(master_lines)
     new_vacation_range = pf.add_vacation_days_off_score(master_lines,vacation_ranges,bid_period_info,save_details=False)
     pf.add_training_fit_score(master_lines,training_start,training_end,bid_period_info)
-    if bid_period_DO_preference is not "none":
+    if bid_period_DO_preference != "none":
         pf.add_bid_edge_days_off(master_lines, bid_period_info,edge=bid_period_DO_preference)
 
     df = master_lines_to_dataframe(master_lines,bid_period_info)
@@ -626,6 +655,40 @@ def main():
 
     export_master_lines_to_excel_table(df,output_path, training_start=training_start, training_end=training_end, vacation_ranges=new_vacation_range)
 
+    while True:
+        exit_program = prompt_yes_no("\nDo you want to exit the program? (y/n): ",default=False,)
+
+        if exit_program:
+            print("Exiting program.")
+            break
+
+
+        vacation_ranges = get_vacation_ranges_from_user_or_saved(config)
+        
+        training_start, training_end = get_training_dates_from_user_or_saved(config)
+
+        bid_period_DO_preference = prompt_bid_period_days_off_preference()
+
+        master_lines = creating_master_line(trips,lines)
+
+        pf.add_blockiness_scores(master_lines,bid_period_info)
+        pf.add_company_ticket_percentages(master_lines)
+        new_vacation_range = pf.add_vacation_days_off_score(master_lines,vacation_ranges,bid_period_info,save_details=False)
+        pf.add_training_fit_score(master_lines,training_start,training_end,bid_period_info)
+        if bid_period_DO_preference != "none":
+            pf.add_bid_edge_days_off(master_lines, bid_period_info,edge=bid_period_DO_preference)
+
+        df = master_lines_to_dataframe(master_lines,bid_period_info)
+
+        sort_order = get_sort_order_from_user_or_saved(config, df)
+
+        df = sort_dataframe_by_conditions(df, sort_order)
+
+        output_path = get_output_file_from_user_or_saved(config)
+
+        print(output_path)
+
+        export_master_lines_to_excel_table(df,output_path, training_start=training_start, training_end=training_end, vacation_ranges=new_vacation_range)
 
 
 if __name__ == "__main__":
