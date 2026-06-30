@@ -306,6 +306,7 @@ def master_lines_to_dataframe(
             "Blockiness": line_data.get("blockiness_score", 0),
             "Total DO": line_data.get("tot_DO", 0),
             "% tickets paid": line_data.get("company_ticket_pct", 0),
+            "Avg # of legs": line_data.get("avg_legs_per_work_day",0),
             "Total CT": line_data.get("tot_CT",0),
             "Premium": int(line_data.get("tot_Premium", line_data.get("tot_premium", 0))),
         })
@@ -337,46 +338,57 @@ def master_lines_to_dataframe(
 
 def sort_dataframe_by_conditions(
     df,
-    sort_order,
+    sort_conditions,
+    *,
+    fixed_start_cols=("Line Number", "Extra Vacation Days"),
+    date_col_format="%Y-%m-%d",
     drop_all_zero_or_none_cols=True,
+    drop_fixed_cols_if_all_zero=True,
     reset_index=True,
     missing_col_action="raise",
 ):
     """
-    Sorts a DataFrame using user-provided sorting conditions.
+    Sorts and reorders a DataFrame using user-provided sorting conditions.
 
     Parameters
     ----------
     df:
         Pandas DataFrame.
 
-    sort_order:
+    sort_conditions:
         List of sorting rules in priority order.
 
-        Each rule should be either:
+        Example:
+            [
+                ("Extra Vacation Days", "desc"),
+                ("Training", "desc"),
+                ("Blockiness", "desc"),
+                ("Total DO", "desc"),
+                ("% tickets paid", "desc"),
+                ("Avg # of legs", "asc"),
+            ]
 
-            ("Column Name", "desc")
+    fixed_start_cols:
+        Columns that should stay at the beginning of the DataFrame.
 
-        or:
-
-            ("Column Name", "asc")
-
-        You can also use:
-
-            ("Column Name", "high_to_low")
-            ("Column Name", "low_to_high")
-            ("Column Name", False)   # False = descending
-            ("Column Name", True)    # True = ascending
+    date_col_format:
+        Format used to detect calendar date columns.
 
     drop_all_zero_or_none_cols:
         If True, any sorting column where all values are 0, None, NaN,
-        or blank will be dropped from the DataFrame and removed from sorting.
+        or blank will be dropped.
+
+    drop_fixed_cols_if_all_zero:
+        If False, fixed columns such as "Extra Vacation Days" will not be
+        dropped even if all values are 0.
+
+        If True, they can be dropped if they are inactive sort columns.
 
     reset_index:
-        If True, resets the index after sorting.
+        If True, resets index after sorting.
 
     missing_col_action:
-        "raise" -> raise an error if a sorting column is missing.
+        "raise"  -> raise an error if a sorting column is missing.
         "ignore" -> skip missing sorting columns.
     """
 
@@ -386,15 +398,32 @@ def sort_dataframe_by_conditions(
         """
         Returns True for ascending, False for descending.
         """
+
         if isinstance(direction, bool):
             return direction
 
         direction = str(direction).lower().strip()
 
-        if direction in ["asc", "ascending", "low_to_high", "small_to_large", "smallest_to_largest"]:
+        ascending_words = {
+            "asc",
+            "ascending",
+            "low_to_high",
+            "small_to_large",
+            "smallest_to_largest",
+        }
+
+        descending_words = {
+            "desc",
+            "descending",
+            "high_to_low",
+            "large_to_small",
+            "largest_to_smallest",
+        }
+
+        if direction in ascending_words:
             return True
 
-        if direction in ["desc", "descending", "high_to_low", "large_to_small", "largest_to_smallest"]:
+        if direction in descending_words:
             return False
 
         raise ValueError(
@@ -402,9 +431,20 @@ def sort_dataframe_by_conditions(
             "Use 'asc', 'desc', True, or False."
         )
 
+    def is_calendar_col(col):
+        """
+        Returns True if the column name looks like a calendar date column.
+        """
+
+        try:
+            datetime.strptime(str(col), date_col_format)
+            return True
+        except ValueError:
+            return False
+
     def numeric_col(col):
         """
-        Converts column to numeric for sorting and zero-checking.
+        Converts a column to numeric for sorting and zero-checking.
 
         Handles:
             10
@@ -430,10 +470,14 @@ def sort_dataframe_by_conditions(
 
         return pd.to_numeric(cleaned, errors="coerce").fillna(0)
 
+    # ------------------------------------------------------------
+    # 1. Validate and activate sorting columns
+    # ------------------------------------------------------------
+
     active_sort_cols = []
     ascending_values = []
 
-    for col, direction in sort_order:
+    for col, direction in sort_conditions:
 
         if col not in df.columns:
             if missing_col_action == "raise":
@@ -444,41 +488,81 @@ def sort_dataframe_by_conditions(
                 raise ValueError("missing_col_action must be 'raise' or 'ignore'.")
 
         col_numeric = numeric_col(col)
-
         all_zero_or_none = col_numeric.eq(0).all()
 
-        if drop_all_zero_or_none_cols and all_zero_or_none:
+        col_is_fixed = col in fixed_start_cols or is_calendar_col(col)
+
+        should_drop_col = (
+            drop_all_zero_or_none_cols
+            and all_zero_or_none
+            and (
+                not col_is_fixed
+                or drop_fixed_cols_if_all_zero
+            )
+        )
+
+        if should_drop_col:
             df = df.drop(columns=[col])
+            continue
+
+        # If column is all zero but protected, keep the column,
+        # but do not use it for sorting.
+        if all_zero_or_none:
             continue
 
         active_sort_cols.append(col)
         ascending_values.append(normalize_sort_direction(direction))
 
-    if not active_sort_cols:
-        if reset_index:
-            return df.reset_index(drop=True)
-        return df
+    # ------------------------------------------------------------
+    # 2. Sort using temporary numeric columns
+    # ------------------------------------------------------------
 
-    temp_sort_cols = []
+    if active_sort_cols:
+        temp_sort_cols = []
 
-    for col in active_sort_cols:
-        temp_col = f"__sort_{col}"
+        for col in active_sort_cols:
+            temp_col = f"__sort_{col}"
 
-        while temp_col in df.columns:
-            temp_col += "_"
+            while temp_col in df.columns:
+                temp_col += "_"
 
-        df[temp_col] = numeric_col(col)
-        temp_sort_cols.append(temp_col)
+            df[temp_col] = numeric_col(col)
+            temp_sort_cols.append(temp_col)
 
-    df = df.sort_values(
-        by=temp_sort_cols,
-        ascending=ascending_values,
-        kind="mergesort",
-    )
+        df = df.sort_values(
+            by=temp_sort_cols,
+            ascending=ascending_values,
+            kind="mergesort",
+        )
 
-    df = df.drop(columns=temp_sort_cols)
+        df = df.drop(columns=temp_sort_cols)
 
     if reset_index:
         df = df.reset_index(drop=True)
+
+    # ------------------------------------------------------------
+    # 3. Reorder columns
+    # ------------------------------------------------------------
+
+    current_cols = list(df.columns)
+
+    fixed_cols = [
+        col for col in current_cols
+        if col in fixed_start_cols or is_calendar_col(col)
+    ]
+
+    sort_order_cols = [
+        col for col, _ in sort_conditions
+        if col in df.columns and col not in fixed_cols
+    ]
+
+    remaining_cols = [
+        col for col in current_cols
+        if col not in fixed_cols and col not in sort_order_cols
+    ]
+
+    final_col_order = fixed_cols + sort_order_cols + remaining_cols
+
+    df = df[final_col_order]
 
     return df

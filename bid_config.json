@@ -21,23 +21,27 @@
             "desc"
         ],
         [
+            "Start bid off",
+            "desc"
+        ],
+        [
             "Blockiness",
             "desc"
         ],
         [
-            "End bid off",
-            "desc"
+            "Avg # of legs",
+            "asc"
         ],
         [
             "% tickets paid",
             "desc"
         ],
         [
-            "Total DO",
+            "Total CT",
             "desc"
         ],
         [
-            "Total CT",
+            "Premium",
             "desc"
         ]
     ],

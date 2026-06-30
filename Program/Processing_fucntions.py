@@ -1,43 +1,228 @@
 from datetime import date, datetime, timedelta
 import re
 
+#Red flag blockiness
+
+def weighted_block_average(lengths):
+    """
+    Rewards larger blocks.
+    A 14-day block is better than two 7-day blocks.
+    No ideal block length is used.
+    """
+    lengths = [length for length in lengths if length > 0]
+
+    if not lengths:
+        return 0
+
+    return sum(length ** 2 for length in lengths) / sum(lengths)
+
+
+def harmonic_block_average(lengths):
+    """
+    Punishes tiny blocks.
+    A single 1-day block drags this down hard.
+    """
+    lengths = [length for length in lengths if length > 0]
+
+    if not lengths:
+        return 0
+
+    return len(lengths) / sum(1 / length for length in lengths)
+
+
+def block_quality(lengths):
+    """
+    Combines:
+        - reward for big blocks
+        - punishment for tiny blocks
+
+    No ideal block length is used.
+    """
+    lengths = [length for length in lengths if length > 0]
+
+    if not lengths:
+        return 0
+
+    weighted = weighted_block_average(lengths)
+    harmonic = harmonic_block_average(lengths)
+
+    return (weighted * harmonic) ** 0.5
+
+
+def merge_touching_work_blocks(work_blocks):
+    """
+    Merges work blocks that have no real day off between them.
+
+    Example:
+        5 on, 0 off, 2 on
+        becomes:
+        7 on
+    """
+    if not work_blocks:
+        return []
+
+    work_blocks = sorted(work_blocks, key=lambda block: block["start_date"])
+
+    merged = [work_blocks[0].copy()]
+
+    for block in work_blocks[1:]:
+        previous = merged[-1]
+
+        days_off_between = (
+            block["start_date"] - previous["end_date"]
+        ).days - 1
+
+        if days_off_between <= 0:
+            previous["end_date"] = max(
+                previous["end_date"],
+                block["end_date"]
+            )
+
+            previous["days_gone"] = (
+                previous["end_date"] - previous["start_date"]
+            ).days + 1
+
+        else:
+            merged.append(block.copy())
+
+    return merged
+
+
+def calculate_red_flag_penalty(
+    work_blocks,
+    edge_off_gaps,
+    internal_off_gaps,
+):
+    """
+    Penalizes the things that usually make a line feel ugly manually:
+
+        - 1-day or 2-day work islands
+        - 1-day or 2-day off gaps between work blocks
+        - too many separate work blocks
+        - a short work block surrounded by large off blocks
+
+    These are not ideal block lengths.
+    They are anti-choppiness penalties.
+    """
+
+    penalty = 0
+
+    work_lengths = [
+        block["days_gone"]
+        for block in work_blocks
+        if block["days_gone"] > 0
+    ]
+
+    # ------------------------------------------------------------
+    # 1. Penalize short work blocks
+    # ------------------------------------------------------------
+    # 1-day work block = big penalty
+    # 2-day work block = medium penalty
+    # 3-day work block = small penalty
+    for length in work_lengths:
+        if length == 1:
+            penalty += 28
+        elif length == 2:
+            penalty += 18
+        elif length == 3:
+            penalty += 8
+
+    # ------------------------------------------------------------
+    # 2. Penalize short internal off gaps
+    # ------------------------------------------------------------
+    # These are days off between work blocks.
+    # Edge days off are not punished here because they may connect
+    # to another pay period.
+    for gap in internal_off_gaps:
+        if gap == 1:
+            penalty += 24
+        elif gap == 2:
+            penalty += 14
+        elif gap == 3:
+            penalty += 6
+
+    # ------------------------------------------------------------
+    # 3. Penalize too many separate work blocks
+    # ------------------------------------------------------------
+    # One or two work blocks in a PP can still be clean.
+    # Three starts to feel chopped up.
+    # Four or more is usually ugly.
+    if len(work_blocks) > 2:
+        penalty += (len(work_blocks) - 2) * 10
+
+    # ------------------------------------------------------------
+    # 4. Penalize isolated work islands inside off time
+    # ------------------------------------------------------------
+    # Example:
+    #     10 off, 1 on, 12 off
+    #
+    # This is worse than simply having a 1-day work block.
+    # It breaks what would otherwise be a large off block.
+    for i, block in enumerate(work_blocks):
+        length = block["days_gone"]
+
+        left_off = None
+        right_off = None
+
+        if i == 0:
+            left_off = edge_off_gaps[0]
+        else:
+            left_off = internal_off_gaps[i - 1]
+
+        if i == len(work_blocks) - 1:
+            right_off = edge_off_gaps[-1]
+        else:
+            right_off = internal_off_gaps[i]
+
+        if left_off is None or right_off is None:
+            continue
+
+        surrounding_off = left_off + right_off
+
+        if surrounding_off >= 7:
+            if length == 1:
+                penalty += 30
+            elif length == 2:
+                penalty += 20
+            elif length == 3:
+                penalty += 10
+
+    return penalty
+
+
+def safe_harmonic_average(values):
+    """
+    Harmonic average for PP bonuses.
+
+    This makes one ugly PP drag the final line score down more
+    than a normal average would.
+    """
+    values = [value for value in values if value > 0]
+
+    if not values:
+        return 0
+
+    return len(values) / sum(1 / value for value in values)
+
+
 def add_blockiness_scores(master_lines, bid_period_info):
     """
-    Adds one top-level key to each line:
+    Adds:
 
         line["blockiness_score"]
 
-    Uses bid_period_info instead of bid_start / bid_end.
+    Main idea:
+        category base score + clean block bonus
 
-    bid_period_info format:
+    This version avoids ideal 7-on / 7-off tuning.
 
-        {
-            "bid_period_date_range": {
-                "start": "2023-05-21",
-                "end": "2023-07-16"
-            },
-            "pay_period_date_ranges": {
-                "PP1": {
-                    "start": "2023-05-21",
-                    "end": "2023-06-17"
-                },
-                "PP2": {
-                    "start": "2023-06-18",
-                    "end": "2023-07-15"
-                }
-            }
-        }
-
-    Scoring:
-        - Each PP gets its own score.
-        - Final line score = average of PP scores.
-
-    Preference order:
-        TRIP > VTO > RB > RA > SB > SA > VOR
-
-    Method:
-        PP score = category_multiplier * blockiness_bonus
-        except VTO, which currently uses a fixed score.
+    Instead it:
+        - rewards large work blocks
+        - rewards large off blocks
+        - punishes tiny work islands
+        - punishes tiny internal off gaps
+        - punishes too many separate work blocks
+        - lets one ugly PP drag down the final line score
     """
 
     pay_period_ranges = bid_period_info["pay_period_date_ranges"]
@@ -58,17 +243,16 @@ def add_blockiness_scores(master_lines, bid_period_info):
 
     for line_number, line in master_lines.items():
 
-        pp_scores = []
+        pp_base_scores = []
+        pp_block_bonuses = []
 
         for pp_index, pp in enumerate(line["PPs"]):
 
-            # --------------------------------------------------------
-            # 1. Get PP date range from bid_period_info
-            # --------------------------------------------------------
             pp_name = pp.get("pp", f"PP{pp_index + 1}")
 
             if pp_name not in pay_period_ranges:
-                pp_scores.append(0)
+                pp_base_scores.append(0)
+                pp_block_bonuses.append(0)
                 continue
 
             pp_start = date.fromisoformat(pay_period_ranges[pp_name]["start"])
@@ -78,11 +262,10 @@ def add_blockiness_scores(master_lines, bid_period_info):
             code_dates = {}
 
             # --------------------------------------------------------
-            # 2. Read assignments using your actual master_lines format
+            # Read assignments
             # --------------------------------------------------------
             for assignment in pp["assignments"]:
 
-                # Normal trip assignment
                 if "flights" in assignment:
 
                     start_dates = []
@@ -91,17 +274,16 @@ def add_blockiness_scores(master_lines, bid_period_info):
                     for flight in assignment["flights"]:
                         start_dates.append(date.fromisoformat(flight["start_date"]))
                         end_dates.append(date.fromisoformat(flight["end_date"]))
-                    
+
                     trip_start = min(start_dates)
                     trip_end = max(end_dates)
 
                     trip_blocks.append({
                         "start_date": trip_start,
                         "end_date": trip_end,
-                        "days_gone": assignment["total_days_gone"],
+                        "days_gone": (trip_end - trip_start).days + 1,
                     })
 
-                # Code assignment: {'code': 'VTO', 'date': '2023-05-21'}
                 elif "code" in assignment:
 
                     code = assignment["code"]
@@ -110,7 +292,7 @@ def add_blockiness_scores(master_lines, bid_period_info):
                     code_dates.setdefault(code, []).append(code_date)
 
             # --------------------------------------------------------
-            # 3. Determine PP category and work blocks
+            # Determine PP category and work blocks
             # --------------------------------------------------------
             if trip_blocks:
                 pp_category = "TRIP"
@@ -126,11 +308,9 @@ def add_blockiness_scores(master_lines, bid_period_info):
 
                 work_blocks = []
 
-                # VTO is time off, so it has no work blocks.
                 if pp_category == "VTO":
                     pass
 
-                # RB / RA / SB / SA / VOR can be measured as blocks.
                 elif pp_category in measurable_codes:
 
                     all_code_work_dates = []
@@ -141,7 +321,6 @@ def add_blockiness_scores(master_lines, bid_period_info):
 
                     all_code_work_dates = sorted(set(all_code_work_dates))
 
-                    # Group consecutive code dates into blocks.
                     if all_code_work_dates:
                         block_start = all_code_work_dates[0]
                         previous_date = all_code_work_dates[0]
@@ -151,104 +330,134 @@ def add_blockiness_scores(master_lines, bid_period_info):
                             if current_date == previous_date + timedelta(days=1):
                                 previous_date = current_date
                             else:
-                                days_gone = (previous_date - block_start).days + 1
-
                                 work_blocks.append({
                                     "start_date": block_start,
                                     "end_date": previous_date,
-                                    "days_gone": days_gone,
+                                    "days_gone": (previous_date - block_start).days + 1,
                                 })
 
                                 block_start = current_date
                                 previous_date = current_date
 
-                        days_gone = (previous_date - block_start).days + 1
-
                         work_blocks.append({
                             "start_date": block_start,
                             "end_date": previous_date,
-                            "days_gone": days_gone,
+                            "days_gone": (previous_date - block_start).days + 1,
                         })
 
             base_score = category_base_scores.get(pp_category, 0)
+            pp_base_scores.append(base_score)
 
             # --------------------------------------------------------
-            # 4. Special handling for VTO
+            # VTO handling
             # --------------------------------------------------------
             if pp_category == "VTO":
-                # VTO usually covers the whole PP.
-                # Treat it as one big clean off block.
-                vto_fixed_score = 60
-
-                pp_scores.append(base_score + vto_fixed_score) # Change this line to multiplication if desired
+                # VTO is clean time off.
+                # Keep the bonus below 100 so VTO cannot outrank TRIP
+                # only because of blockiness.
+                pp_block_bonuses.append(95)
                 continue
 
             # --------------------------------------------------------
-            # 5. Calculate blockiness bonus
+            # No work blocks
             # --------------------------------------------------------
+            work_blocks = merge_touching_work_blocks(work_blocks)
             work_blocks.sort(key=lambda block: block["start_date"])
 
             if not work_blocks:
-                pp_scores.append(base_score)
+                pp_block_bonuses.append(0)
                 continue
 
-            days_gone_list = [
-                block["days_gone"]
-                for block in work_blocks
-            ]
+            # --------------------------------------------------------
+            # Build off gaps
+            # --------------------------------------------------------
+            edge_off_gaps = []
+            internal_off_gaps = []
 
-            days_between_trips_list = []
-
-            # PP start to first work block
             first_gap = (work_blocks[0]["start_date"] - pp_start).days
-            days_between_trips_list.append(max(first_gap, 0))
+            edge_off_gaps.append(max(first_gap, 0))
 
-            # Between work blocks
             for i in range(1, len(work_blocks)):
                 previous_end = work_blocks[i - 1]["end_date"]
                 next_start = work_blocks[i]["start_date"]
 
-                gap = (next_start - previous_end).days
-                days_between_trips_list.append(max(gap, 0))
+                gap = (next_start - previous_end).days - 1
+                internal_off_gaps.append(max(gap, 0))
 
-            # Last work block to PP end
             last_gap = (pp_end - work_blocks[-1]["end_date"]).days
-            days_between_trips_list.append(max(last_gap, 0))
+            edge_off_gaps.append(max(last_gap, 0))
 
-            # Trips can use official DD/DO.
-            # Codes use calculated DD/DO because package DD/DO can be incoherent.
-            if pp_category == "TRIP":
-                dd_denominator = int(pp["DD"])
-                do_denominator = int(pp["DO"])
-            else:
-                dd_denominator = sum(days_gone_list)
-                do_denominator = sum(days_between_trips_list)
+            all_off_gaps = edge_off_gaps + internal_off_gaps
 
-            if dd_denominator > 0:
-                days_gone_component = (
-                    sum(day ** 2 for day in days_gone_list) / dd_denominator
-                )
-            else:
-                days_gone_component = 0
+            work_lengths = [
+                block["days_gone"]
+                for block in work_blocks
+                if block["days_gone"] > 0
+            ]
 
-            if do_denominator > 0:
-                days_between_component = (
-                    sum(day ** 2 for day in days_between_trips_list) / do_denominator
-                )
-            else:
-                days_between_component = 0
+            off_lengths = [
+                gap
+                for gap in all_off_gaps
+                if gap > 0
+            ]
 
-            blockiness_bonus = (
-                0.5 * days_gone_component
-                + 0.5 * days_between_component
+            # --------------------------------------------------------
+            # Positive block quality
+            # --------------------------------------------------------
+            work_quality = block_quality(work_lengths)
+            off_quality = block_quality(off_lengths)
+
+            raw_bonus = (
+                0.50 * work_quality
+                + 0.50 * off_quality
             )
 
-            pp_scores.append(base_score + blockiness_bonus) # Change this line to multiplication if desired
+            # Scale the natural block size into a 0-99 bonus range.
+            # No ideal 7-day target is used.
+            raw_bonus = raw_bonus * 7
 
-        if pp_scores:
-            line["blockiness_score"] = sum(pp_scores) / len(pp_scores)
+            # --------------------------------------------------------
+            # Red-flag penalties
+            # --------------------------------------------------------
+            penalty = calculate_red_flag_penalty(
+                work_blocks=work_blocks,
+                edge_off_gaps=edge_off_gaps,
+                internal_off_gaps=internal_off_gaps,
+            )
+
+            final_bonus = raw_bonus - penalty
+
+            # Keep category base dominant.
+            final_bonus = max(0, min(final_bonus, 99))
+
+            pp_block_bonuses.append(final_bonus)
+
+        # ------------------------------------------------------------
+        # Final line score
+        # ------------------------------------------------------------
+        if pp_base_scores:
+            average_base_score = sum(pp_base_scores) / len(pp_base_scores)
         else:
-            line["blockiness_score"] = 0
+            average_base_score = 0
+
+        if pp_block_bonuses:
+            average_bonus = sum(pp_block_bonuses) / len(pp_block_bonuses)
+            harmonic_bonus = safe_harmonic_average(pp_block_bonuses)
+
+            # This is important:
+            # Do not let one excellent PP completely hide one ugly PP.
+            final_bonus = (
+                0.60 * average_bonus
+                + 0.40 * harmonic_bonus
+            )
+        else:
+            final_bonus = 0
+
+        blockiness_score = average_base_score + final_bonus
+
+        bucketed_blockiness_score = int((average_base_score + final_bonus)//5) * 5
+
+        line["blockiness_score"] = bucketed_blockiness_score
 
 
 
@@ -993,3 +1202,141 @@ def add_bid_edge_days_off(
                 bid_start=bid_start,
                 bid_end=bid_end,
             )
+
+def add_avg_legs_per_work_day(
+    master_lines,
+    score_field="avg_legs_per_work_day",
+    round_digits=1,
+):
+    """
+    Adds this top-level key to each line:
+
+        line_data["avg_non_dh_flights_between_rests"]
+
+    Meaning:
+        Average number of non-DH flight legs between rests.
+
+    Rules:
+        - Flights with route_flags containing "DH ..." are not counted.
+        - Rest is detected when flight["rest"] has a real value.
+        - VTO, RB, RA, SB, SA, VOR are assigned 0.
+        - If no qualifying non-DH flight blocks exist, score is 0.
+    """
+
+    zero_categories = {"VTO", "RB", "RA", "SB", "SA", "VOR"}
+
+    def normalize_category(value):
+        if value is None:
+            return None
+        return str(value).strip().upper()
+
+    def get_category(obj):
+        """
+        Tries to detect whether a line/PP/assignment is VTO, RB, RA, etc.
+        This is intentionally flexible because these categories may appear
+        under different key names depending on your parser.
+        """
+        if not isinstance(obj, dict):
+            return None
+
+        possible_keys = [
+            "category",
+            "type",
+            "assignment_type",
+            "line_type",
+            "pp_type",
+            "status",
+        ]
+
+        for key in possible_keys:
+            value = normalize_category(obj.get(key))
+            if value in zero_categories:
+                return value
+
+        # Also handles structures like {"VTO": True}
+        for category in zero_categories:
+            if obj.get(category) is True:
+                return category
+
+        return None
+
+    def has_dh_flag(flight):
+        flags = flight.get("route_flags")
+
+        if not flags:
+            return False
+
+        if isinstance(flags, str):
+            flags = [flags]
+
+        for flag in flags:
+            flag_text = str(flag).strip().upper()
+
+            if flag_text.startswith("DH"):
+                return True
+
+        return False
+
+    def has_rest_after_flight(flight):
+        rest = flight.get("rest")
+        return rest not in (None, "", "-")
+
+    for line_number, line_data in master_lines.items():
+
+        # If the whole line is VTO/RB/RA/SB/SA/VOR, score is 0.
+        if get_category(line_data) in zero_categories:
+            line_data[score_field] = 0
+            if save_details:
+                line_data[details_field] = {
+                    "blocks": [],
+                    "reason": "zero_category_line",
+                }
+            continue
+
+        blocks_between_rests = []
+
+        for pp in line_data.get("PPs", []):
+
+            # If the whole PP is VTO/RB/RA/SB/SA/VOR, ignore it.
+            if get_category(pp) in zero_categories:
+                continue
+
+            for assignment in pp.get("assignments", []):
+
+                # If this assignment is VTO/RB/RA/SB/SA/VOR, ignore it.
+                if get_category(assignment) in zero_categories:
+                    continue
+
+                flights = assignment.get("flights", [])
+
+                if not flights:
+                    continue
+
+                current_block_count = 0
+
+                for flight in flights:
+
+                    # Count only non-DH flight legs.
+                    if not has_dh_flag(flight):
+                        current_block_count += 1
+
+                    # A rest ends the current block.
+                    if has_rest_after_flight(flight):
+                        if current_block_count > 0:
+                            blocks_between_rests.append(current_block_count)
+
+                        current_block_count = 0
+
+                # End of trip also closes the final block.
+                if current_block_count > 0:
+                    blocks_between_rests.append(current_block_count)
+
+        if blocks_between_rests:
+            avg_value = sum(blocks_between_rests) / len(blocks_between_rests)
+
+            if round_digits is not None:
+                avg_value = round(avg_value, round_digits)
+        else:
+            avg_value = 0
+
+        line_data[score_field] = avg_value
