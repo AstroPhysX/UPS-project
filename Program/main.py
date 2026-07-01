@@ -639,7 +639,8 @@ def main():
     pf.add_blockiness_scores(master_lines,bid_period_info)
     pf.add_company_ticket_percentages(master_lines)
     new_vacation_range = pf.add_vacation_days_off_score(master_lines,vacation_ranges,bid_period_info,save_details=False)
-    pf.add_training_fit_score(master_lines,training_start,training_end,bid_period_info)
+    if training_start != None and training_end != None:
+        pf.add_training_fit_score(master_lines,training_start,training_end,bid_period_info)
     pf.add_avg_legs_per_work_day(master_lines)
     if bid_period_DO_preference != "none":
         pf.add_bid_edge_days_off(master_lines, bid_period_info,edge=bid_period_DO_preference)
@@ -684,7 +685,7 @@ def main():
 
         sort_order = get_sort_order_from_user_or_saved(config, df)
 
-        df = sort_dataframe_by_conditions(df, sort_order)
+        df = sort_dataframe_by_conditions(df, sort_order,default_mode="weighted",soft_max_weight=3.0,keep_score_columns=True)
 
         output_path = get_output_file_from_user_or_saved(config)
 

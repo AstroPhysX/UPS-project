@@ -455,7 +455,7 @@ def add_blockiness_scores(master_lines, bid_period_info):
 
         blockiness_score = average_base_score + final_bonus
 
-        bucketed_blockiness_score = int((average_base_score + final_bonus)//5) * 5
+        bucketed_blockiness_score = int((average_base_score + final_bonus)//2) * 2
 
         line["blockiness_score"] = bucketed_blockiness_score
 
