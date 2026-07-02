@@ -1340,3 +1340,52 @@ def add_avg_legs_per_work_day(
             avg_value = 0
 
         line_data[score_field] = avg_value
+
+def line_numbers_to_bid_string(df, number_of_lines, column="Line Number"):
+    """
+    Takes the first `number_of_lines` entries from the line number column
+    and returns a compressed bid string.
+
+    Example:
+        [3, 5, 1, 7, 8, 9, 10, 19]
+        -> "3 5 1 7=10 19"
+    """
+
+    # Get only the requested number of line numbers
+    line_numbers = (
+        df[column]
+        .head(number_of_lines)
+        .dropna()
+        .astype(int)
+        .tolist()
+    )
+
+    if not line_numbers:
+        return ""
+
+    parts = []
+    start = line_numbers[0]
+    previous = line_numbers[0]
+
+    for number in line_numbers[1:]:
+        if number == previous + 2:
+            # Continue the current range
+            previous = number
+        else:
+            # Close the previous range
+            if start == previous:
+                parts.append(str(start))
+            else:
+                parts.append(f"{start}={previous}")
+
+            # Start a new range
+            start = number
+            previous = number
+
+    # Close the final range
+    if start == previous:
+        parts.append(str(start))
+    else:
+        parts.append(f"{start}={previous}")
+
+    return " ".join(parts)

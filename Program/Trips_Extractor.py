@@ -1,5 +1,6 @@
 #simply run: trips = extract_trips_from_pdf(pdf_path,first_page=2)
 #Working
+
 import re
 import pdfplumber
 
@@ -279,33 +280,148 @@ def parse_trip_text(text):
 
     return trip
 
-
-def extract_trips_from_pdf(pdf_path, first_page=2, last_page=None):
+def extract_trips_from_pdf(
+    pdf_path,
+    first_page=2,
+    last_page=None,
+    stop_after_empty_pages=4,
+    progress_callback=None,
+):
     """
     Returns a dictionary keyed by Trip ID.
 
-    Page numbers are normal PDF page numbers:
-        first_page=2 means page 2.
-        last_page=4 means page 4.
+    progress_callback:
+        Optional function that receives a progress dictionary.
+
+    Example progress data:
+        {
+            "current": 10,
+            "total": 150,
+            "page": 11,
+            "trips_on_page": 8,
+            "total_trips": 72,
+            "status": "running",
+            "message": "Extracting page 11 of 150",
+        }
     """
 
+    def send_progress(
+        current,
+        total,
+        page_number=None,
+        trips_on_page=0,
+        total_trips=0,
+        status="running",
+        message=None,
+    ):
+        if progress_callback is None:
+            return
+
+        progress_callback({
+            "current": current,
+            "total": total,
+            "page": page_number,
+            "trips_on_page": trips_on_page,
+            "total_trips": total_trips,
+            "status": status,
+            "message": message,
+        })
+
     trips = {}
+    empty_pages_in_a_row = 0
 
     with pdfplumber.open(pdf_path) as pdf:
+        total_pdf_pages = len(pdf.pages)
+
         start_index = first_page - 1
-        end_index = last_page if last_page is not None else len(pdf.pages)
+        end_index = last_page if last_page is not None else total_pdf_pages
+
+        start_index = max(0, start_index)
+        end_index = min(end_index, total_pdf_pages)
+
+        total_pages_to_process = end_index - start_index
+
+        if total_pages_to_process <= 0:
+            send_progress(
+                current=0,
+                total=0,
+                status="done",
+                message="No pages to process.",
+            )
+            return trips
+
+        send_progress(
+            current=0,
+            total=total_pages_to_process,
+            status="starting",
+            message="Starting trip extraction...",
+        )
 
         for page_index in range(start_index, end_index):
+            page_number = page_index + 1
+            current_progress = page_index - start_index + 1
+
             page = pdf.pages[page_index]
+            trips_found_on_page = 0
 
-            for bbox in make_trip_crops(page):
-                cropped = page.crop(bbox)
-                text = cropped.extract_text(x_tolerance=1, y_tolerance=3) or ""
+            try:
+                for bbox in make_trip_crops(page):
+                    cropped = page.crop(bbox)
+                    text = cropped.extract_text(x_tolerance=1, y_tolerance=3) or ""
 
-                if "Trip Id:" not in text:
-                    continue
+                    if "Trip Id:" not in text:
+                        continue
 
-                trip = parse_trip_text(text)
-                trips[trip["trip_id"]] = trip
+                    trip = parse_trip_text(text)
+                    trips[trip["trip_id"]] = trip
+                    trips_found_on_page += 1
+
+            finally:
+                page.close()
+
+            if trips_found_on_page == 0:
+                empty_pages_in_a_row += 1
+            else:
+                empty_pages_in_a_row = 0
+
+            send_progress(
+                current=current_progress,
+                total=total_pages_to_process,
+                page_number=page_number,
+                trips_on_page=trips_found_on_page,
+                total_trips=len(trips),
+                status="running",
+                message=(
+                    f"Extracting trips: page {page_number} "
+                    f"({current_progress} of {total_pages_to_process})"
+                ),
+            )
+
+            if (
+                stop_after_empty_pages is not None
+                and empty_pages_in_a_row >= stop_after_empty_pages
+            ):
+                send_progress(
+                    current=current_progress,
+                    total=total_pages_to_process,
+                    page_number=page_number,
+                    trips_on_page=trips_found_on_page,
+                    total_trips=len(trips),
+                    status="stopped",
+                    message=(
+                        f"Stopped at page {page_number}: "
+                        f"{empty_pages_in_a_row} empty pages in a row."
+                    ),
+                )
+                break
+
+        send_progress(
+            current=min(current_progress, total_pages_to_process),
+            total=total_pages_to_process,
+            page_number=page_number,
+            total_trips=len(trips),
+            status="done",
+            message=f"Finished extracting {len(trips)} trips.",
+        )
 
     return trips
