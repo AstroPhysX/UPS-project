@@ -20,7 +20,7 @@ Notes:
     - It keeps the same PDF loading, cached extraction, sorting settings,
       bid-string generation, Excel export, and export-complete dialog behavior.
     - For the Visualizer button, this file expects a PySide6 visualizer module
-      such as bid_spreadsheet_viewer_pyside6.py or excel_killer_pyside6.py.
+      such as GUI_spreadsheet_pyside6.py or excel_killer_pyside6.py.
 """
 
 from __future__ import annotations
@@ -73,8 +73,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from Trips_Extractor import extract_trips_from_pdf
-from Lines_Extractor import parse_line_report_pdf
+from pdf_extractors import extract_trips_from_pdf, parse_line_report_pdf, matching_bid_period
 from master_lines_creation import creating_master_line
 from master_to_pandas import master_lines_to_dataframe, sort_dataframe_by_conditions
 from export_to_excel import export_master_lines_to_excel_table
@@ -565,6 +564,8 @@ class BidGUI(QMainWindow):
         self.cached_lines: dict[str, Any] | None = None
         self.cached_trips: dict[str, Any] | None = None
         self.cached_pdf_key: tuple[str, str] | None = None
+        self.cached_bid_period_key: tuple[str, str] | None = None
+        self.cached_bid_period: str | None = None
 
         self.sort_order: list[list[str]] = []
         self.latest_bid_string = ""
@@ -1016,6 +1017,8 @@ class BidGUI(QMainWindow):
         if self.cached_pdf_key and current_key != self.cached_pdf_key:
             self.pdf_status_label.setText("PDF paths changed. Click Load PDFs again.")
             self.preview_df = None
+            self.cached_bid_period_key = None
+            self.cached_bid_period = None
             self._refresh_available_columns_list([])
             self._clear_bid_string("PDF paths changed. Generate the bid string again after loading/sorting.")
 
@@ -1380,6 +1383,71 @@ class BidGUI(QMainWindow):
             "sorting_settings": self._get_sorting_settings(),
         }
 
+
+    def _check_matching_bid_period_or_warn(self, inputs: dict[str, Any]) -> bool:
+        """
+        Verifies that the TRIPS and LINES PDFs are from the same bid period.
+
+        If they match:
+            - stores the bid period string
+            - sets the Excel filename to that bid period
+            - updates inputs["output_path"] so export uses the new filename
+
+        If they do not match:
+            - shows a popup
+            - returns False
+            - prevents PDF extraction from starting
+        """
+        pdf_key = (inputs["trips_pdf_path"], inputs["lines_pdf_path"])
+
+        if self.cached_bid_period_key == pdf_key and self.cached_bid_period:
+            bid_period = self.cached_bid_period
+        else:
+            self.pdf_status_label.setText("Checking bid period match...")
+            QApplication.processEvents()
+
+            try:
+                bid_period = matching_bid_period(
+                    inputs["trips_pdf_path"],
+                    inputs["lines_pdf_path"],
+                )
+            except Exception as exc:
+                self.pdf_status_label.setText("Bid period check failed.")
+                QMessageBox.critical(
+                    self,
+                    "Bid period check error",
+                    f"Could not verify that the LINES and TRIPS PDFs match.\n\n{exc}",
+                )
+                return False
+
+            if bid_period is None:
+                self.pdf_status_label.setText("Lines and trips packages do not match.")
+                self._write_log("PDF load stopped: Lines and trips package provided do not match.")
+
+                QMessageBox.critical(
+                    self,
+                    "PDF package mismatch",
+                    "Lines and trips package provided do not match.\n\n"
+                    "Please choose LINES and TRIPS PDFs from the same bid period.",
+                )
+                return False
+
+            bid_period = str(bid_period).strip()
+            self.cached_bid_period_key = pdf_key
+            self.cached_bid_period = bid_period
+
+        output_filename = clean_filename(bid_period)
+        self.output_filename_edit.setText(output_filename)
+
+        inputs["bid_period"] = bid_period
+        inputs["output_path"] = Path(inputs["output_folder"]) / f"{output_filename}.xlsx"
+
+        self.pdf_status_label.setText(f"Bid period verified: {bid_period}")
+        self._write_log(f"Bid period verified: {bid_period}. Excel filename set to {output_filename}.xlsx")
+
+        return True
+
+
     def _save_inputs_to_config(self, inputs: dict[str, Any]) -> None:
         self.config_data["vacation_ranges"] = inputs["vacation_ranges"]
         self.config_data["training_start"] = inputs["training_start"]
@@ -1646,7 +1714,12 @@ class BidGUI(QMainWindow):
     def generate_bid_string(self, *, copy_after: bool = False) -> None:
         try:
             inputs = self._collect_inputs()
+
+            if not self._check_matching_bid_period_or_warn(inputs):
+                return
+
             self._save_inputs_to_config(inputs)
+
         except Exception as exc:
             QMessageBox.critical(self, "Input error", str(exc))
             return
@@ -1663,6 +1736,7 @@ class BidGUI(QMainWindow):
         if self.latest_bid_string.strip() or self._get_displayed_bid_string():
             self._copy_bid_string_to_clipboard()
             return
+
         self.generate_bid_string(copy_after=True)
 
     # -------------------------- Processing logic --------------------------
@@ -1698,7 +1772,12 @@ class BidGUI(QMainWindow):
     def load_pdfs(self) -> None:
         try:
             inputs = self._collect_inputs()
+
+            if not self._check_matching_bid_period_or_warn(inputs):
+                return
+
             self._save_inputs_to_config(inputs)
+
         except Exception as exc:
             QMessageBox.critical(self, "Input error", str(exc))
             return
@@ -1711,7 +1790,12 @@ class BidGUI(QMainWindow):
     def export_excel(self) -> None:
         try:
             inputs = self._collect_inputs()
+
+            if not self._check_matching_bid_period_or_warn(inputs):
+                return
+
             self._save_inputs_to_config(inputs)
+
         except Exception as exc:
             QMessageBox.critical(self, "Input error", str(exc))
             return
@@ -1726,7 +1810,12 @@ class BidGUI(QMainWindow):
     def open_visualizer(self) -> None:
         try:
             inputs = self._collect_inputs()
+
+            if not self._check_matching_bid_period_or_warn(inputs):
+                return
+
             self._save_inputs_to_config(inputs)
+
         except Exception as exc:
             QMessageBox.critical(self, "Input error", str(exc))
             return
@@ -1885,16 +1974,16 @@ class BidGUI(QMainWindow):
         errors: list[str] = []
 
         try:
-            from bid_spreadsheet_viewer_pyside6 import BidSpreadsheetWindow
+            from GUI_spreadsheet_pyside6 import BidSpreadsheetWindow
             return BidSpreadsheetWindow
         except Exception as exc:
-            errors.append(f"bid_spreadsheet_viewer_pyside6.BidSpreadsheetWindow: {exc}")
+            errors.append(f"GUI_spreadsheet_pyside6.BidSpreadsheetWindow: {exc}")
 
         try:
-            from bid_spreadsheet_viewer_pyside6 import BidSpreadsheetViewer
+            from GUI_spreadsheet_pyside6 import BidSpreadsheetViewer
             return BidSpreadsheetViewer
         except Exception as exc:
-            errors.append(f"bid_spreadsheet_viewer_pyside6.BidSpreadsheetViewer: {exc}")
+            errors.append(f"GUI_spreadsheet_pyside6.BidSpreadsheetViewer: {exc}")
 
         try:
             from excel_killer_pyside6 import BidSpreadsheetWindow
@@ -1909,7 +1998,7 @@ class BidGUI(QMainWindow):
             errors.append(f"excel_killer_pyside6.BidSpreadsheetViewer: {exc}")
 
         raise RuntimeError(
-            "Could not import a PySide6 visualizer. Put bid_spreadsheet_viewer_pyside6.py "
+            "Could not import a PySide6 visualizer. Put GUI_spreadsheet_pyside6.py "
             "or excel_killer_pyside6.py in the same folder as this GUI.\n\n"
             + "\n".join(errors)
         )
@@ -1929,7 +2018,7 @@ class BidGUI(QMainWindow):
         viewer_class = self._get_bid_spreadsheet_viewer_class()
 
         try:
-            # Works with BidSpreadsheetWindow from bid_spreadsheet_viewer_pyside6.py.
+            # Works with BidSpreadsheetWindow from GUI_spreadsheet_pyside6.py.
             viewer_window = viewer_class(
                 sorted_df,
                 training_start=training_start,
