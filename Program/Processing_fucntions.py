@@ -1389,3 +1389,398 @@ def line_numbers_to_bid_string(df, number_of_lines, column="Line Number"):
         parts.append(f"{start}={previous}")
 
     return " ".join(parts)
+
+
+
+def add_requested_days_off_scores(
+    master_lines,
+    bid_period_info,
+    requested_dates,
+    *,
+    score_key="requested_days_off_score",
+
+    # Percentage scoring
+    true_off_percent=100.0,
+    trip_percent=0.0,
+    vto_vor_percent=40.0,
+    default_code_percent=0.0,
+
+    # Optional custom scores for other codes
+    code_percent_scores=None,
+
+    # Final cap
+    max_score=100.0,
+
+    # What to store if every requested date is outside the bid period
+    no_valid_dates_score=0,
+):
+    """
+    Adds a requested-days-off percentage score to each line in master_lines.
+
+    New scoring logic:
+
+        The function only cares about the percentage of requested dates that are off.
+
+        True off day:
+            100%
+
+        VTO or VOR day:
+            40%
+
+        Trip day:
+            0%
+
+        RA/RB/SA/SB/etc.:
+            0% by default, unless custom code_percent_scores are passed.
+
+    Important behavior:
+
+        - Dates outside the bid period are ignored completely.
+        - There is no day-before bonus.
+        - There is no day-after bonus.
+        - Maximum score is 100.
+        - VTO/VOR never count as true off, but they still receive 40%.
+
+    requested_dates accepts:
+
+        "2026-08-15"
+
+        ["2026-08-15", "2026-08-22"]
+
+        ("2026-08-15", "2026-08-22")
+
+        [
+            ("2026-08-15", "2026-08-22"),
+            "2026-09-01",
+        ]
+
+    Mutates master_lines in place and also returns master_lines.
+    """
+
+    # -----------------------------
+    # Internal helpers
+    # -----------------------------
+
+    def to_date(value):
+        if isinstance(value, datetime):
+            return value.date()
+
+        if isinstance(value, date):
+            return value
+
+        if isinstance(value, str):
+            text = value.strip()
+
+            for fmt in (
+                "%Y-%m-%d",
+                "%m/%d/%Y",
+                "%m/%d/%y",
+                "%Y/%m/%d",
+            ):
+                try:
+                    return datetime.strptime(text, fmt).date()
+                except ValueError:
+                    pass
+
+        raise ValueError(f"Could not convert {value!r} to a date.")
+
+    def date_range_inclusive(start, end):
+        start = to_date(start)
+        end = to_date(end)
+
+        if end < start:
+            raise ValueError(f"Date range end {end} is before start {start}.")
+
+        result = []
+        current = start
+
+        while current <= end:
+            result.append(current)
+            current += timedelta(days=1)
+
+        return result
+
+    def normalize_requested_dates(value):
+        """
+        Converts requested_dates into a flat list of date objects.
+
+        This intentionally flattens everything because the score is now based
+        on the percentage of requested days that are off, not on separate groups.
+        """
+
+        dates = []
+
+        # Tuple means one inclusive date range.
+        if isinstance(value, tuple) and len(value) == 2:
+            return date_range_inclusive(value[0], value[1])
+
+        # Optional dictionary support.
+        if isinstance(value, dict):
+            if "start" in value and "end" in value:
+                return date_range_inclusive(value["start"], value["end"])
+
+            if "date" in value:
+                return [to_date(value["date"])]
+
+            raise ValueError(
+                "Dictionary date request must contain either "
+                "{'date': ...} or {'start': ..., 'end': ...}."
+            )
+
+        # List means multiple requests.
+        # Each item can be a singular date, tuple range, or dict.
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, tuple) and len(item) == 2:
+                    dates.extend(date_range_inclusive(item[0], item[1]))
+                elif isinstance(item, dict):
+                    dates.extend(normalize_requested_dates(item))
+                else:
+                    dates.append(to_date(item))
+
+            return dates
+
+        # Anything else is one singular date.
+        return [to_date(value)]
+
+    def expand_dates(start, end):
+        start = to_date(start)
+        end = to_date(end)
+
+        current = start
+
+        while current <= end:
+            yield current
+            current += timedelta(days=1)
+
+    def clean_code(code):
+        if code is None:
+            return ""
+
+        return str(code).strip().upper()
+
+    def date_is_inside_bid_period(d):
+        return bid_start_date <= d <= bid_end_date
+
+    def get_code_percent(code):
+        code = clean_code(code)
+
+        if code in code_percent_scores:
+            return code_percent_scores[code]
+
+        return default_code_percent
+
+    def build_day_status_map_for_line(line_data):
+        """
+        Builds a map of assigned days.
+
+        If a date is missing from this map, and the date is inside the bid period,
+        it means the date is truly off.
+
+        Returns:
+
+            {
+                date_obj: {
+                    "kind": "TRIP" / "CODE",
+                    "percent": float,
+                    "codes": [...],
+                    "trip_ids": [...],
+                }
+            }
+        """
+
+        day_map = {}
+
+        for pp in line_data.get("PPs", []):
+            for assignment in pp.get("assignments", []):
+
+                # -----------------------------
+                # Trip assignment
+                # -----------------------------
+                if "flights" in assignment:
+                    trip_id = assignment.get("trip_id")
+
+                    for flight in assignment.get("flights", []):
+                        start = flight.get("start_date")
+                        end = flight.get("end_date")
+
+                        if not start or not end:
+                            continue
+
+                        for d in expand_dates(start, end):
+                            existing = day_map.setdefault(d, {
+                                "kind": None,
+                                "percent": default_code_percent,
+                                "codes": [],
+                                "trip_ids": [],
+                            })
+
+                            # Trip day dominates everything else.
+                            existing["kind"] = "TRIP"
+                            existing["percent"] = trip_percent
+
+                            if trip_id is not None and trip_id not in existing["trip_ids"]:
+                                existing["trip_ids"].append(trip_id)
+
+                # -----------------------------
+                # Code assignment: VTO, VOR, RA, RB, etc.
+                # -----------------------------
+                elif "code" in assignment:
+                    code = clean_code(assignment.get("code"))
+
+                    if assignment.get("date"):
+                        code_dates = [to_date(assignment["date"])]
+                    elif assignment.get("start_date") and assignment.get("end_date"):
+                        code_dates = list(expand_dates(
+                            assignment["start_date"],
+                            assignment["end_date"],
+                        ))
+                    else:
+                        continue
+
+                    for d in code_dates:
+                        existing = day_map.setdefault(d, {
+                            "kind": None,
+                            "percent": default_code_percent,
+                            "codes": [],
+                            "trip_ids": [],
+                        })
+
+                        if code not in existing["codes"]:
+                            existing["codes"].append(code)
+
+                        # If a trip already exists on this date, keep the trip result.
+                        if existing["kind"] == "TRIP":
+                            existing["percent"] = trip_percent
+                            continue
+
+                        existing["kind"] = "CODE"
+
+                        # If multiple codes somehow exist on the same date,
+                        # use the best score among those codes.
+                        existing["percent"] = max(
+                            existing["percent"],
+                            get_code_percent(code),
+                        )
+
+        return day_map
+
+    def get_day_status(day_map, d):
+        """
+        Returns status for a requested date.
+
+        This function assumes d is inside the bid period.
+
+        Inside bid period:
+            Missing from day_map = true day off.
+            Existing in day_map = trip or code assignment.
+        """
+
+        if d not in day_map:
+            return {
+                "kind": "OFF",
+                "percent": true_off_percent,
+                "codes": [],
+                "trip_ids": [],
+                "is_true_off": True,
+                "is_vto_or_vor": False,
+            }
+
+        status = day_map[d].copy()
+
+        codes = status.get("codes", [])
+        is_vto_or_vor = bool(codes) and all(
+            clean_code(code) in ("VTO", "VOR")
+            for code in codes
+        )
+
+        status["is_true_off"] = False
+        status["is_vto_or_vor"] = is_vto_or_vor
+
+        return status
+
+    # -----------------------------
+    # Normalize settings
+    # -----------------------------
+
+    bid_start_date = to_date(bid_period_info["bid_period_date_range"]["start"])
+    bid_end_date = to_date(bid_period_info["bid_period_date_range"]["end"])
+
+    requested_date_list = normalize_requested_dates(requested_dates)
+
+    # Remove duplicate requested dates so overlapping ranges do not double-count.
+    requested_date_list = sorted(set(requested_date_list))
+
+    valid_requested_dates = [
+        d for d in requested_date_list
+        if date_is_inside_bid_period(d)
+    ]
+
+    ignored_dates_outside_bid_period = [
+        d for d in requested_date_list
+        if not date_is_inside_bid_period(d)
+    ]
+
+    if code_percent_scores is None:
+        code_percent_scores = {
+            "VTO": vto_vor_percent,
+            "VOR": vto_vor_percent,
+        }
+    else:
+        code_percent_scores = {
+            clean_code(code): float(percent)
+            for code, percent in code_percent_scores.items()
+        }
+
+        # Guarantee VTO/VOR exist unless the user explicitly included them.
+        code_percent_scores.setdefault("VTO", vto_vor_percent)
+        code_percent_scores.setdefault("VOR", vto_vor_percent)
+
+    # -----------------------------
+    # Score every line
+    # -----------------------------
+
+    for line_number, line_data in master_lines.items():
+        day_map = build_day_status_map_for_line(line_data)
+
+        day_details = []
+        day_percents = []
+
+        true_off_count = 0
+        vto_vor_count = 0
+        trip_count = 0
+        other_code_count = 0
+
+        for d in valid_requested_dates:
+            status = get_day_status(day_map, d)
+
+            day_percents.append(status["percent"])
+
+            if status["kind"] == "OFF":
+                true_off_count += 1
+            elif status["kind"] == "TRIP":
+                trip_count += 1
+            elif status["is_vto_or_vor"]:
+                vto_vor_count += 1
+            elif status["kind"] == "CODE":
+                other_code_count += 1
+
+            day_details.append({
+                "date": d,
+                "kind": status["kind"],
+                "percent": status["percent"],
+                "codes": status["codes"],
+                "trip_ids": status["trip_ids"],
+                "is_true_off": status["is_true_off"],
+                "is_vto_or_vor": status["is_vto_or_vor"],
+            })
+
+        if day_percents:
+            final_score = sum(day_percents) / len(day_percents)
+        else:
+            # This means every requested date was outside the bid period.
+            final_score = no_valid_dates_score
+
+        final_score = min(final_score, max_score)
+
+        line_data[score_key] = round(final_score)

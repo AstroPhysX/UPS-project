@@ -48,8 +48,23 @@ def matching_bid_period(pdf_path_1, pdf_path_2):
 
 #---------------------------------------------------------------------
 #simply run: trips = extract_trips_from_pdf(pdf_path,first_page=2)
+#TRIPS working Progress report + EXTRA INFO
 TIME_RE = r"\(\d{2}\)\d{2}:\d{2}"
 DUR_RE = r"\d+h\d{2}"
+
+def get_first_match(pattern, text, default=None):
+    match = re.search(pattern, text)
+    return match.group(1) if match else default
+
+
+def get_first_float(pattern, text, default=None):
+    value = get_first_match(pattern, text, default=None)
+    return float(value) if value is not None else default
+
+
+def get_first_int(pattern, text, default=None):
+    value = get_first_match(pattern, text, default=None)
+    return int(value) if value is not None else default
 
 def clean_time(value):
     """
@@ -239,6 +254,28 @@ def parse_flight_line(line):
 def parse_trip_text(text):
     """
     Parses one trip table into a dictionary.
+
+    Extracts:
+        Trip-level:
+            - trip_id
+            - lines
+            - total_blocks
+            - tafb
+            - premium
+            - duty_time
+            - block_time
+            - credit_time
+            - per_diem
+            - ldgs
+
+        Block-level:
+            - start
+            - end
+            - duty
+            - block
+            - rest
+            - credit
+            - flights
     """
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -252,15 +289,21 @@ def parse_trip_text(text):
     if lines_match:
         line_numbers = [int(x) for x in re.findall(r"\d+", lines_match.group(1))]
 
-    tafb_match = re.search(r"TAFB:\s*(\d+h\d{2})", full_text)
-    premium_match = re.search(r"Premium\s+([\d.]+)", full_text)
-
     trip = {
         "trip_id": trip_id,
         "lines": line_numbers,
         "total_blocks": 0,
-        "tafb": tafb_match.group(1) if tafb_match else None,
-        "premium": float(premium_match.group(1)) if premium_match else None,
+
+        # Trip summary values
+        "tafb": get_first_match(r"TAFB:\s*(\d+h\d{2})", full_text),
+        "premium": get_first_float(r"Premium\s+([\d.]+)", full_text),
+        "duty_time": get_first_match(r"Duty Time:\s*(\d+h\d{2})", full_text),
+        "block_time": get_first_match(r"Block Time:\s*(\d+h\d{2})", full_text),
+        "credit_time": get_first_match(r"Credit Time:\s*(\d+h\d{2}[A-Z]?)", full_text),
+        "per_diem": get_first_float(r"per Diem\s+([\d.]+)", full_text),
+        "ldgs": get_first_int(r"LDGS\s+(\d+)", full_text),
+
+        # Block list
         "blocks": [],
     }
 
@@ -269,8 +312,11 @@ def parse_trip_text(text):
     for line in lines:
         # New block starts with something like:
         # (15)19:43 1h00 Duty 8h26
+        # (16)21:00 0h00 Duty 0h00
         duty_match = re.match(
-            rf"^(?P<block_start>{TIME_RE})\s+{DUR_RE}\s+Duty\s+{DUR_RE}",
+            rf"^(?P<block_start>{TIME_RE})\s+"
+            rf"(?P<report_time>{DUR_RE})\s+"
+            rf"Duty\s+(?P<duty>{DUR_RE})",
             line,
         )
 
@@ -278,7 +324,13 @@ def parse_trip_text(text):
             current_block = {
                 "start": clean_time(duty_match.group("block_start")),
                 "end": None,
+
+                # New block-level fields
+                "duty": duty_match.group("duty"),
+                "block": None,
                 "rest": None,
+                "credit": None,
+
                 "flights": [],
             }
             trip["blocks"].append(current_block)
@@ -287,8 +339,13 @@ def parse_trip_text(text):
         if current_block is None:
             continue
 
-        # Block ends with something like:
+        # Block ends can look like:
         # (00)04:09 0h15 Credit 4h13D
+        # (03)07:00 0h00 Rest -
+        # (20)00:51 0h15 Credit 4h00M
+        #
+        # But this should NOT count as a block end:
+        # (16)21:00 0h00 Duty 0h00
         block_end_match = re.match(
             rf"^(?P<block_end>{TIME_RE})\s+"
             rf"(?P<ground_time>{DUR_RE})"
@@ -299,25 +356,49 @@ def parse_trip_text(text):
         if block_end_match:
             after = block_end_match.group("after") or ""
 
-            # If the word immediately after the duration is Duty,
-            # this is a new block start, not a block end.
             if not after.startswith("Duty"):
                 current_block["end"] = clean_time(block_end_match.group("block_end"))
 
         flight = parse_flight_line(line)
 
         if flight:
-            # For the first flight in each block, use the block/duty start time,
+            # For the first flight in each block, use the duty/block start time,
             # not the actual flight departure time.
             if not current_block["flights"]:
                 flight["start"] = current_block["start"]
 
             current_block["flights"].append(flight)
 
-        rest_match = re.search(r"Rest\s+(-|\d+h\d{2})", line)
+        # Block-level Block.
+        # Important: this should match "Block 3h19",
+        # but NOT "Block Time: 3h19".
+        block_match = re.search(
+            r"\bBlock\s+(?!Time:)(\d+h\d{2})",
+            line,
+        )
+
+        if block_match:
+            current_block["block"] = block_match.group(1)
+
+        # Block-level Rest.
+        rest_match = re.search(
+            r"\bRest\s+(-|\d+h\d{2})",
+            line,
+        )
 
         if rest_match:
             current_block["rest"] = rest_match.group(1)
+
+        # Block-level Credit.
+        # Important: this should match "Credit 5h30M",
+        # but NOT "Credit Time: 5h30D".
+        credit_match = re.search(
+            r"\bCredit\s+(?!Time:)(\d+h\d{2}[A-Z]?)",
+            line,
+        )
+
+        if credit_match:
+            current_block["credit"] = credit_match.group(1)
 
     trip["total_blocks"] = len(trip["blocks"])
 
