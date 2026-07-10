@@ -1,6 +1,7 @@
 import pandas as pd
 from datetime import date, datetime, timedelta
 from collections import defaultdict
+import math
 
 def build_line_calendar_values(line_data, bid_dates, off_value=""):
     """
@@ -306,7 +307,7 @@ def master_lines_to_dataframe(
             "Blockiness": line_data.get("blockiness_score", 0),
             "Total DO": line_data.get("tot_DO", 0),
             "% tickets paid": line_data.get("company_ticket_pct", 0),
-            "Avg # of legs": line_data.get("avg_legs_per_work_day",0),
+            "Avg # of legs": line_data.get("avg_legs_per_work_day",math.nan),
             "Total CT": line_data.get("tot_CT",0),
             "Premium": int(line_data.get("tot_Premium", line_data.get("tot_premium", 0))),
         })
