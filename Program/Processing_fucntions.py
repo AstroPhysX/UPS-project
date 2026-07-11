@@ -1,8 +1,11 @@
 from datetime import date, datetime, timedelta
 import re
+import math
+from collections import Counter
+import pandas as pd
+from copy import deepcopy
 
-#Red flag blockiness
-
+#Blockiness score using Red flag without category scores--------------------------------------------------------------------------------------------------------------------------------------
 def weighted_block_average(lengths):
     """
     Rewards larger blocks.
@@ -16,7 +19,6 @@ def weighted_block_average(lengths):
 
     return sum(length ** 2 for length in lengths) / sum(lengths)
 
-
 def harmonic_block_average(lengths):
     """
     Punishes tiny blocks.
@@ -28,7 +30,6 @@ def harmonic_block_average(lengths):
         return 0
 
     return len(lengths) / sum(1 / length for length in lengths)
-
 
 def block_quality(lengths):
     """
@@ -47,7 +48,6 @@ def block_quality(lengths):
     harmonic = harmonic_block_average(lengths)
 
     return (weighted * harmonic) ** 0.5
-
 
 def merge_touching_work_blocks(work_blocks):
     """
@@ -86,7 +86,6 @@ def merge_touching_work_blocks(work_blocks):
             merged.append(block.copy())
 
     return merged
-
 
 def calculate_red_flag_penalty(
     work_blocks,
@@ -189,7 +188,6 @@ def calculate_red_flag_penalty(
 
     return penalty
 
-
 def safe_harmonic_average(values):
     """
     Harmonic average for PP bonuses.
@@ -204,55 +202,51 @@ def safe_harmonic_average(values):
 
     return len(values) / sum(1 / value for value in values)
 
-
-def add_blockiness_scores(master_lines, bid_period_info):
+def add_blockiness_scores(
+    master_lines,
+    bid_period_info,
+    vto_fixed_score=10,
+    vor_fixed_score=0,
+    round_to_nearest=5,
+):
     """
     Adds:
 
         line["blockiness_score"]
 
-    Main idea:
-        category base score + clean block bonus
+    This version removes category_base_scores entirely.
 
-    This version avoids ideal 7-on / 7-off tuning.
+    Scoring:
+        - VTO pay periods receive vto_fixed_score.
+        - VOR pay periods receive vor_fixed_score.
+        - TRIP/RB/RA/SB/SA pay periods receive only the calculated
+          red-flag blockiness score.
+        - Final line score = average of PP scores, bucketed by 5 points.
 
-    Instead it:
-        - rewards large work blocks
-        - rewards large off blocks
-        - punishes tiny work islands
-        - punishes tiny internal off gaps
-        - punishes too many separate work blocks
-        - lets one ugly PP drag down the final line score
+    Example:
+        add_blockiness_scores(
+            master_lines,
+            bid_period_info,
+            vto_fixed_score=95,
+            vor_fixed_score=0,
+        )
     """
 
     pay_period_ranges = bid_period_info["pay_period_date_ranges"]
-
-    category_base_scores = {
-        "TRIP": 700,
-        "VTO": 600,
-        "RB": 500,
-        "RA": 400,
-        "SB": 300,
-        "SA": 200,
-        "VOR": 100,
-        "UNKNOWN": 0,
-    }
 
     code_preference_order = ["VTO", "RB", "RA", "SB", "SA", "VOR"]
     measurable_codes = {"RB", "RA", "SB", "SA", "VOR"}
 
     for line_number, line in master_lines.items():
 
-        pp_base_scores = []
-        pp_block_bonuses = []
+        pp_scores = []
 
         for pp_index, pp in enumerate(line["PPs"]):
 
             pp_name = pp.get("pp", f"PP{pp_index + 1}")
 
             if pp_name not in pay_period_ranges:
-                pp_base_scores.append(0)
-                pp_block_bonuses.append(0)
+                pp_scores.append(0)
                 continue
 
             pp_start = date.fromisoformat(pay_period_ranges[pp_name]["start"])
@@ -345,17 +339,15 @@ def add_blockiness_scores(master_lines, bid_period_info):
                             "days_gone": (previous_date - block_start).days + 1,
                         })
 
-            base_score = category_base_scores.get(pp_category, 0)
-            pp_base_scores.append(base_score)
-
             # --------------------------------------------------------
-            # VTO handling
+            # Fixed-score categories
             # --------------------------------------------------------
             if pp_category == "VTO":
-                # VTO is clean time off.
-                # Keep the bonus below 100 so VTO cannot outrank TRIP
-                # only because of blockiness.
-                pp_block_bonuses.append(95)
+                pp_scores.append(vto_fixed_score)
+                continue
+
+            if pp_category == "VOR":
+                pp_scores.append(vor_fixed_score)
                 continue
 
             # --------------------------------------------------------
@@ -365,7 +357,7 @@ def add_blockiness_scores(master_lines, bid_period_info):
             work_blocks.sort(key=lambda block: block["start_date"])
 
             if not work_blocks:
-                pp_block_bonuses.append(0)
+                pp_scores.append(0)
                 continue
 
             # --------------------------------------------------------
@@ -412,8 +404,6 @@ def add_blockiness_scores(master_lines, bid_period_info):
                 + 0.50 * off_quality
             )
 
-            # Scale the natural block size into a 0-99 bonus range.
-            # No ideal 7-day target is used.
             raw_bonus = raw_bonus * 7
 
             # --------------------------------------------------------
@@ -425,43 +415,26 @@ def add_blockiness_scores(master_lines, bid_period_info):
                 internal_off_gaps=internal_off_gaps,
             )
 
-            final_bonus = raw_bonus - penalty
+            pp_score = raw_bonus - penalty
 
-            # Keep category base dominant.
-            final_bonus = max(0, min(final_bonus, 99))
+            # Keep score controlled.
+            pp_score = max(0, min(pp_score, 99))
 
-            pp_block_bonuses.append(final_bonus)
+            pp_scores.append(pp_score)
 
         # ------------------------------------------------------------
         # Final line score
         # ------------------------------------------------------------
-        if pp_base_scores:
-            average_base_score = sum(pp_base_scores) / len(pp_base_scores)
+        if pp_scores:
+            blockiness_score = sum(pp_scores) / len(pp_scores)
         else:
-            average_base_score = 0
+            blockiness_score = 0
 
-        if pp_block_bonuses:
-            average_bonus = sum(pp_block_bonuses) / len(pp_block_bonuses)
-            harmonic_bonus = safe_harmonic_average(pp_block_bonuses)
-
-            # This is important:
-            # Do not let one excellent PP completely hide one ugly PP.
-            final_bonus = (
-                0.60 * average_bonus
-                + 0.40 * harmonic_bonus
-            )
-        else:
-            final_bonus = 0
-
-        blockiness_score = average_base_score + final_bonus
-
-        bucketed_blockiness_score = int((average_base_score + final_bonus)//2) * 2
+        bucketed_blockiness_score = int(blockiness_score // round_to_nearest) * round_to_nearest
 
         line["blockiness_score"] = bucketed_blockiness_score
 
-
-
-
+#% of tickets paid by Company--------------------------------------------------------------------------------------------------------------------------------------
 def add_company_ticket_percentages(master_lines):
     """
     Adds company-paid ticket percentage to each pay period and each line.
@@ -576,59 +549,68 @@ def add_company_ticket_percentages(master_lines):
             line_ticket_pct = 0.0
         
 
-        line["company_ticket_pct"] = line_ticket_pct
+        line["pct_company_tickets"] = line_ticket_pct
 
-
-def to_date(value):
-    if isinstance(value, datetime):
-        return value.date()
-
-    if isinstance(value, date):
-        return value
-
-    if isinstance(value, str):
-        return date.fromisoformat(value)
-
-    raise TypeError(f"Unsupported date value: {value!r}")
-
+#Training in Days on score removed the category scores--------------------------------------------------------------------------------------------------------------------------------------
 def add_training_fit_score(
     master_lines,
     training_start,
     training_end,
-    bid_period_info,
-    trip_weight=0.80,
-    off_edge_weight=0.20,
-    category_base_scores=None,
+    bid_start,
+    bid_end,
+    vto_score=30,
+    vor_score=30,
+    true_off_max_score=20,
 ):
     """
     Adds training_fit_score to each line.
 
     Final score:
-        training_fit_score = category_base_score + fit_score
+        0 to 100 percent.
 
-    Category base score:
-        Based on the best/highest category touched by the training dates.
+    Higher score = better.
 
-    Fit score:
-        0 to 100 score that rewards training replacing work/reserve days
-        and penalizes training falling in the middle of true days-off blocks.
+    Per-day scoring:
+        TRIP / RB / RA / SB / SA = 100
+        VTO                      = 30
+        VOR                      = 20
+        true day off              = 0 to true_off_max_score
+
+    True day off logic:
+        - Off day at the edge of an off block gets true_off_max_score.
+        - Off day in the middle of an off block gets close to 0.
+        - This helps avoid training falling in the middle of clean days off.
+
+    Date logic:
+        Uses inclusive calendar dates.
+
+        Example:
+            training_start = "2023-07-06"
+            training_end   = "2023-07-10"
+
+        Means:
+            Jul 06, Jul 07, Jul 08, Jul 09, Jul 10
+
+    Adds:
+        line["training_fit_score"]
+
+    Returns:
+        master_lines
     """
 
-    if category_base_scores is None:
-        category_base_scores = {
-            "TRIP": 700,
-            "VTO": 200,
-            "RB": 600,
-            "RA": 500,
-            "SB": 400,
-            "SA": 300,
-            "VOR": 100,
-            "UNKNOWN": 0,
-        }
+    normal_work_codes = {"TRIP", "RB", "RA", "SB", "SA"}
 
-    # Codes that should count as "on/work" days for training replacement.
-    # VTO is intentionally excluded because it is time off.
-    work_codes = {"TRIP", "RB", "RA", "SB", "SA", "VOR"}
+    def to_date(value):
+        if isinstance(value, datetime):
+            return value.date()
+
+        if isinstance(value, date):
+            return value
+
+        if isinstance(value, str):
+            return date.fromisoformat(value)
+
+        raise TypeError(f"Unsupported date value: {value!r}")
 
     def date_range_inclusive(start, end):
         current = start
@@ -638,15 +620,31 @@ def add_training_fit_score(
 
     def add_day_category(day_categories, day, category):
         """
-        Saves the highest-value category for a given day.
+        Saves the strongest category for a given day.
 
-        Example:
-            If a day somehow has both TRIP and RB,
-            TRIP wins because 700 > 500.
+        Priority:
+            TRIP/RB/RA/SB/SA = strongest
+            VTO
+            VOR
+            UNKNOWN = weakest
+
+        This protects you if a day somehow appears in more than one assignment.
         """
+
+        priority = {
+            "TRIP": 100,
+            "RB": 100,
+            "RA": 100,
+            "SB": 100,
+            "SA": 100,
+            "VTO": vto_score,
+            "VOR": vor_score,
+            "UNKNOWN": 0,
+        }
+
         current_category = day_categories.get(day, "UNKNOWN")
 
-        if category_base_scores.get(category, 0) > category_base_scores.get(current_category, 0):
+        if priority.get(category, 0) > priority.get(current_category, 0):
             day_categories[day] = category
 
     def get_day_categories_for_line(line):
@@ -657,9 +655,10 @@ def add_training_fit_score(
                 date(2023, 7, 6): "TRIP",
                 date(2023, 7, 7): "RB",
                 date(2023, 7, 8): "VTO",
+                date(2023, 7, 9): "VOR",
             }
 
-        True days off will simply not appear and later become UNKNOWN.
+        True days off are not stored and later become UNKNOWN.
         """
 
         day_categories = {}
@@ -694,14 +693,14 @@ def add_training_fit_score(
 
                     continue
 
-                # Case 2: coded assignment such as VTO, RB, RA, SB, SA, VOR
+                # Case 2: coded assignment such as VTO, VOR, RB, RA, SB, SA
                 code = assignment.get("code")
                 assignment_date = assignment.get("date")
 
                 if code and assignment_date:
                     code = str(code).strip().upper()
 
-                    if code in category_base_scores:
+                    if code in {"VTO", "VOR", "RB", "RA", "SB", "SA"}:
                         add_day_category(
                             day_categories,
                             to_date(assignment_date),
@@ -710,16 +709,29 @@ def add_training_fit_score(
 
         return day_categories
 
-    def build_off_blocks(bid_days, work_days):
+    def build_true_off_blocks(bid_days, day_categories):
+        """
+        Builds blocks of true days off.
+
+        True days off are days that do not have:
+            - TRIP
+            - RB / RA / SB / SA
+            - VTO
+            - VOR
+
+        In other words, only UNKNOWN days count as true off days.
+        """
+
         off_blocks = []
 
         current_start = None
         previous_day = None
 
         for day in sorted(bid_days):
-            is_off_day = day not in work_days
+            category = day_categories.get(day, "UNKNOWN")
+            is_true_off_day = category == "UNKNOWN"
 
-            if is_off_day:
+            if is_true_off_day:
                 if current_start is None:
                     current_start = day
 
@@ -736,10 +748,58 @@ def add_training_fit_score(
 
         return off_blocks
 
+    def true_off_day_score(day, off_day_to_block):
+        """
+        Scores a true day off from 0 to true_off_max_score.
+
+        Edge of off block:
+            score = true_off_max_score
+
+        Middle of off block:
+            score approaches 0
+        """
+
+        block = off_day_to_block.get(day)
+
+        if block is None:
+            return 0
+
+        block_start, block_end = block
+        block_length = (block_end - block_start).days + 1
+
+        if block_length <= 1:
+            return true_off_max_score
+
+        days_from_left_edge = (day - block_start).days
+        days_from_right_edge = (block_end - day).days
+
+        edge_distance = min(days_from_left_edge, days_from_right_edge)
+        max_possible_edge_distance = (block_length - 1) / 2
+
+        middle_penalty = edge_distance / max_possible_edge_distance
+
+        edge_score_fraction = 1 - middle_penalty
+
+        return true_off_max_score * edge_score_fraction
+
+    def score_training_day(day, day_categories, off_day_to_block):
+        category = day_categories.get(day, "UNKNOWN")
+
+        if category in normal_work_codes:
+            return 100
+
+        if category == "VTO":
+            return vto_score
+
+        if category == "VOR":
+            return vor_score
+
+        return true_off_day_score(day, off_day_to_block)
+
     training_start = to_date(training_start)
     training_end = to_date(training_end)
-    bid_start = to_date(bid_period_info['bid_period_date_range']['start'])
-    bid_end = to_date(bid_period_info['bid_period_date_range']['end'])
+    bid_start = to_date(bid_start)
+    bid_end = to_date(bid_end)
 
     if training_end < training_start:
         raise ValueError("training_end must be on or after training_start")
@@ -749,101 +809,30 @@ def add_training_fit_score(
 
     training_days = list(date_range_inclusive(training_start, training_end))
     bid_days = set(date_range_inclusive(bid_start, bid_end))
-    training_total_days = len(training_days)
 
     for line_num, line in master_lines.items():
 
         day_categories = get_day_categories_for_line(line)
 
-        # Determine the category for each training day.
-        training_day_categories = [
-            day_categories.get(day, "UNKNOWN")
-            for day in training_days
-        ]
-
-        # Pick the best/highest category touched during training.
-        best_training_category = max(
-            training_day_categories,
-            key=lambda category: category_base_scores.get(category, 0),
-        )
-
-        category_base_score = category_base_scores.get(best_training_category, 0)
-
-        # Work days are TRIP, RB, RA, SB, SA, VOR.
-        # VTO and UNKNOWN are treated as off days.
-        work_days = {
-            day
-            for day, category in day_categories.items()
-            if category in work_codes
-        }
-
-        # 1. Reward training that overlaps work/reserve days.
-        training_work_days = [
-            day for day in training_days
-            if day in work_days
-        ]
-
-        work_overlap_pct = (
-            len(training_work_days) / training_total_days
-        ) * 100
-
-        # 2. Penalize training that falls in the middle of true days-off blocks.
-        training_off_days = [
-            day for day in training_days
-            if day not in work_days
-        ]
-
-        off_blocks = build_off_blocks(bid_days, work_days)
+        true_off_blocks = build_true_off_blocks(bid_days, day_categories)
 
         off_day_to_block = {}
 
-        for block_start, block_end in off_blocks:
+        for block_start, block_end in true_off_blocks:
             for day in date_range_inclusive(block_start, block_end):
                 off_day_to_block[day] = (block_start, block_end)
 
-        middle_penalty_values = []
+        daily_scores = [
+            score_training_day(day, day_categories, off_day_to_block)
+            for day in training_days
+        ]
 
-        for day in training_off_days:
-            block = off_day_to_block.get(day)
+        training_fit_score = sum(daily_scores) / len(daily_scores)
 
-            if block is None:
-                middle_penalty_values.append(1.0)
-                continue
-
-            block_start, block_end = block
-            block_length = (block_end - block_start).days + 1
-
-            if block_length <= 1:
-                middle_penalty_values.append(0.0)
-                continue
-
-            days_from_left_edge = (day - block_start).days
-            days_from_right_edge = (block_end - day).days
-
-            edge_distance = min(days_from_left_edge, days_from_right_edge)
-            max_possible_edge_distance = (block_length - 1) / 2
-
-            middle_penalty = edge_distance / max_possible_edge_distance
-            middle_penalty_values.append(middle_penalty)
-
-        if middle_penalty_values:
-            off_middle_penalty_pct = (
-                sum(middle_penalty_values) / len(middle_penalty_values)
-            ) * 100
-        else:
-            off_middle_penalty_pct = 0.0
-
-        off_edge_score = 100 - off_middle_penalty_pct
-
-        fit_score = (
-            trip_weight * work_overlap_pct
-            + off_edge_weight * off_edge_score
-        )
-
-        line["training_fit_score"] = round(category_base_score + fit_score, 1)
+        line["training_fit_score"] = round(training_fit_score, 1)
 
 
-
+#Util functions--------------------------------------------------------------------------------------------------------------------------------------
 def count_days_off_around_date(assignments, target_date, before_or_after, bid_start, bid_end):
     """
     Counts consecutive days off immediately before or after a given date.
@@ -922,7 +911,6 @@ def count_days_off_around_date(assignments, target_date, before_or_after, bid_st
 
     return days_off
 
-
 def get_all_assignments(line_data):
     assignments = []
 
@@ -931,41 +919,27 @@ def get_all_assignments(line_data):
 
     return assignments
 
-
+#New vacation score with ocv toggle--------------------------------------------------------------------------------------------------------------------------------------
 def add_vacation_days_off_score(
     master_lines,
     vacation_ranges,
     bid_period_info,
     pp_drop_threshold_days=14,
-    save_details=True,
+    save_details=False,
 ):
-    """
-    Adds a vacation days-off score to each master line.
+    score_field = "extra_vacation_days"
 
-    The score counts ONLY the extra line-dependent days off directly connected
-    to the vacation or dropped pay period.
+    def to_date(value):
+        if isinstance(value, date):
+            return value
+        return datetime.strptime(value, "%Y-%m-%d").date()
 
-    It does NOT count:
-        - the vacation days themselves
-        - the days inside a dropped pay period
-
-    UPS rule:
-        If vacation days in a pay period are >= pp_drop_threshold_days,
-        that full pay period is treated as protected/dropped.
-
-    Edge cases handled:
-        - Vacation causing current PP1 or PP2 to drop.
-        - Vacation causing the previous pay period to drop.
-        - Vacation causing the next pay period to drop.
-        - Multiple separate vacation blocks.
-          The function focuses on the largest protected vacation/drop block.
-    """
-    score_field="extra_vacation_days"
-
-    def make_range(start, end):
-        start = to_date(start)
-        end = to_date(end)
-        return {"start": start, "end": end}
+    def make_range(start, end, pp_drop=True):
+        return {
+            "start": to_date(start),
+            "end": to_date(end),
+            "pp_drop": pp_drop,
+        }
 
     def count_overlap_days(range_a, range_b):
         start = max(range_a["start"], range_b["start"])
@@ -979,19 +953,19 @@ def add_vacation_days_off_score(
     def range_length(date_range):
         return (date_range["end"] - date_range["start"]).days + 1
 
+    def get_all_assignments(line_data):
+        assignments = []
+
+        for pp in line_data.get("PPs", []):
+            assignments.extend(pp.get("assignments", []))
+
+        return assignments
+
     def merge_blocks(blocks):
-        """
-        Merges protected blocks that touch or overlap.
-
-        Example:
-            Jun 1-Jun 7 and Jun 8-Jun 14 become Jun 1-Jun 14.
-        """
-
         if not blocks:
             return []
 
         blocks = sorted(blocks, key=lambda b: b["start"])
-
         merged = [blocks[0].copy()]
 
         for block in blocks[1:]:
@@ -999,14 +973,11 @@ def add_vacation_days_off_score(
 
             if block["start"] <= last["end"] + timedelta(days=1):
                 last["end"] = max(last["end"], block["end"])
-                last["reason"] += " + " + block["reason"]
             else:
                 merged.append(block.copy())
 
         return merged
 
-    # Use pay period dates as the real bid boundaries.
-    # This avoids accidentally counting the extra day if bid_period end is one day after PP2.
     pp_ranges = {
         pp_name: make_range(pp_info["start"], pp_info["end"])
         for pp_name, pp_info in bid_period_info["pay_period_date_ranges"].items()
@@ -1017,7 +988,6 @@ def add_vacation_days_off_score(
     bid_start = min(pp["start"] for pp in pp_ranges.values())
     bid_end = max(pp["end"] for pp in pp_ranges.values())
 
-    # Assume pay periods are 28 days unless the actual PP length says otherwise.
     first_pp = sorted_pps[0][1]
     last_pp = sorted_pps[-1][1]
     pp_length = range_length(first_pp)
@@ -1039,22 +1009,37 @@ def add_vacation_days_off_score(
     }
 
     vacation_blocks = [
-        make_range(vac["start"], vac["end"])
+        make_range(
+            vac["start"],
+            vac["end"],
+            pp_drop=vac.get("pp_drop", True),
+        )
         for vac in vacation_ranges
     ]
 
     protected_blocks = []
 
-    # First add the actual vacation ranges.
+    # Add the actual vacation ranges first.
+    # This was missing in your current version.
     for vac in vacation_blocks:
         protected_blocks.append({
             "start": vac["start"],
             "end": vac["end"],
-            "reason": "VACATION",
         })
 
     # Then apply PP-drop logic.
     for pp_name, pp_range in all_pps_to_check.items():
+
+        pp_drop_check_enabled = False
+
+        for vac in vacation_blocks:
+            if vac["pp_drop"] and count_overlap_days(vac, pp_range) > 0:
+                pp_drop_check_enabled = True
+                break
+
+        if not pp_drop_check_enabled:
+            continue
+
         vacation_days_in_pp = 0
 
         for vac in vacation_blocks:
@@ -1064,7 +1049,6 @@ def add_vacation_days_off_score(
             protected_blocks.append({
                 "start": pp_range["start"],
                 "end": pp_range["end"],
-                "reason": f"{pp_name}_DROPPED",
             })
 
     protected_blocks = merge_blocks(protected_blocks)
@@ -1105,7 +1089,6 @@ def add_vacation_days_off_score(
             block_scores.append({
                 "block_start": block["start"],
                 "block_end": block["end"],
-                "reason": block["reason"],
                 "protected_days": protected_days,
                 "days_off_before": days_before,
                 "days_off_after": days_after,
@@ -1113,9 +1096,6 @@ def add_vacation_days_off_score(
             })
 
         if block_scores:
-            # Important:
-            # First prefer the larger vacation/drop block.
-            # Then, among similar blocks, prefer more extra days off.
             best_block = max(
                 block_scores,
                 key=lambda b: (b["protected_days"], b["extra_days_off"])
@@ -1127,10 +1107,9 @@ def add_vacation_days_off_score(
                 line_data[f"{score_field}_details"] = {
                     "selected_block_start": best_block["block_start"].isoformat(),
                     "selected_block_end": best_block["block_end"].isoformat(),
-                    "reason": best_block["reason"],
                     "protected_days_not_counted_in_score": best_block["protected_days"],
                     "days_off_before": best_block["days_off_before"],
-                    "days_off_after": best_block["days_off_after"],
+                    "days_off_after": best_block["days_after"] if "days_after" in best_block else best_block["days_off_after"],
                     "score": best_block["extra_days_off"],
                 }
 
@@ -1139,8 +1118,10 @@ def add_vacation_days_off_score(
 
             if save_details:
                 line_data[f"{score_field}_details"] = None
+
     return new_vacation_ranges
 
+#End or start bid off--------------------------------------------------------------------------------------------------------------------------------------
 def add_bid_edge_days_off(
     master_lines,
     bid_period_info,
@@ -1203,27 +1184,38 @@ def add_bid_edge_days_off(
                 bid_end=bid_end,
             )
 
+#Average number of legs per rest--------------------------------------------------------------------------------------------------------------------------------------
 def add_avg_legs_per_work_day(
     master_lines,
     score_field="avg_legs_per_work_day",
     round_digits=1,
+    no_score_categories=None,
 ):
     """
     Adds this top-level key to each line:
 
-        line_data["avg_non_dh_flights_between_rests"]
+        line_data[score_field]
 
     Meaning:
-        Average number of non-DH flight legs between rests.
+        Average number of counted flight legs between rests.
 
     Rules:
-        - Flights with route_flags containing "DH ..." are not counted.
+        - DH flights are not counted.
+        - BUS positioning is not counted.
+        - Flights with code SBG or SBA are not counted.
+          Example: SBG2, SBA1, SBG5
         - Rest is detected when flight["rest"] has a real value.
-        - VTO, RB, RA, SB, SA, VOR are assigned 0.
-        - If no qualifying non-DH flight blocks exist, score is 0.
+        - VTO, RB, RA, SB, SA, VOR lines/PPs/assignments receive NaN.
+        - If no qualifying flight blocks exist, score is NaN, not 0.
     """
 
-    zero_categories = {"VTO", "RB", "RA", "SB", "SA", "VOR"}
+    if no_score_categories is None:
+        no_score_categories = {"VTO", "RB", "RA", "SB", "SA", "VOR"}
+    else:
+        no_score_categories = {
+            str(value).strip().upper()
+            for value in no_score_categories
+        }
 
     def normalize_category(value):
         if value is None:
@@ -1231,11 +1223,6 @@ def add_avg_legs_per_work_day(
         return str(value).strip().upper()
 
     def get_category(obj):
-        """
-        Tries to detect whether a line/PP/assignment is VTO, RB, RA, etc.
-        This is intentionally flexible because these categories may appear
-        under different key names depending on your parser.
-        """
         if not isinstance(obj, dict):
             return None
 
@@ -1250,17 +1237,16 @@ def add_avg_legs_per_work_day(
 
         for key in possible_keys:
             value = normalize_category(obj.get(key))
-            if value in zero_categories:
+            if value in no_score_categories:
                 return value
 
-        # Also handles structures like {"VTO": True}
-        for category in zero_categories:
+        for category in no_score_categories:
             if obj.get(category) is True:
                 return category
 
         return None
 
-    def has_dh_flag(flight):
+    def has_excluded_route_flag(flight):
         flags = flight.get("route_flags")
 
         if not flags:
@@ -1275,7 +1261,32 @@ def add_avg_legs_per_work_day(
             if flag_text.startswith("DH"):
                 return True
 
+            if "BUS" in flag_text:
+                return True
+
         return False
+
+    def has_excluded_code(flight):
+        code = flight.get("code")
+
+        if not code:
+            return False
+
+        code_text = str(code).strip().upper()
+
+        return (
+            code_text.startswith("SBG")
+            or code_text.startswith("SBA")
+        )
+
+    def should_count_as_leg(flight):
+        if has_excluded_route_flag(flight):
+            return False
+
+        if has_excluded_code(flight):
+            return False
+
+        return True
 
     def has_rest_after_flight(flight):
         rest = flight.get("rest")
@@ -1283,28 +1294,26 @@ def add_avg_legs_per_work_day(
 
     for line_number, line_data in master_lines.items():
 
-        # If the whole line is VTO/RB/RA/SB/SA/VOR, score is 0.
-        if get_category(line_data) in zero_categories:
-            line_data[score_field] = 0
-            if save_details:
-                line_data[details_field] = {
-                    "blocks": [],
-                    "reason": "zero_category_line",
-                }
+        # Default every line to NaN first.
+        # This prevents missing values from later becoming 0 through .get(..., 0).
+        line_data[score_field] = math.nan
+
+        # Pure VTO/RB/RA/SB/SA/VOR line: leave as NaN.
+        if get_category(line_data) in no_score_categories:
             continue
 
         blocks_between_rests = []
 
         for pp in line_data.get("PPs", []):
 
-            # If the whole PP is VTO/RB/RA/SB/SA/VOR, ignore it.
-            if get_category(pp) in zero_categories:
+            # Ignore full non-trip pay periods.
+            if get_category(pp) in no_score_categories:
                 continue
 
             for assignment in pp.get("assignments", []):
 
-                # If this assignment is VTO/RB/RA/SB/SA/VOR, ignore it.
-                if get_category(assignment) in zero_categories:
+                # Ignore non-trip assignments.
+                if get_category(assignment) in no_score_categories:
                     continue
 
                 flights = assignment.get("flights", [])
@@ -1316,31 +1325,32 @@ def add_avg_legs_per_work_day(
 
                 for flight in flights:
 
-                    # Count only non-DH flight legs.
-                    if not has_dh_flag(flight):
+                    if should_count_as_leg(flight):
                         current_block_count += 1
 
-                    # A rest ends the current block.
                     if has_rest_after_flight(flight):
                         if current_block_count > 0:
                             blocks_between_rests.append(current_block_count)
 
                         current_block_count = 0
 
-                # End of trip also closes the final block.
                 if current_block_count > 0:
                     blocks_between_rests.append(current_block_count)
 
-        if blocks_between_rests:
-            avg_value = sum(blocks_between_rests) / len(blocks_between_rests)
+        # If there are no real counted blocks, keep NaN.
+        if not blocks_between_rests:
+            continue
 
-            if round_digits is not None:
-                avg_value = round(avg_value, round_digits)
-        else:
-            avg_value = 0
+        avg_value = sum(blocks_between_rests) / len(blocks_between_rests)
+
+        if round_digits is not None:
+            avg_value = round(avg_value, round_digits)
 
         line_data[score_field] = avg_value
 
+    return master_lines
+
+#Function should maybe be moved to df
 def line_numbers_to_bid_string(df, number_of_lines, column="Line Number"):
     """
     Takes the first `number_of_lines` entries from the line number column
@@ -1390,14 +1400,13 @@ def line_numbers_to_bid_string(df, number_of_lines, column="Line Number"):
 
     return " ".join(parts)
 
-
-
+#Requested days off--------------------------------------------------------------------------------------------------------------------------------------
 def add_requested_days_off_scores(
     master_lines,
     bid_period_info,
     requested_dates,
     *,
-    score_key="requested_days_off_score",
+    score_key="pct_requested_days_off",
 
     # Percentage scoring
     true_off_percent=100.0,
@@ -1784,3 +1793,1343 @@ def add_requested_days_off_scores(
         final_score = min(final_score, max_score)
 
         line_data[score_key] = round(final_score)
+
+#line type preference--------------------------------------------------------------------------------------------------------------------------------------
+def add_line_type_preference_scores(
+    master_lines,
+    preference_order,
+    *,
+    score_key="line_type_preference_score",
+    save_details=False,
+    counts_key="line_type_counts",
+    scoring_percentages_key="line_type_power_adjusted_percentage",
+    preference_score_map_key="line_type_preference_score_map",
+    clear_existing_details=True,
+    top_score=100,
+    bottom_score=0,
+    power_law_coeff=1.0,
+    unknown_score=None,
+    overlay_types=("VTO", "VOR"),
+    round_digits=1,
+):
+    """
+    Adds a line-type preference score to each line.
+
+    Default behavior:
+        Only saves:
+            line_data["line_type_preference_score"]
+
+    If save_details=True, also saves:
+        line_data["line_type_counts"]
+        line_data["line_type_power_adjusted_percentage"]
+        line_data["line_type_preference_score_map"]
+
+    Scoring philosophy:
+
+        1. Pure Trips:
+            {"TRIPS": 10}
+
+            Scoring percentage:
+                TRIPS = 100%
+
+        2. Trips mixed with VTO:
+            {"TRIPS": 10, "VTO": 28}
+
+            Actual counts do NOT matter for the VTO amount.
+
+            Scoring percentage:
+                TRIPS = 50%
+                VTO   = 50%
+
+            So if:
+                TRIPS = 100
+                VTO   = 80
+
+            Final score:
+                90
+
+        3. Trips mixed with VOR:
+            Same behavior as VTO.
+
+        4. Trips mixed with RA/RB/SA/SB/SBA/SBG:
+            Uses actual percentages.
+
+        5. DH/BUS:
+            Counts as TRIPS by default.
+
+            Exception:
+                If a trip starts with DH/BUS, ends with DH/BUS,
+                and every non-DH/BUS day inside is the same SBA/SBG type,
+                the whole trip counts as SBA/SBG.
+
+                Example:
+                    DH + SBG + SBG + SBG + DH
+
+                Counts as:
+                    SBG = total_days_gone
+
+    power_law_coeff:
+        Controls the power-law falloff of the preference order.
+
+        1.0 = linear
+        >1.0 = lower preferences fall off faster
+        <1.0 = lower preferences stay closer to the top
+    """
+
+    if power_law_coeff <= 0:
+        raise ValueError("power_law_coeff must be greater than 0.")
+
+    def normalize_line_type(value):
+        if value is None:
+            return None
+
+        text = str(value).strip().upper()
+
+        if not text:
+            return None
+
+        aliases = {
+            "TRIP": "TRIPS",
+            "TRIPS": "TRIPS",
+            "FLY": "TRIPS",
+            "FLYING": "TRIPS",
+
+            "VTO": "VTO",
+            "RB": "RB",
+            "RA": "RA",
+            "SB": "SB",
+            "SA": "SA",
+            "VOR": "VOR",
+
+            "SBA": "SBA",
+            "SBG": "SBG",
+        }
+
+        if text in aliases:
+            return aliases[text]
+
+        match = re.fullmatch(r"(SBA|SBG)\d*", text)
+
+        if match:
+            return match.group(1)
+
+        return text
+
+    def route_flags_have_dh_or_bus(route_flags):
+        if not route_flags:
+            return False
+
+        if isinstance(route_flags, str):
+            route_flags = [route_flags]
+
+        for flag in route_flags:
+            flag_text = str(flag).upper()
+
+            if "DH" in flag_text or "BUS" in flag_text:
+                return True
+
+        return False
+
+    def safe_int(value, default=0):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return default
+
+    def get_flight_date_key(flight, fallback_index):
+        return (
+            flight.get("start_date")
+            or flight.get("date")
+            or flight.get("end_date")
+            or f"NO_DATE_{fallback_index}"
+        )
+
+    def detect_sba_sbg_sandwich_trip(flights):
+        """
+        Detects:
+
+            DH/BUS + SBA/SBG days + DH/BUS
+
+        If all non-DH/BUS rows are the same SBA/SBG type,
+        then the entire trip counts as that SBA/SBG type.
+        """
+
+        if not flights:
+            return None
+
+        starts_with_dh_or_bus = route_flags_have_dh_or_bus(
+            flights[0].get("route_flags")
+        )
+
+        ends_with_dh_or_bus = route_flags_have_dh_or_bus(
+            flights[-1].get("route_flags")
+        )
+
+        if not starts_with_dh_or_bus or not ends_with_dh_or_bus:
+            return None
+
+        coded_types = set()
+
+        for flight in flights:
+            flight_code = normalize_line_type(flight.get("code"))
+            is_dh_or_bus = route_flags_have_dh_or_bus(
+                flight.get("route_flags")
+            )
+
+            if flight_code in {"SBA", "SBG"}:
+                coded_types.add(flight_code)
+                continue
+
+            if is_dh_or_bus:
+                continue
+
+            return None
+
+        if len(coded_types) == 1:
+            return next(iter(coded_types))
+
+        return None
+
+    # ------------------------------------------------------------
+    # Normalize overlay types
+    # ------------------------------------------------------------
+
+    overlay_types = {
+        normalize_line_type(item)
+        for item in overlay_types
+        if normalize_line_type(item) is not None
+    }
+
+    # ------------------------------------------------------------
+    # Build power-law preference score map
+    # ------------------------------------------------------------
+
+    normalized_order = []
+
+    for item in preference_order:
+        normalized = normalize_line_type(item)
+
+        if normalized and normalized not in normalized_order:
+            normalized_order.append(normalized)
+
+    if not normalized_order:
+        raise ValueError("preference_order must contain at least one valid line type.")
+
+    if len(normalized_order) == 1:
+        preference_score_map = {
+            normalized_order[0]: float(top_score)
+        }
+    else:
+        max_index = len(normalized_order) - 1
+        preference_score_map = {}
+
+        for index, line_type in enumerate(normalized_order):
+            rank_position = 1 - (index / max_index)
+            curved_position = rank_position ** power_law_coeff
+
+            score = bottom_score + (top_score - bottom_score) * curved_position
+            preference_score_map[line_type] = score
+
+    if unknown_score is None:
+        unknown_score = bottom_score
+
+    # ------------------------------------------------------------
+    # Score each line
+    # ------------------------------------------------------------
+
+    for line_number, line_data in master_lines.items():
+        counts = Counter()
+
+        for pp in line_data.get("PPs", []):
+            for assignment in pp.get("assignments", []):
+
+                # ------------------------------------------------
+                # Non-trip assignment:
+                # VTO / RB / RA / SB / SA / VOR
+                # ------------------------------------------------
+                if "flights" not in assignment:
+                    code = assignment.get("code")
+
+                    if code:
+                        normalized_code = normalize_line_type(code)
+                        counts[normalized_code] += 1
+
+                    continue
+
+                # ------------------------------------------------
+                # Trip assignment
+                # ------------------------------------------------
+                flights = assignment.get("flights") or []
+
+                total_trip_days = safe_int(
+                    assignment.get("total_days_gone"),
+                    default=0,
+                )
+
+                if total_trip_days <= 0:
+                    unique_dates = {
+                        get_flight_date_key(flight, index)
+                        for index, flight in enumerate(flights)
+                    }
+                    total_trip_days = len(unique_dates)
+
+                sandwich_type = detect_sba_sbg_sandwich_trip(flights)
+
+                if sandwich_type in {"SBA", "SBG"}:
+                    counts[sandwich_type] += total_trip_days
+                    continue
+
+                coded_days = {}
+
+                for index, flight in enumerate(flights):
+                    flight_code = normalize_line_type(flight.get("code"))
+
+                    if flight_code in {"SBA", "SBG"}:
+                        date_key = get_flight_date_key(flight, index)
+                        coded_days[date_key] = flight_code
+
+                for coded_type in coded_days.values():
+                    counts[coded_type] += 1
+
+                normal_trip_days = max(total_trip_days - len(coded_days), 0)
+
+                if normal_trip_days > 0:
+                    counts["TRIPS"] += normal_trip_days
+
+        # --------------------------------------------------------
+        # Build scoring percentages
+        # --------------------------------------------------------
+
+        present_overlay_types = {
+            line_type
+            for line_type, count in counts.items()
+            if count > 0 and line_type in overlay_types
+        }
+
+        non_overlay_counts = Counter({
+            line_type: count
+            for line_type, count in counts.items()
+            if count > 0 and line_type not in overlay_types
+        })
+
+        scoring_weights = {}
+
+        if present_overlay_types and non_overlay_counts:
+            # VTO/VOR mixed with something else:
+            #
+            # Overlay group gets 50%.
+            # Non-overlay group gets 50%.
+            #
+            # Example:
+            #   TRIPS 10, VTO 28
+            #
+            # Becomes:
+            #   TRIPS 50%
+            #   VTO   50%
+
+            overlay_share = 0.5
+            non_overlay_share = 0.5
+
+            # Split overlay share equally among present overlay types.
+            # Usually this is just VTO or VOR.
+            overlay_each = overlay_share / len(present_overlay_types)
+
+            for overlay_type in present_overlay_types:
+                scoring_weights[overlay_type] = overlay_each
+
+            # Split non-overlay share by actual non-overlay percentages.
+            non_overlay_total = sum(non_overlay_counts.values())
+
+            for line_type, count in non_overlay_counts.items():
+                scoring_weights[line_type] = (
+                    non_overlay_share * count / non_overlay_total
+                )
+
+        else:
+            # No VTO/VOR overlay issue.
+            # Use actual percentages.
+            total_counted = sum(counts.values())
+
+            if total_counted > 0:
+                for line_type, count in counts.items():
+                    scoring_weights[line_type] = count / total_counted
+
+        # --------------------------------------------------------
+        # Calculate final score
+        # --------------------------------------------------------
+
+        if not scoring_weights:
+            final_score = 0
+            scoring_percentages = {}
+        else:
+            final_score = 0
+
+            for line_type, weight in scoring_weights.items():
+                line_type_score = preference_score_map.get(
+                    line_type,
+                    unknown_score,
+                )
+
+                final_score += line_type_score * weight
+
+            scoring_percentages = {
+                line_type: round(weight * 100, round_digits)
+                for line_type, weight in scoring_weights.items()
+            }
+
+        # --------------------------------------------------------
+        # Save result
+        # --------------------------------------------------------
+
+        line_data[score_key] = round(final_score, round_digits)
+
+        if save_details:
+            line_data[counts_key] = dict(counts)
+            line_data[scoring_percentages_key] = scoring_percentages
+            line_data[preference_score_map_key] = {
+                key: round(value, round_digits)
+                for key, value in preference_score_map.items()
+            }
+        
+#% international flights and continents--------------------------------------------------------------------------------------------------------------------------------------
+def normalize_airport_code(value):
+    """
+    Normalizes airport codes like SDF, DFW, CGN, KSDF, etc.
+    """
+
+    if value is None:
+        return None
+
+    text = str(value).strip().upper()
+
+    if not text or text in {"NONE", "NAN", "NULL", "-", "0"}:
+        return None
+
+    text = re.sub(r"[^A-Z0-9]", "", text)
+
+    return text or None
+
+def is_sba_sbg_flight(flight):
+    """
+    Returns True for SBA/SBG entries such as:
+        SBG3
+        SBA1
+
+    Handles both trips_dict style:
+        flight["flight"] = "SBG3"
+
+    and master_lines style:
+        flight["code"] = "SBG3"
+    """
+
+    if not isinstance(flight, dict):
+        return False
+
+    possible_values = [
+        flight.get("flight"),
+        flight.get("code"),
+    ]
+
+    for value in possible_values:
+        if value is None:
+            continue
+
+        text = str(value).strip().upper()
+
+        if re.match(r"^(SBA|SBG)\d*\b", text):
+            return True
+
+    return False
+
+def collect_unique_arrival_destinations_from_trips(
+    trips,
+    *,
+    ignore_sba_sbg=True,
+):
+    """
+    Collects unique arrival/destination airport codes from the trips dictionary.
+
+    This should be run BEFORE creating_master_lines.
+
+    It only collects arrivals because you want destination percentages,
+    not leg percentages.
+
+    Parameters
+    ----------
+    trips:
+        The trips dictionary.
+
+    ignore_sba_sbg:
+        If True, ignores SBA/SBG same-airport entries because they are not
+        real travel destinations.
+
+    Returns
+    -------
+    set
+        Example:
+            {"SDF", "DFW", "ATL", "CGN"}
+    """
+
+    destinations = set()
+
+    for trip_id, trip_data in trips.items():
+        if not isinstance(trip_data, dict):
+            continue
+
+        for block in trip_data.get("blocks", []):
+            if not isinstance(block, dict):
+                continue
+
+            for flight in block.get("flights", []):
+                if not isinstance(flight, dict):
+                    continue
+
+                if ignore_sba_sbg and is_sba_sbg_flight(flight):
+                    continue
+
+                arrival = normalize_airport_code(flight.get("arrival"))
+
+                if arrival:
+                    destinations.add(arrival)
+
+    return destinations
+
+def build_bid_period_airport_lookup(
+    airports_csv_path,
+    destination_codes,
+    *,
+    allowed_types=("large_airport", "medium_airport"),
+):
+    """
+    Builds a small airport lookup table for only the destination codes
+    found in the bid period.
+
+    Uses OurAirports airports.csv.
+
+    It matches against:
+        iata_code
+        local_code
+        gps_code
+        ident
+
+    Returns
+    -------
+    airport_lookup:
+        Dictionary keyed by the bid package destination code.
+
+    unmatched_codes:
+        Sorted list of destination codes that were not found.
+
+    matched_airports_df:
+        Small DataFrame useful for debugging.
+    """
+
+    destination_codes = {
+        normalize_airport_code(code)
+        for code in destination_codes
+        if normalize_airport_code(code)
+    }
+
+    if not destination_codes:
+        return {}, [], pd.DataFrame()
+
+    columns_needed = [
+        "ident",
+        "type",
+        "name",
+        "continent",
+        "iso_country",
+        "gps_code",
+        "iata_code",
+        "local_code",
+    ]
+
+    airports = pd.read_csv(
+        airports_csv_path,
+        usecols=lambda col: col in columns_needed,
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    if allowed_types is not None:
+        airports = airports[airports["type"].isin(allowed_types)].copy()
+
+    code_columns = [
+        "iata_code",
+        "local_code",
+        "gps_code",
+        "ident",
+    ]
+
+    matches = []
+
+    for code_column in code_columns:
+        temp = airports.copy()
+
+        temp["bid_destination_code"] = temp[code_column].apply(
+            normalize_airport_code
+        )
+        temp["matched_code_column"] = code_column
+
+        temp = temp[temp["bid_destination_code"].isin(destination_codes)]
+
+        if not temp.empty:
+            matches.append(temp)
+
+    if not matches:
+        return {}, sorted(destination_codes), pd.DataFrame()
+
+    matched_airports = pd.concat(matches, ignore_index=True)
+
+    # If the same code matches multiple rows, prefer IATA first.
+    match_priority = {
+        "iata_code": 0,
+        "local_code": 1,
+        "gps_code": 2,
+        "ident": 3,
+    }
+
+    type_priority = {
+        "large_airport": 0,
+        "medium_airport": 1,
+        "small_airport": 2,
+        "heliport": 3,
+        "seaplane_base": 4,
+        "closed": 5,
+    }
+
+    matched_airports["match_priority"] = (
+        matched_airports["matched_code_column"]
+        .map(match_priority)
+        .fillna(99)
+    )
+
+    matched_airports["type_priority"] = (
+        matched_airports["type"]
+        .map(type_priority)
+        .fillna(99)
+    )
+
+    matched_airports = matched_airports.sort_values(
+        by=[
+            "bid_destination_code",
+            "match_priority",
+            "type_priority",
+        ]
+    )
+
+    matched_airports = matched_airports.drop_duplicates(
+        subset=["bid_destination_code"],
+        keep="first",
+    )
+
+    airport_lookup = {}
+
+    for _, row in matched_airports.iterrows():
+        code = row["bid_destination_code"]
+
+        airport_lookup[code] = {
+            "local_code": row.get("local_code", ""),
+            "iata_code": row.get("iata_code", ""),
+            "gps_code": row.get("gps_code", ""),
+            "ident": row.get("ident", ""),
+            "iso_country": row.get("iso_country", ""),
+            "continent": row.get("continent", ""),
+            "type": row.get("type", ""),
+            "name": row.get("name", ""),
+            "matched_code_column": row.get("matched_code_column", ""),
+        }
+
+    unmatched_codes = sorted(destination_codes - set(airport_lookup.keys()))
+
+    return airport_lookup, unmatched_codes, matched_airports
+
+def add_international_destination_scores(
+    master_lines,
+    airport_lookup,
+    *,
+    home_country="US",
+    ignore_sba_sbg=True,
+    continent_codes=("EU", "AS", "SA", "AF", "OC"),
+    continent_percent_denominator="all_known_destinations",
+):
+    """
+    Adds international destination scoring to each line in master_lines.
+
+    This counts ARRIVALS only.
+
+    Percentage fields are set to NaN when the line has no countable trip
+    destinations at all.
+    """
+
+    if continent_percent_denominator not in {
+        "all_known_destinations",
+        "international_destinations",
+    }:
+        raise ValueError(
+            "continent_percent_denominator must be either "
+            "'all_known_destinations' or 'international_destinations'"
+        )
+
+    for line_number, line_data in master_lines.items():
+        international_count = 0
+        domestic_count = 0
+        known_count = 0
+
+        has_countable_destination = False
+        unknown_destinations = set()
+
+        continent_counts = {
+            continent: 0 for continent in continent_codes
+        }
+
+        for pp in line_data.get("PPs", []):
+            if not isinstance(pp, dict):
+                continue
+
+            for assignment in pp.get("assignments", []):
+                if not isinstance(assignment, dict):
+                    continue
+
+                for flight in assignment.get("flights", []):
+                    if not isinstance(flight, dict):
+                        continue
+
+                    if ignore_sba_sbg and is_sba_sbg_flight(flight):
+                        continue
+
+                    arrival = normalize_airport_code(flight.get("arrival"))
+
+                    if not arrival:
+                        continue
+
+                    # This means the line has at least one real destination
+                    # arrival, even if that airport is not found in the lookup.
+                    has_countable_destination = True
+
+                    airport_info = airport_lookup.get(arrival)
+
+                    if airport_info is None:
+                        unknown_destinations.add(arrival)
+                        continue
+
+                    known_count += 1
+
+                    iso_country = airport_info.get("iso_country", "")
+                    continent = airport_info.get("continent", "")
+
+                    if iso_country == home_country:
+                        domestic_count += 1
+                    else:
+                        international_count += 1
+
+                        if continent in continent_counts:
+                            continent_counts[continent] += 1
+
+        # ---------------------------------------------------------
+        # If there are no real trip destinations, set pct fields NaN
+        # ---------------------------------------------------------
+
+        if not has_countable_destination:
+            line_data["pct_dest_int"] = float("nan")
+
+            for continent in continent_counts:
+                line_data[f"pct_dest_{continent}"] = float("nan")
+
+            continue
+
+        # ---------------------------------------------------------
+        # If there are destinations but none matched the airport lookup,
+        # the percentage cannot be calculated reliably.
+        # ---------------------------------------------------------
+
+        if known_count == 0:
+            line_data["pct_dest_int"] = float("nan")
+
+            for continent in continent_counts:
+                line_data[f"pct_dest_{continent}"] = float("nan")
+
+            continue
+
+        # ---------------------------------------------------------
+        # Normal percentage calculation
+        # ---------------------------------------------------------
+
+        line_data["pct_dest_int"] = round(
+            international_count / known_count * 100,
+            2,
+        )
+
+        for continent, count in continent_counts.items():
+            percent_field = f"pct_dest_{continent}"
+
+            if continent_percent_denominator == "all_known_destinations":
+                denominator = known_count
+            else:
+                denominator = international_count
+
+            if denominator:
+                line_data[percent_field] = round(count / denominator * 100, 2)
+            else:
+                line_data[percent_field] = 0.0
+
+#Calculates pay per line--------------------------------------------------------------------------------------------------------------------------------------
+def add_pay_to_master_lines(
+    master_lines,
+    hourly_rate,
+    *,
+    default_pp_guarantee_hours=75.0,
+    pp_guarantees=None,
+    mutate=True,
+    round_digits=2,
+    add_flat_fields=True,
+    save_details = False
+):
+    """
+    Adds estimated pay information to each line in master_lines.
+
+    This does NOT overwrite:
+        CT
+        BT
+        DT
+        tot_CT
+        tot_BT
+        tot_DT
+
+    Instead it adds:
+        line_data["pay"]
+
+    Formula per pay period:
+        extracted_credit_hours = PP["CT"]
+        paid_credit_hours = max(extracted_credit_hours, guarantee_hours)
+        base_pay = paid_credit_hours * hourly_rate
+
+    Line formula:
+        total_base_pay = sum(PP base pay)
+        total_premium = sum(trip assignment premium)
+        total_per_diem = sum(trip assignment per_diem)
+
+        taxable_pay_estimate = total_base_pay + total_premium
+        cash_pay_estimate = taxable_pay_estimate + total_per_diem
+
+    Parameters
+    ----------
+    master_lines:
+        Dictionary keyed by line number.
+
+    hourly_rate:
+        Hourly pay rate for seat/year.
+        Example: 284.29 for 2025 15th-year FO.
+
+    default_pp_guarantee_hours:
+        Usually 75.0 for a 28-day pay period.
+        Use 96.0 for a 35-day pay period, or pass pp_guarantees.
+
+    pp_guarantees:
+        Optional dictionary by PP name.
+        Example:
+            {"PP1": 75.0, "PP2": 75.0}
+
+    mutate:
+        If True, modifies master_lines in place.
+        If False, returns a deep copy.
+
+    add_flat_fields:
+        If True, also adds simple top-level numeric fields useful for DataFrame sorting:
+            pay_cash_estimate
+            pay_taxable_estimate
+            pay_base
+            pay_premium
+            pay_per_diem
+            paid_CT
+            guarantee_credit_added
+    """
+    def time_to_hours(value):
+        """
+        Converts UPS-style time strings to decimal hours.
+
+        Handles:
+            '74:24'   -> 74.4
+            '26:09'   -> 26.15
+            '15h37'   -> 15.6167
+            '41h08T'  -> 41.1333
+            '33h16D'  -> 33.2667
+            74.4      -> 74.4
+            None      -> 0.0
+        """
+
+        if value is None:
+            return 0.0
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip()
+
+        if not text:
+            return 0.0
+
+        # Remove trailing UPS credit markers such as T, D, M, etc.
+        # Example: 41h08T -> 41h08
+        text = re.sub(r"[A-Za-z]+$", "", text)
+
+        # Format: HH:MM
+        if ":" in text:
+            hours, minutes = text.split(":", 1)
+            return int(hours) + int(minutes) / 60
+
+        # Format: HHhMM
+        match = re.match(r"^(\d+)h(\d+)$", text)
+        if match:
+            hours = int(match.group(1))
+            minutes = int(match.group(2))
+            return hours + minutes / 60
+
+        # Format: HHh
+        match = re.match(r"^(\d+)h$", text)
+        if match:
+            return float(match.group(1))
+
+        # Fallback for strings like '74.4'
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+
+    def hours_to_hhmm(hours):
+        """
+        Converts decimal hours to H:MM string.
+
+        Example:
+            75.0 -> '75:00'
+            74.4 -> '74:24'
+        """
+
+        if hours is None:
+            hours = 0.0
+
+        total_minutes = int(round(float(hours) * 60))
+        h = total_minutes // 60
+        m = total_minutes % 60
+        return f"{h}:{m:02d}"
+
+
+    def safe_money(value):
+        """
+        Converts money-like values to float.
+
+        Handles:
+            431.89
+            '431.89'
+            '$431.89'
+            None
+        """
+
+        if value is None:
+            return 0.0
+
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip().replace("$", "").replace(",", "")
+
+        if not text:
+            return 0.0
+
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+
+    def get_pp_guarantee_hours(pp, default_guarantee_hours=75.0, pp_guarantees=None):
+        """
+        Returns the pay-period guarantee for a PP.
+
+        default_guarantee_hours:
+            Usually 75.0 for a normal 28-day pay period.
+
+        pp_guarantees:
+            Optional dictionary if you need custom guarantees.
+
+            Example:
+                {
+                    "PP1": 75.0,
+                    "PP2": 96.0,
+                }
+        """
+
+    pp_name = pp.get("pp")
+
+    if pp_guarantees and pp_name in pp_guarantees:
+        return float(pp_guarantees[pp_name])
+
+    return float(default_guarantee_hours)
+
+    if not mutate:
+        master_lines = deepcopy(master_lines)
+
+    hourly_rate = float(hourly_rate)
+
+    for line_number, line_data in master_lines.items():
+        pp_pay_details = []
+
+        line_guarantee_applied = False
+
+        total_extracted_credit_hours = 0.0
+        total_paid_credit_hours = 0.0
+        total_guarantee_credit_added_hours = 0.0
+
+        total_base_pay = 0.0
+        total_premium = 0.0
+        total_per_diem = 0.0
+
+        for pp_index, pp in enumerate(line_data.get("PPs", []), start=1):
+            pp_name = pp.get("pp", f"PP{pp_index}")
+
+            extracted_credit_hours = time_to_hours(pp.get("CT"))
+            guarantee_hours = get_pp_guarantee_hours(
+                pp,
+                default_guarantee_hours=default_pp_guarantee_hours,
+                pp_guarantees=pp_guarantees,
+            )
+
+            paid_credit_hours = max(extracted_credit_hours, guarantee_hours)
+            guarantee_credit_added_hours = max(
+                0.0,
+                paid_credit_hours - extracted_credit_hours,
+            )
+
+            pp_guarantee_applied = paid_credit_hours > extracted_credit_hours
+            line_guarantee_applied = line_guarantee_applied or pp_guarantee_applied
+
+            pp_base_pay = paid_credit_hours * hourly_rate
+
+            pp_premium = 0.0
+            pp_per_diem = 0.0
+            pp_trip_ids = []
+
+            for assignment in pp.get("assignments", []):
+                # Trip assignments have trip_id, premium, per_diem.
+                # VTO/RA/RB/SA/SB/VOR day assignments usually only have code/date.
+                if "trip_id" in assignment:
+                    pp_trip_ids.append(assignment.get("trip_id"))
+
+                pp_premium += safe_money(assignment.get("premium"))
+                pp_per_diem += safe_money(assignment.get("per_diem"))
+
+            pp_taxable_pay = pp_base_pay + pp_premium
+            pp_cash_pay = pp_taxable_pay + pp_per_diem
+
+            total_extracted_credit_hours += extracted_credit_hours
+            total_paid_credit_hours += paid_credit_hours
+            total_guarantee_credit_added_hours += guarantee_credit_added_hours
+
+            total_base_pay += pp_base_pay
+            total_premium += pp_premium
+            total_per_diem += pp_per_diem
+            if save_details:
+                pp_pay_details.append({
+                    "pp": pp_name,
+
+                    "guarantee_applied": pp_guarantee_applied,
+                    "guarantee_credit_added_hours": round(guarantee_credit_added_hours, 4),
+
+                    # Money
+                    "base_pay": round(pp_base_pay, round_digits),
+                    "taxable_pay_estimate": round(pp_taxable_pay, round_digits),
+                    "cash_pay_estimate": round(pp_cash_pay, round_digits),
+
+                    # Debug / traceability
+                    "trip_ids": pp_trip_ids,
+                })
+
+        taxable_pay_estimate = total_base_pay + total_premium
+        cash_pay_estimate = taxable_pay_estimate + total_per_diem
+        if save_details:
+            line_data["pay"] = {
+                "guarantee_credit_added_hours": round(total_guarantee_credit_added_hours, 4),
+
+                "base_pay": round(total_base_pay, round_digits),
+                "premium": round(total_premium, round_digits),
+                "per_diem": round(total_per_diem, round_digits),
+
+                "taxable_pay_estimate": round(taxable_pay_estimate, round_digits),
+                "cash_pay_estimate": round(cash_pay_estimate, round_digits),
+
+                "PPs": pp_pay_details,
+            }
+
+        if add_flat_fields:
+            line_data["pay_guarantee_applied"] = line_guarantee_applied
+            line_data["tot_pay"] = round(cash_pay_estimate, round_digits)
+            line_data["pay_taxable"] = round(taxable_pay_estimate, round_digits)
+            line_data["pay_premium"] = round(total_premium, round_digits)
+            line_data["pay_per_diem"] = round(total_per_diem, round_digits)
+
+#% of weekends off--------------------------------------------------------------------------------------------------------------------------------------
+def add_weekends_off_percentage(
+    master_lines,
+    bid_period_info=None,
+    *,
+    round_digits=0,
+    save_details=False,
+):
+    """
+    Adds the percentage of complete Saturday/Sunday weekends off
+    to each line in master_lines.
+
+    A weekend counts as off only when:
+        - Saturday is off
+        - Sunday is off
+
+    VTO and VOR are ignored completely:
+        - They do not count as working.
+        - They do not count as off.
+        - A weekend containing VTO or VOR is excluded from the calculation.
+
+    Normal trips count as working for every calendar date from the
+    beginning through the end of the trip, including layover/rest days.
+
+    Other dated codes, such as RA, RB, SA, and SB, count as working.
+
+    Adds:
+        line_data["weekends_off_percent"]
+
+    When save_details=True, also adds:
+        line_data["weekends_off_count"]
+        line_data["weekends_worked_count"]
+        line_data["weekends_ignored_count"]
+        line_data["weekends_counted"]
+    """
+
+    ignored_codes = {"VTO", "VOR"}
+
+    def parse_date(value):
+        if value is None:
+            return None
+
+        if isinstance(value, datetime):
+            return value.date()
+
+        if isinstance(value, date):
+            return value
+
+        return date.fromisoformat(str(value).strip())
+
+    if bid_period_info is not None:
+        bid_range = bid_period_info["bid_period_date_range"]
+
+        bid_start = parse_date(bid_range["start"])
+        bid_end = parse_date(bid_range["end"])
+
+    else:
+        all_dates = []
+
+        for line_data in master_lines.values():
+            for pp in line_data.get("PPs", []):
+                for assignment in pp.get("assignments", []):
+                    for flight in assignment.get("flights") or []:
+                        flight_start = parse_date(
+                            flight.get("start_date")
+                        )
+                        flight_end = parse_date(
+                            flight.get("end_date")
+                        )
+
+                        if flight_start is not None:
+                            all_dates.append(flight_start)
+
+                        if flight_end is not None:
+                            all_dates.append(flight_end)
+
+                    assignment_date = parse_date(
+                        assignment.get("date")
+                    )
+
+                    if assignment_date is not None:
+                        all_dates.append(assignment_date)
+
+        if not all_dates:
+            raise ValueError(
+                "No dates were found in master_lines."
+            )
+
+        bid_start = min(all_dates)
+        bid_end = max(all_dates)
+
+    def add_date_range(target_set, start_date, end_date):
+        current_date = start_date
+
+        while current_date <= end_date:
+            if bid_start <= current_date <= bid_end:
+                target_set.add(current_date)
+
+            current_date += timedelta(days=1)
+
+    def get_line_dates(line_data):
+        """
+        Returns:
+            work_dates
+            ignored_dates
+        """
+
+        work_dates = set()
+        ignored_dates = set()
+
+        for pp in line_data.get("PPs", []):
+            for assignment in pp.get("assignments", []):
+                flights = assignment.get("flights") or []
+
+                # Normal trip assignment
+                if flights:
+                    trip_dates = []
+
+                    for flight in flights:
+                        flight_start = parse_date(
+                            flight.get("start_date")
+                        )
+                        flight_end = parse_date(
+                            flight.get("end_date")
+                        )
+
+                        if flight_start is not None:
+                            trip_dates.append(flight_start)
+
+                        if flight_end is not None:
+                            trip_dates.append(flight_end)
+
+                    if trip_dates:
+                        add_date_range(
+                            work_dates,
+                            min(trip_dates),
+                            max(trip_dates),
+                        )
+
+                    continue
+
+                # Dated code assignment
+                code = str(
+                    assignment.get("code") or ""
+                ).strip().upper()
+
+                assignment_date = parse_date(
+                    assignment.get("date")
+                )
+
+                if assignment_date is not None:
+                    if not bid_start <= assignment_date <= bid_end:
+                        continue
+
+                    if code in ignored_codes:
+                        ignored_dates.add(assignment_date)
+                    else:
+                        work_dates.add(assignment_date)
+
+                    continue
+
+                # Support an assignment-level date range if one exists
+                assignment_start = parse_date(
+                    assignment.get("start_date")
+                )
+                assignment_end = parse_date(
+                    assignment.get("end_date")
+                )
+
+                if (
+                    assignment_start is None
+                    and assignment_end is None
+                ):
+                    continue
+
+                assignment_start = (
+                    assignment_start or assignment_end
+                )
+                assignment_end = (
+                    assignment_end or assignment_start
+                )
+
+                target_set = (
+                    ignored_dates
+                    if code in ignored_codes
+                    else work_dates
+                )
+
+                add_date_range(
+                    target_set,
+                    assignment_start,
+                    assignment_end,
+                )
+
+        # If conflicting data places both work and VTO/VOR on a date,
+        # treat the actual work assignment as controlling.
+        ignored_dates.difference_update(work_dates)
+
+        return work_dates, ignored_dates
+
+    # Find the first Saturday in the bid period
+    days_until_saturday = (5 - bid_start.weekday()) % 7
+    saturday = bid_start + timedelta(days=days_until_saturday)
+
+    weekends = []
+
+    while saturday + timedelta(days=1) <= bid_end:
+        sunday = saturday + timedelta(days=1)
+
+        weekends.append((saturday, sunday))
+        saturday += timedelta(days=7)
+
+    for line_data in master_lines.values():
+        if not isinstance(line_data, dict):
+            continue
+
+        work_dates, ignored_dates = get_line_dates(line_data)
+
+        weekends_off = 0
+        weekends_worked = 0
+        weekends_ignored = 0
+
+        for saturday, sunday in weekends:
+            # The entire weekend is ignored if either day is VTO or VOR.
+            if (
+                saturday in ignored_dates
+                or sunday in ignored_dates
+            ):
+                weekends_ignored += 1
+                continue
+
+            if (
+                saturday in work_dates
+                or sunday in work_dates
+            ):
+                weekends_worked += 1
+            else:
+                weekends_off += 1
+
+        weekends_counted = (
+            weekends_off + weekends_worked
+        )
+
+        if weekends_counted:
+            percentage = (
+                weekends_off
+                / weekends_counted
+                * 100
+            )
+        else:
+            percentage = 0.0
+
+        line_data["pct_weekends_off"] = round(
+            percentage,
+            round_digits,
+        )
+
+        if save_details:
+            line_data["weekends_off_count"] = weekends_off
+            line_data["weekends_worked_count"] = weekends_worked
+            line_data["weekends_ignored_count"] = weekends_ignored
+            line_data["weekends_counted"] = weekends_counted

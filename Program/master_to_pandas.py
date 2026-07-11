@@ -306,10 +306,22 @@ def master_lines_to_dataframe(
             "Training": line_data.get("training_fit_score", 0),
             "Blockiness": line_data.get("blockiness_score", 0),
             "Total DO": line_data.get("tot_DO", 0),
-            "% tickets paid": line_data.get("company_ticket_pct", 0),
+            "% tickets paid": line_data.get("pct_company_ticket", 0),
             "Avg # of legs": line_data.get("avg_legs_per_work_day",math.nan),
             "Total CT": line_data.get("tot_CT",0),
             "Premium": int(line_data.get("tot_Premium", line_data.get("tot_premium", 0))),
+            "Avg CT": line_data.get("avg_CT", 0),
+            "Avg DT": line_data.get("avg_DT",0),
+            "Avg Rest": line_data.get("avg_rest",0),
+            "Avg TAFB": line_data.get("avg_tafb",0),
+            "Line Type": line_data.get("line_type_preference_score",0),
+            "% International dest": line_data.get("pct_dest_int",math.nan),
+            "% Asian dest": line_data.get("pct_dest_AS",math.nan),
+            r"% Europoean dest": line_data.get("pct_dest_EU",math.nan),
+            "% South American dest": line_data.get("pct_dest_SA",math.nan),
+            "% Weekends off": line_data.get("pct_weekends_off",0),
+            r"% of Days off Requested": line_data.get("pct_requested_days_off",0),
+            "Pay": line_data.get("tot_pay",0),
         })
 
         if include_start_bid_off:
