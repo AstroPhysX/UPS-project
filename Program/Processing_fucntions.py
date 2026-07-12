@@ -5,6 +5,98 @@ from collections import Counter
 import pandas as pd
 from copy import deepcopy
 
+#Util functions--------------------------------------------------------------------------------------------------------------------------------------
+def count_days_off_around_date(assignments, target_date, before_or_after, bid_start, bid_end):
+    """
+    Counts consecutive days off immediately before or after a given date.
+
+    Parameters:
+        assignments:
+            The assignments list from a line or pay period.
+
+        target_date:
+            Date to count around. Can be 'YYYY-MM-DD' or date object.
+
+        before_or_after:
+            Either 'before' or 'after'.
+
+        bid_start:
+            Start date boundary. Can be 'YYYY-MM-DD' or date object.
+
+        bid_end:
+            End date boundary. Can be 'YYYY-MM-DD' or date object.
+
+    Returns:
+        Integer number of consecutive days off.
+    """
+
+    target_date = to_date(target_date)
+    bid_start = to_date(bid_start)
+    bid_end = to_date(bid_end)
+
+    if before_or_after not in {"before", "after"}:
+        raise ValueError("before_or_after must be 'before' or 'after'")
+
+    busy_dates = set()
+
+    for assignment in assignments:
+
+        # Trip assignment
+        if "flights" in assignment:
+            flight_dates = []
+
+            for flight in assignment["flights"]:
+                flight_dates.append(to_date(flight["start_date"]))
+                flight_dates.append(to_date(flight["end_date"]))
+
+            trip_start = min(flight_dates)
+            trip_end = max(flight_dates)
+
+            current = trip_start
+            while current <= trip_end:
+                busy_dates.add(current)
+                current += timedelta(days=1)
+
+        # Single-day code assignment: RA, RB, SA, SB, VOR, VTO, etc.
+        elif "date" in assignment:
+            assignment_date = to_date(assignment["date"])
+            code = assignment.get("code")
+
+            # RA, RB, SA, SB, VOR, VTO, etc. are not counted as normal days off.
+            if code is not None:
+                busy_dates.add(assignment_date)
+
+    if before_or_after == "before":
+        current = target_date - timedelta(days=1)
+        step = -1
+    else:
+        current = target_date + timedelta(days=1)
+        step = 1
+
+    days_off = 0
+
+    while bid_start <= current <= bid_end:
+        if current in busy_dates:
+            break
+
+        days_off += 1
+        current += timedelta(days=step)
+
+    return days_off
+
+def get_all_assignments(line_data):
+    assignments = []
+
+    for pp in line_data.get("PPs", []):
+        assignments.extend(pp.get("assignments", []))
+
+    return assignments
+
+def to_date(value):
+        if isinstance(value, date):
+            return value
+        return datetime.strptime(value, "%Y-%m-%d").date()
+
 #Blockiness score using Red flag without category scores--------------------------------------------------------------------------------------------------------------------------------------
 def weighted_block_average(lengths):
     """
@@ -556,8 +648,7 @@ def add_training_fit_score(
     master_lines,
     training_start,
     training_end,
-    bid_start,
-    bid_end,
+    bid_period_info,
     vto_score=30,
     vor_score=30,
     true_off_max_score=20,
@@ -798,8 +889,8 @@ def add_training_fit_score(
 
     training_start = to_date(training_start)
     training_end = to_date(training_end)
-    bid_start = to_date(bid_start)
-    bid_end = to_date(bid_end)
+    bid_start = to_date(bid_period_info['bid_period_date_range']['start'])
+    bid_end = to_date(bid_period_info['bid_period_date_range']['end'])
 
     if training_end < training_start:
         raise ValueError("training_end must be on or after training_start")
@@ -830,94 +921,6 @@ def add_training_fit_score(
         training_fit_score = sum(daily_scores) / len(daily_scores)
 
         line["training_fit_score"] = round(training_fit_score, 1)
-
-
-#Util functions--------------------------------------------------------------------------------------------------------------------------------------
-def count_days_off_around_date(assignments, target_date, before_or_after, bid_start, bid_end):
-    """
-    Counts consecutive days off immediately before or after a given date.
-
-    Parameters:
-        assignments:
-            The assignments list from a line or pay period.
-
-        target_date:
-            Date to count around. Can be 'YYYY-MM-DD' or date object.
-
-        before_or_after:
-            Either 'before' or 'after'.
-
-        bid_start:
-            Start date boundary. Can be 'YYYY-MM-DD' or date object.
-
-        bid_end:
-            End date boundary. Can be 'YYYY-MM-DD' or date object.
-
-    Returns:
-        Integer number of consecutive days off.
-    """
-
-    target_date = to_date(target_date)
-    bid_start = to_date(bid_start)
-    bid_end = to_date(bid_end)
-
-    if before_or_after not in {"before", "after"}:
-        raise ValueError("before_or_after must be 'before' or 'after'")
-
-    busy_dates = set()
-
-    for assignment in assignments:
-
-        # Trip assignment
-        if "flights" in assignment:
-            flight_dates = []
-
-            for flight in assignment["flights"]:
-                flight_dates.append(to_date(flight["start_date"]))
-                flight_dates.append(to_date(flight["end_date"]))
-
-            trip_start = min(flight_dates)
-            trip_end = max(flight_dates)
-
-            current = trip_start
-            while current <= trip_end:
-                busy_dates.add(current)
-                current += timedelta(days=1)
-
-        # Single-day code assignment: RA, RB, SA, SB, VOR, VTO, etc.
-        elif "date" in assignment:
-            assignment_date = to_date(assignment["date"])
-            code = assignment.get("code")
-
-            # RA, RB, SA, SB, VOR, VTO, etc. are not counted as normal days off.
-            if code is not None:
-                busy_dates.add(assignment_date)
-
-    if before_or_after == "before":
-        current = target_date - timedelta(days=1)
-        step = -1
-    else:
-        current = target_date + timedelta(days=1)
-        step = 1
-
-    days_off = 0
-
-    while bid_start <= current <= bid_end:
-        if current in busy_dates:
-            break
-
-        days_off += 1
-        current += timedelta(days=step)
-
-    return days_off
-
-def get_all_assignments(line_data):
-    assignments = []
-
-    for pp in line_data.get("PPs", []):
-        assignments.extend(pp.get("assignments", []))
-
-    return assignments
 
 #New vacation score with ocv toggle--------------------------------------------------------------------------------------------------------------------------------------
 def add_vacation_days_off_score(
@@ -2195,6 +2198,11 @@ def add_line_type_preference_scores(
             }
         
 #% international flights and continents--------------------------------------------------------------------------------------------------------------------------------------
+#Run this before creating_master_line
+# destination_codes = collect_unique_arrival_destinations_from_trips(trips,ignore_sba_sbg=True)
+# airport_lookup, unmatched_airports, matched_airports_df = build_bid_period_airport_lookup("airports.csv",destination_codes,allowed_types=("large_airport", "medium_airport"))
+#run this after creating_master_line
+# add_international_destination_scores(master_lines,airport_lookup)
 def normalize_airport_code(value):
     """
     Normalizes airport codes like SDF, DFW, CGN, KSDF, etc.
@@ -2577,7 +2585,7 @@ def add_international_destination_scores(
                 line_data[percent_field] = 0.0
 
 #Calculates pay per line--------------------------------------------------------------------------------------------------------------------------------------
-def add_pay_to_master_lines(
+def add_pay(
     master_lines,
     hourly_rate,
     *,

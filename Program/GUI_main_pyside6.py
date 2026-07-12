@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -91,6 +92,21 @@ DEFAULT_SORTING_SETTINGS = {
 }
 
 DEFAULT_NUMBER_OF_LINES_TO_BID = 20
+DEFAULT_HOURLY_RATE = 50.33
+
+LINE_TYPE_CODES = [
+    "TRIPS",
+    "VTO",
+    "RA",
+    "RB",
+    "SA",
+    "SB",
+    "SBA",
+    "SBG",
+    "VOR",
+]
+
+DEFAULT_LINE_TYPE_PREFERENCE_ORDER = list(LINE_TYPE_CODES)
 
 DEFAULT_MODE_DESCRIPTIONS = {
     "strict": "Normal priority / tie-breaker sort. The first selected column dominates, then the next column breaks ties, and so on.",
@@ -188,6 +204,22 @@ def validate_positive_int(value: str, field_name: str) -> int:
         number = int(text)
     except ValueError as exc:
         raise ValueError(f"{field_name} must be a whole number, such as 20.") from exc
+
+    if number <= 0:
+        raise ValueError(f"{field_name} must be greater than zero.")
+
+    return number
+
+
+def validate_positive_float(value: str, field_name: str) -> float:
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"{field_name} is required.")
+
+    try:
+        number = float(text)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a number, such as 50.33.") from exc
 
     if number <= 0:
         raise ValueError(f"{field_name} must be greater than zero.")
@@ -379,7 +411,71 @@ class DateEntry(QWidget):
 
 
 class VacationRangeDialog(QDialog):
-    """Dialog for adding or editing a vacation range."""
+    """Dialog for adding or editing a vacation range and its OCV setting."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        title: str,
+        initial_start: str = "",
+        initial_end: str = "",
+        initial_pp_drop: bool = True,
+    ) -> None:
+        super().__init__(parent)
+        self.result: dict[str, Any] | None = None
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        self.start_entry = DateEntry(self)
+        self.start_entry.setText(initial_start)
+        self.end_entry = DateEntry(self)
+        self.end_entry.setText(initial_end)
+        self.ocv_check = QCheckBox("Enable OCV / pay-period drop")
+        self.ocv_check.setChecked(bool(initial_pp_drop))
+        self.ocv_check.setToolTip(
+            "Checked stores pp_drop=True for this vacation range. "
+            "Unchecked stores pp_drop=False."
+        )
+
+        main = QGridLayout(self)
+        main.addWidget(QLabel("Start date:"), 0, 0)
+        main.addWidget(self.start_entry, 0, 1)
+        main.addWidget(QLabel("End date:"), 1, 0)
+        main.addWidget(self.end_entry, 1, 1)
+        main.addWidget(self.ocv_check, 2, 0, 1, 2)
+
+        save_button = QPushButton("Save")
+        cancel_button = QPushButton("Cancel")
+        save_button.clicked.connect(self._save)
+        cancel_button.clicked.connect(self.reject)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(save_button)
+        main.addLayout(buttons, 3, 0, 1, 2)
+
+        self.resize(390, 165)
+
+    def _save(self) -> None:
+        try:
+            start = validate_required_date(self.start_entry.text(), "Vacation start")
+            end = validate_required_date(self.end_entry.text(), "Vacation end")
+            if end < start:
+                raise ValueError("Vacation end date is before vacation start date.")
+            self.result = {
+                "start": start,
+                "end": end,
+                "pp_drop": self.ocv_check.isChecked(),
+            }
+            self.accept()
+        except Exception as exc:
+            QMessageBox.critical(self, "Vacation date error", str(exc))
+
+
+class RequestedDateRangeDialog(QDialog):
+    """Dialog for a requested single day off or a requested date range."""
 
     def __init__(
         self,
@@ -399,11 +495,18 @@ class VacationRangeDialog(QDialog):
         self.end_entry = DateEntry(self)
         self.end_entry.setText(initial_end)
 
+        help_label = QLabel(
+            "For one requested day, enter only the start date. "
+            "For a range, enter both dates."
+        )
+        help_label.setWordWrap(True)
+
         main = QGridLayout(self)
-        main.addWidget(QLabel("Start date:"), 0, 0)
-        main.addWidget(self.start_entry, 0, 1)
-        main.addWidget(QLabel("End date:"), 1, 0)
-        main.addWidget(self.end_entry, 1, 1)
+        main.addWidget(help_label, 0, 0, 1, 2)
+        main.addWidget(QLabel("Date / start:"), 1, 0)
+        main.addWidget(self.start_entry, 1, 1)
+        main.addWidget(QLabel("Optional end:"), 2, 0)
+        main.addWidget(self.end_entry, 2, 1)
 
         save_button = QPushButton("Save")
         cancel_button = QPushButton("Cancel")
@@ -414,20 +517,20 @@ class VacationRangeDialog(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(cancel_button)
         buttons.addWidget(save_button)
-        main.addLayout(buttons, 2, 0, 1, 2)
+        main.addLayout(buttons, 3, 0, 1, 2)
 
-        self.resize(360, 130)
+        self.resize(410, 175)
 
     def _save(self) -> None:
         try:
-            start = validate_required_date(self.start_entry.text(), "Vacation start")
-            end = validate_required_date(self.end_entry.text(), "Vacation end")
-            if end < start:
-                raise ValueError("Vacation end date is before vacation start date.")
+            start = validate_required_date(self.start_entry.text(), "Requested date")
+            end = validate_date_or_blank(self.end_entry.text(), "Requested end date") or ""
+            if end and end < start:
+                raise ValueError("Requested end date is before the start date.")
             self.result = {"start": start, "end": end}
             self.accept()
         except Exception as exc:
-            QMessageBox.critical(self, "Vacation date error", str(exc))
+            QMessageBox.critical(self, "Requested date error", str(exc))
 
 
 class ExportCompleteDialog(QDialog):
@@ -552,7 +655,7 @@ class BidGUI(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("UPS Bid Analyzer")
-        self.resize(1080, 780)
+        self.resize(1080, 900)
         self.setMinimumSize(960, 640)
         apply_window_icon(self)
 
@@ -566,14 +669,27 @@ class BidGUI(QMainWindow):
         self.cached_pdf_key: tuple[str, str] | None = None
         self.cached_bid_period_key: tuple[str, str] | None = None
         self.cached_bid_period: str | None = None
+        self.cached_airport_lookup_key: tuple[str, str] | None = None
+        self.cached_airport_lookup: dict[str, Any] | None = None
+        self.cached_unmatched_airports: Any = None
+        self.cached_matched_airports_df: pd.DataFrame | None = None
 
         self.sort_order: list[list[str]] = []
         self.latest_bid_string = ""
         self.visualizer_windows: list[QWidget] = []
 
+        self._loading_saved_values = True
+        self.preference_refresh_pending = False
+
         self._setup_style()
         self._build_ui()
+
+        self.preference_refresh_timer = QTimer(self)
+        self.preference_refresh_timer.setSingleShot(True)
+        self.preference_refresh_timer.timeout.connect(self._refresh_after_preference_change)
+
         self._load_saved_values()
+        self._loading_saved_values = False
 
         self.queue_timer = QTimer(self)
         self.queue_timer.timeout.connect(self._poll_queue)
@@ -620,7 +736,7 @@ class BidGUI(QMainWindow):
                 font-size: 11pt;
                 font-weight: bold;
             }}
-            QLineEdit, QTextEdit, QListWidget, QTableWidget, QComboBox {{
+            QLineEdit, QDoubleSpinBox, QTextEdit, QListWidget, QTableWidget, QComboBox {{
                 background: white;
                 color: black;
                 selection-background-color: {UPS_BLUE};
@@ -749,20 +865,24 @@ class BidGUI(QMainWindow):
         grid.setColumnStretch(1, 1)
         grid.setColumnStretch(3, 1)
 
+        # Vacation ranges -------------------------------------------------
         grid.addWidget(QLabel("Vacation ranges:"), 0, 0, alignment=Qt.AlignTop)
 
         vacation_area = QWidget()
         vacation_layout = QHBoxLayout(vacation_area)
         vacation_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.vacation_table = QTableWidget(0, 2)
-        self.vacation_table.setHorizontalHeaderLabels(["Start", "End"])
-        self.vacation_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.vacation_table = QTableWidget(0, 3)
+        self.vacation_table.setHorizontalHeaderLabels(["Start", "End", "OCV"])
+        self.vacation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.vacation_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.vacation_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.vacation_table.verticalHeader().setVisible(False)
         self.vacation_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.vacation_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.vacation_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.vacation_table.setMinimumHeight(120)
+        self.vacation_table.setMinimumHeight(125)
+        self.vacation_table.itemChanged.connect(self._on_vacation_table_item_changed)
         vacation_layout.addWidget(self.vacation_table, 1)
 
         vacation_buttons = QVBoxLayout()
@@ -778,29 +898,137 @@ class BidGUI(QMainWindow):
             vacation_buttons.addWidget(button)
         vacation_buttons.addStretch(1)
         vacation_layout.addLayout(vacation_buttons)
-
         grid.addWidget(vacation_area, 0, 1, 1, 3)
+
+        # Requested days --------------------------------------------------
+        grid.addWidget(QLabel("Requested days off:"), 1, 0, alignment=Qt.AlignTop)
+
+        requested_area = QWidget()
+        requested_layout = QHBoxLayout(requested_area)
+        requested_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.requested_dates_table = QTableWidget(0, 2)
+        self.requested_dates_table.setHorizontalHeaderLabels(["Date / Start", "End (optional)"])
+        self.requested_dates_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.requested_dates_table.verticalHeader().setVisible(False)
+        self.requested_dates_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.requested_dates_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.requested_dates_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.requested_dates_table.setMinimumHeight(120)
+        requested_layout.addWidget(self.requested_dates_table, 1)
+
+        requested_buttons = QVBoxLayout()
+        add_requested = QPushButton("Add day or range")
+        edit_requested = QPushButton("Edit selected")
+        remove_requested = QPushButton("Remove selected")
+        clear_requested = QPushButton("Clear all")
+        add_requested.clicked.connect(self._add_requested_date_range)
+        edit_requested.clicked.connect(self._edit_requested_date_range)
+        remove_requested.clicked.connect(self._remove_requested_date_range)
+        clear_requested.clicked.connect(self._clear_requested_date_ranges)
+        for button in (add_requested, edit_requested, remove_requested, clear_requested):
+            requested_buttons.addWidget(button)
+        requested_buttons.addStretch(1)
+        requested_layout.addLayout(requested_buttons)
+        grid.addWidget(requested_area, 1, 1, 1, 3)
+
+        # Lower preferences: normal inputs on the left, line types on right.
+        lower_area = QWidget()
+        lower_layout = QHBoxLayout(lower_area)
+        lower_layout.setContentsMargins(0, 6, 0, 0)
+        lower_layout.setSpacing(28)
+
+        left_preferences = QWidget()
+        left_grid = QGridLayout(left_preferences)
+        left_grid.setContentsMargins(0, 0, 0, 0)
+        left_grid.setHorizontalSpacing(10)
+        left_grid.setVerticalSpacing(10)
+        left_grid.setColumnStretch(1, 1)
 
         self.training_start_entry = DateEntry(self)
         self.training_end_entry = DateEntry(self)
         self.training_start_entry.line_edit.textChanged.connect(
-            lambda: self._mark_bid_string_stale("Training dates changed. Generate the bid string again after sorting.")
+            lambda: self._on_date_preferences_changed(
+                "Training dates changed. Sorting columns will refresh automatically."
+            )
         )
         self.training_end_entry.line_edit.textChanged.connect(
-            lambda: self._mark_bid_string_stale("Training dates changed. Generate the bid string again after sorting.")
+            lambda: self._on_date_preferences_changed(
+                "Training dates changed. Sorting columns will refresh automatically."
+            )
         )
 
-        grid.addWidget(QLabel("Training start:"), 1, 0)
-        grid.addWidget(self.training_start_entry, 1, 1, alignment=Qt.AlignLeft)
-        grid.addWidget(QLabel("Training end:"), 1, 2)
-        grid.addWidget(self.training_end_entry, 1, 3, alignment=Qt.AlignLeft)
+        training_row = QWidget()
+        training_layout = QHBoxLayout(training_row)
+        training_layout.setContentsMargins(0, 0, 0, 0)
+        training_layout.setSpacing(8)
+        training_layout.addWidget(QLabel("Start:"))
+        training_layout.addWidget(self.training_start_entry)
+        training_layout.addSpacing(10)
+        training_layout.addWidget(QLabel("End:"))
+        training_layout.addWidget(self.training_end_entry)
+        training_layout.addStretch(1)
 
         self.bid_edge_combo = QComboBox()
         self.bid_edge_combo.addItems(["none", "start", "end", "both"])
         self.bid_edge_combo.currentTextChanged.connect(lambda _text: self._on_bid_edge_changed())
 
-        grid.addWidget(QLabel("Bid edge days off:"), 2, 0)
-        grid.addWidget(self.bid_edge_combo, 2, 1, alignment=Qt.AlignLeft)
+        self.hourly_rate_edit = QDoubleSpinBox()
+        self.hourly_rate_edit.setPrefix("$")
+        self.hourly_rate_edit.setDecimals(2)
+        self.hourly_rate_edit.setRange(0.01, 10000.00)
+        self.hourly_rate_edit.setSingleStep(1.00)
+        self.hourly_rate_edit.setValue(DEFAULT_HOURLY_RATE)
+        self.hourly_rate_edit.setMaximumWidth(125)
+        self.hourly_rate_edit.setToolTip("Hourly pay rate in dollars used to estimate line pay.")
+        self.hourly_rate_edit.editingFinished.connect(self._on_hourly_rate_changed)
+
+        left_grid.addWidget(QLabel("Training dates:"), 0, 0)
+        left_grid.addWidget(training_row, 0, 1)
+        left_grid.addWidget(QLabel("Bid edge days off:"), 1, 0)
+        left_grid.addWidget(self.bid_edge_combo, 1, 1, alignment=Qt.AlignLeft)
+        left_grid.addWidget(QLabel("Hourly pay rate:"), 2, 0)
+        left_grid.addWidget(self.hourly_rate_edit, 2, 1, alignment=Qt.AlignLeft)
+        left_grid.setRowStretch(3, 1)
+
+        right_preferences = QWidget()
+        right_grid = QGridLayout(right_preferences)
+        right_grid.setContentsMargins(0, 0, 0, 0)
+        right_grid.setHorizontalSpacing(10)
+
+        self.line_type_preference_list = QListWidget()
+        self.line_type_preference_list.setMinimumHeight(185)
+        self.line_type_preference_list.setMinimumWidth(160)
+        self.line_type_preference_list.setMaximumWidth(210)
+        self.line_type_preference_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.line_type_preference_list.setDragEnabled(True)
+        self.line_type_preference_list.viewport().setAcceptDrops(True)
+        self.line_type_preference_list.setDropIndicatorShown(True)
+        self.line_type_preference_list.setDragDropMode(QAbstractItemView.InternalMove)
+        self.line_type_preference_list.setDefaultDropAction(Qt.MoveAction)
+        self.line_type_preference_list.setDragDropOverwriteMode(False)
+        self.line_type_preference_list.model().rowsMoved.connect(
+            lambda *_args: self._line_type_preference_changed()
+        )
+
+        line_type_controls = QVBoxLayout()
+        reset_type_order = QPushButton("Reset order")
+        reset_type_order.clicked.connect(self._reset_line_type_preference_order)
+        line_type_controls.addWidget(reset_type_order)
+        line_type_controls.addStretch(1)
+
+        line_type_help = QLabel("Drag items to reorder. Top = most preferred.")
+        line_type_help.setWordWrap(True)
+        line_type_help.setMaximumWidth(170)
+
+        right_grid.addWidget(QLabel("Line-type preference order:"), 0, 0, alignment=Qt.AlignTop)
+        right_grid.addWidget(self.line_type_preference_list, 0, 1, 2, 1)
+        right_grid.addLayout(line_type_controls, 0, 2, 2, 1)
+        right_grid.addWidget(line_type_help, 1, 0, alignment=Qt.AlignTop)
+
+        lower_layout.addWidget(left_preferences, 1)
+        lower_layout.addWidget(right_preferences, 1)
+        grid.addWidget(lower_area, 2, 0, 1, 4)
 
         container.addWidget(prefs_frame)
 
@@ -961,9 +1189,23 @@ class BidGUI(QMainWindow):
 
     def _load_saved_values(self) -> None:
         self._set_vacation_ranges(self.config_data.get("vacation_ranges", []))
+        self._set_requested_date_entries(self.config_data.get("requested_dates", []))
 
         self.training_start_entry.setText(self.config_data.get("training_start") or "")
         self.training_end_entry.setText(self.config_data.get("training_end") or "")
+
+        saved_hourly_rate = self.config_data.get("hourly_rate", DEFAULT_HOURLY_RATE)
+        try:
+            saved_hourly_rate = validate_positive_float(str(saved_hourly_rate), "Hourly pay rate")
+        except ValueError:
+            saved_hourly_rate = DEFAULT_HOURLY_RATE
+        self.hourly_rate_edit.setValue(saved_hourly_rate)
+
+        saved_preference_order = self.config_data.get(
+            "line_type_preference_order",
+            DEFAULT_LINE_TYPE_PREFERENCE_ORDER,
+        )
+        self._set_line_type_preference_order(saved_preference_order)
 
         bid_edge = self.config_data.get("bid_edge") or "none"
         index = self.bid_edge_combo.findText(bid_edge)
@@ -1019,32 +1261,59 @@ class BidGUI(QMainWindow):
             self.preview_df = None
             self.cached_bid_period_key = None
             self.cached_bid_period = None
+            self.cached_airport_lookup_key = None
+            self.cached_airport_lookup = None
+            self.cached_unmatched_airports = None
+            self.cached_matched_airports_df = None
             self._refresh_available_columns_list([])
             self._clear_bid_string("PDF paths changed. Generate the bid string again after loading/sorting.")
 
-    # -------------------------- Vacation range actions --------------------------
+    # -------------------------- Vacation / requested-date actions --------------------------
 
-    def _set_vacation_ranges(self, vacation_ranges: list[dict[str, str]] | None) -> None:
-        self.vacation_table.setRowCount(0)
-        for vacation in vacation_ranges or []:
-            start = vacation.get("start", "")
-            end = vacation.get("end", "")
-            if start and end:
-                row = self.vacation_table.rowCount()
-                self.vacation_table.insertRow(row)
-                self.vacation_table.setItem(row, 0, QTableWidgetItem(start))
-                self.vacation_table.setItem(row, 1, QTableWidgetItem(end))
+    def _make_ocv_item(self, checked: bool) -> QTableWidgetItem:
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        item.setTextAlignment(Qt.AlignCenter)
+        return item
 
-    def _get_vacation_ranges(self) -> list[dict[str, str]]:
-        ranges: list[dict[str, str]] = []
+    def _append_vacation_row(self, start: str, end: str, pp_drop: bool = True) -> None:
+        row = self.vacation_table.rowCount()
+        self.vacation_table.insertRow(row)
+        self.vacation_table.setItem(row, 0, QTableWidgetItem(start))
+        self.vacation_table.setItem(row, 1, QTableWidgetItem(end))
+        self.vacation_table.setItem(row, 2, self._make_ocv_item(pp_drop))
+
+    def _set_vacation_ranges(self, vacation_ranges: list[dict[str, Any]] | None) -> None:
+        self.vacation_table.blockSignals(True)
+        try:
+            self.vacation_table.setRowCount(0)
+            for vacation in vacation_ranges or []:
+                if not isinstance(vacation, dict):
+                    continue
+                start = str(vacation.get("start", "") or "")
+                end = str(vacation.get("end", "") or "")
+                pp_drop = bool(vacation.get("pp_drop", True))
+                if start and end:
+                    self._append_vacation_row(start, end, pp_drop)
+        finally:
+            self.vacation_table.blockSignals(False)
+
+    def _get_vacation_ranges(self) -> list[dict[str, Any]]:
+        ranges: list[dict[str, Any]] = []
         for row in range(self.vacation_table.rowCount()):
             start_item = self.vacation_table.item(row, 0)
             end_item = self.vacation_table.item(row, 1)
+            ocv_item = self.vacation_table.item(row, 2)
             start = validate_required_date(start_item.text() if start_item else "", "Vacation start")
             end = validate_required_date(end_item.text() if end_item else "", "Vacation end")
             if end < start:
                 raise ValueError(f"Vacation range {start} to {end}: end date is before start date.")
-            ranges.append({"start": start, "end": end})
+            ranges.append({
+                "start": start,
+                "end": end,
+                "pp_drop": bool(ocv_item and ocv_item.checkState() == Qt.Checked),
+            })
         return ranges
 
     def _selected_vacation_row(self) -> int | None:
@@ -1056,11 +1325,19 @@ class BidGUI(QMainWindow):
     def _add_vacation_range(self) -> None:
         dialog = VacationRangeDialog(self, "Add vacation range")
         if dialog.exec() == QDialog.Accepted and dialog.result:
-            row = self.vacation_table.rowCount()
-            self.vacation_table.insertRow(row)
-            self.vacation_table.setItem(row, 0, QTableWidgetItem(dialog.result["start"]))
-            self.vacation_table.setItem(row, 1, QTableWidgetItem(dialog.result["end"]))
-            self._clear_bid_string("Vacation ranges changed. Generate the bid string again after sorting.")
+            self.vacation_table.blockSignals(True)
+            try:
+                self._append_vacation_row(
+                    dialog.result["start"],
+                    dialog.result["end"],
+                    bool(dialog.result.get("pp_drop", True)),
+                )
+            finally:
+                self.vacation_table.blockSignals(False)
+            self._save_vacation_ranges_to_config()
+            self._schedule_preference_refresh(
+                "Vacation ranges changed. Sorting columns will refresh automatically."
+            )
 
     def _edit_vacation_range(self) -> None:
         row = self._selected_vacation_row()
@@ -1070,21 +1347,287 @@ class BidGUI(QMainWindow):
 
         start = self.vacation_table.item(row, 0).text() if self.vacation_table.item(row, 0) else ""
         end = self.vacation_table.item(row, 1).text() if self.vacation_table.item(row, 1) else ""
-        dialog = VacationRangeDialog(self, "Edit vacation range", start, end)
+        ocv_item = self.vacation_table.item(row, 2)
+        pp_drop = bool(ocv_item and ocv_item.checkState() == Qt.Checked)
+        dialog = VacationRangeDialog(self, "Edit vacation range", start, end, pp_drop)
         if dialog.exec() == QDialog.Accepted and dialog.result:
-            self.vacation_table.setItem(row, 0, QTableWidgetItem(dialog.result["start"]))
-            self.vacation_table.setItem(row, 1, QTableWidgetItem(dialog.result["end"]))
-            self._clear_bid_string("Vacation ranges changed. Generate the bid string again after sorting.")
+            self.vacation_table.blockSignals(True)
+            try:
+                self.vacation_table.setItem(row, 0, QTableWidgetItem(dialog.result["start"]))
+                self.vacation_table.setItem(row, 1, QTableWidgetItem(dialog.result["end"]))
+                self.vacation_table.setItem(
+                    row,
+                    2,
+                    self._make_ocv_item(bool(dialog.result.get("pp_drop", True))),
+                )
+            finally:
+                self.vacation_table.blockSignals(False)
+            self._save_vacation_ranges_to_config()
+            self._schedule_preference_refresh(
+                "Vacation ranges changed. Sorting columns will refresh automatically."
+            )
 
     def _remove_vacation_range(self) -> None:
         row = self._selected_vacation_row()
         if row is not None:
             self.vacation_table.removeRow(row)
-            self._clear_bid_string("Vacation ranges changed. Generate the bid string again after sorting.")
+            self._save_vacation_ranges_to_config()
+            self._schedule_preference_refresh(
+                "Vacation ranges changed. Sorting columns will refresh automatically."
+            )
 
     def _clear_vacation_ranges(self) -> None:
         self.vacation_table.setRowCount(0)
-        self._clear_bid_string("Vacation ranges changed. Generate the bid string again after sorting.")
+        self._save_vacation_ranges_to_config()
+        self._schedule_preference_refresh(
+            "Vacation ranges changed. Sorting columns will refresh automatically."
+        )
+
+    def _on_vacation_table_item_changed(self, _item: QTableWidgetItem) -> None:
+        if self._loading_saved_values:
+            return
+        self._save_vacation_ranges_to_config()
+        self._schedule_preference_refresh(
+            "Vacation OCV setting changed. Sorting columns will refresh automatically."
+        )
+
+    def _save_vacation_ranges_to_config(self) -> None:
+        try:
+            self.config_data["vacation_ranges"] = self._get_vacation_ranges() or None
+            save_config(self.config_data)
+        except Exception:
+            pass
+
+    # Requested single dates and ranges ---------------------------------
+
+    def _append_requested_date_row(self, start: str, end: str = "") -> None:
+        row = self.requested_dates_table.rowCount()
+        self.requested_dates_table.insertRow(row)
+        self.requested_dates_table.setItem(row, 0, QTableWidgetItem(start))
+        self.requested_dates_table.setItem(row, 1, QTableWidgetItem(end))
+
+    def _normalize_saved_requested_date_entries(self, entries: Any) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        if entries is None:
+            return normalized
+
+        if isinstance(entries, (str, tuple)):
+            entries = [entries]
+
+        if not isinstance(entries, list):
+            return normalized
+
+        for entry in entries:
+            start = ""
+            end = ""
+            if isinstance(entry, str):
+                start = entry
+            elif isinstance(entry, dict):
+                start = str(entry.get("start", "") or "")
+                end = str(entry.get("end", "") or "")
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                start = str(entry[0] or "")
+                end = str(entry[1] or "")
+
+            if start:
+                normalized.append({"start": start, "end": end})
+
+        return normalized
+
+    def _set_requested_date_entries(self, entries: Any) -> None:
+        self.requested_dates_table.setRowCount(0)
+        for entry in self._normalize_saved_requested_date_entries(entries):
+            self._append_requested_date_row(entry["start"], entry["end"])
+
+    def _get_requested_date_entries(self) -> list[dict[str, str]]:
+        entries: list[dict[str, str]] = []
+        for row in range(self.requested_dates_table.rowCount()):
+            start_item = self.requested_dates_table.item(row, 0)
+            end_item = self.requested_dates_table.item(row, 1)
+            start = validate_required_date(start_item.text() if start_item else "", "Requested date")
+            end = validate_date_or_blank(end_item.text() if end_item else "", "Requested end date") or ""
+            if end and end < start:
+                raise ValueError(f"Requested range {start} to {end}: end date is before start date.")
+            entries.append({"start": start, "end": end})
+        return entries
+
+    def _get_requested_dates_for_scoring(self) -> list[Any]:
+        requested_dates: list[Any] = []
+        for entry in self._get_requested_date_entries():
+            start = entry["start"]
+            end = entry["end"]
+            if end and end != start:
+                requested_dates.append((start, end))
+            else:
+                requested_dates.append(start)
+        return requested_dates
+
+    def _selected_requested_date_row(self) -> int | None:
+        rows = self.requested_dates_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        return rows[0].row()
+
+    def _add_requested_date_range(self) -> None:
+        dialog = RequestedDateRangeDialog(self, "Add requested day or range")
+        if dialog.exec() == QDialog.Accepted and dialog.result:
+            self._append_requested_date_row(dialog.result["start"], dialog.result["end"])
+            self._save_requested_dates_to_config()
+            self._schedule_preference_refresh(
+                "Requested days changed. Sorting columns will refresh automatically."
+            )
+
+    def _edit_requested_date_range(self) -> None:
+        row = self._selected_requested_date_row()
+        if row is None:
+            QMessageBox.information(self, "Edit requested day", "Select a requested day or range first.")
+            return
+
+        start = self.requested_dates_table.item(row, 0).text() if self.requested_dates_table.item(row, 0) else ""
+        end = self.requested_dates_table.item(row, 1).text() if self.requested_dates_table.item(row, 1) else ""
+        dialog = RequestedDateRangeDialog(self, "Edit requested day or range", start, end)
+        if dialog.exec() == QDialog.Accepted and dialog.result:
+            self.requested_dates_table.setItem(row, 0, QTableWidgetItem(dialog.result["start"]))
+            self.requested_dates_table.setItem(row, 1, QTableWidgetItem(dialog.result["end"]))
+            self._save_requested_dates_to_config()
+            self._schedule_preference_refresh(
+                "Requested days changed. Sorting columns will refresh automatically."
+            )
+
+    def _remove_requested_date_range(self) -> None:
+        row = self._selected_requested_date_row()
+        if row is not None:
+            self.requested_dates_table.removeRow(row)
+            self._save_requested_dates_to_config()
+            self._schedule_preference_refresh(
+                "Requested days changed. Sorting columns will refresh automatically."
+            )
+
+    def _clear_requested_date_ranges(self) -> None:
+        self.requested_dates_table.setRowCount(0)
+        self._save_requested_dates_to_config()
+        self._schedule_preference_refresh(
+            "Requested days changed. Sorting columns will refresh automatically."
+        )
+
+    def _save_requested_dates_to_config(self) -> None:
+        try:
+            self.config_data["requested_dates"] = self._get_requested_date_entries()
+            save_config(self.config_data)
+        except Exception:
+            pass
+
+    # Line-type preference order ----------------------------------------
+
+    def _set_line_type_preference_order(self, order: Any) -> None:
+        cleaned: list[str] = []
+        if isinstance(order, (list, tuple)):
+            for value in order:
+                code = str(value).strip().upper()
+                if code in LINE_TYPE_CODES and code not in cleaned:
+                    cleaned.append(code)
+        for code in LINE_TYPE_CODES:
+            if code not in cleaned:
+                cleaned.append(code)
+
+        self.line_type_preference_list.clear()
+        self.line_type_preference_list.addItems(cleaned)
+
+    def _get_line_type_preference_order(self) -> list[str]:
+        order = [
+            self.line_type_preference_list.item(row).text().strip().upper()
+            for row in range(self.line_type_preference_list.count())
+        ]
+        if len(order) != len(LINE_TYPE_CODES) or set(order) != set(LINE_TYPE_CODES):
+            raise ValueError(
+                "Line-type preference order must contain TRIPS, VTO, RA, RB, "
+                "SA, SB, SBA, SBG, and VOR exactly once."
+            )
+        return order
+
+    def _move_line_type_preference_up(self) -> None:
+        row = self.line_type_preference_list.currentRow()
+        if row <= 0:
+            return
+        item = self.line_type_preference_list.takeItem(row)
+        self.line_type_preference_list.insertItem(row - 1, item)
+        self.line_type_preference_list.setCurrentRow(row - 1)
+        self._line_type_preference_changed()
+
+    def _move_line_type_preference_down(self) -> None:
+        row = self.line_type_preference_list.currentRow()
+        if row < 0 or row >= self.line_type_preference_list.count() - 1:
+            return
+        item = self.line_type_preference_list.takeItem(row)
+        self.line_type_preference_list.insertItem(row + 1, item)
+        self.line_type_preference_list.setCurrentRow(row + 1)
+        self._line_type_preference_changed()
+
+    def _reset_line_type_preference_order(self) -> None:
+        self._set_line_type_preference_order(DEFAULT_LINE_TYPE_PREFERENCE_ORDER)
+        self.line_type_preference_list.setCurrentRow(0)
+        self._line_type_preference_changed()
+
+    def _line_type_preference_changed(self) -> None:
+        self.config_data["line_type_preference_order"] = self._get_line_type_preference_order()
+        save_config(self.config_data)
+        self._schedule_preference_refresh(
+            "Line-type preference order changed. Analyzer values will refresh automatically."
+        )
+
+    # Preference persistence and automatic column refresh ---------------
+
+    def _on_hourly_rate_changed(self) -> None:
+        if self._loading_saved_values:
+            return
+        hourly_rate = round(float(self.hourly_rate_edit.value()), 2)
+        self.config_data["hourly_rate"] = hourly_rate
+        save_config(self.config_data)
+        self._schedule_preference_refresh(
+            "Hourly pay rate changed. Pay estimates will refresh automatically."
+        )
+
+    def _on_date_preferences_changed(self, status_message: str) -> None:
+        if self._loading_saved_values:
+            return
+        self._schedule_preference_refresh(status_message)
+
+    def _schedule_preference_refresh(self, status_message: str) -> None:
+        if self._loading_saved_values:
+            return
+        self._clear_bid_string(status_message)
+        self.preference_refresh_pending = True
+        self.preference_refresh_timer.start(500)
+
+    def _refresh_after_preference_change(self) -> None:
+        if not self.preference_refresh_pending:
+            return
+
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.preference_refresh_timer.start(200)
+            return
+
+        if self.cached_trips is None or self.cached_lines is None:
+            self.preference_refresh_pending = False
+            self.pdf_status_label.setText(
+                "Preferences saved. Load the PDFs to build the updated sorting columns."
+            )
+            return
+
+        try:
+            inputs = self._collect_inputs()
+            self._save_inputs_to_config(inputs)
+        except Exception as exc:
+            self.preference_refresh_pending = False
+            self.pdf_status_label.setText(
+                "Preference refresh is waiting for complete, valid inputs."
+            )
+            self._write_log(f"Automatic preference refresh skipped: {exc}")
+            return
+
+        self.preference_refresh_pending = False
+        self.pdf_status_label.setText("Preferences changed. Refreshing analyzer columns...")
+        self._start_worker(self._load_worker, inputs, False)
 
     # -------------------------- Sorting list actions --------------------------
 
@@ -1343,6 +1886,11 @@ class BidGUI(QMainWindow):
         if not vacation_ranges:
             vacation_ranges = None
 
+        requested_date_entries = self._get_requested_date_entries()
+        requested_dates = self._get_requested_dates_for_scoring()
+        if not requested_dates:
+            requested_dates = None
+
         training_start = validate_date_or_blank(self.training_start_entry.text(), "Training start")
         training_end = validate_date_or_blank(self.training_end_entry.text(), "Training end")
 
@@ -1350,6 +1898,9 @@ class BidGUI(QMainWindow):
             raise ValueError("Enter both training start and training end, or leave both blank.")
         if training_start and training_end and training_end < training_start:
             raise ValueError("Training end date is before training start date.")
+
+        hourly_rate = round(float(self.hourly_rate_edit.value()), 2)
+        line_type_preference_order = self._get_line_type_preference_order()
 
         bid_edge = self.bid_edge_combo.currentText().strip().lower() or "none"
         if bid_edge not in {"none", "start", "end", "both"}:
@@ -1373,8 +1924,12 @@ class BidGUI(QMainWindow):
             "trips_pdf_path": trips_pdf_path,
             "lines_pdf_path": lines_pdf_path,
             "vacation_ranges": vacation_ranges,
+            "requested_date_entries": requested_date_entries,
+            "requested_dates": requested_dates,
             "training_start": training_start,
             "training_end": training_end,
+            "hourly_rate": hourly_rate,
+            "line_type_preference_order": line_type_preference_order,
             "bid_edge": bid_edge,
             "output_folder": output_folder,
             "output_path": output_path,
@@ -1450,8 +2005,11 @@ class BidGUI(QMainWindow):
 
     def _save_inputs_to_config(self, inputs: dict[str, Any]) -> None:
         self.config_data["vacation_ranges"] = inputs["vacation_ranges"]
+        self.config_data["requested_dates"] = inputs["requested_date_entries"]
         self.config_data["training_start"] = inputs["training_start"]
         self.config_data["training_end"] = inputs["training_end"]
+        self.config_data["hourly_rate"] = inputs["hourly_rate"]
+        self.config_data["line_type_preference_order"] = inputs["line_type_preference_order"]
         self.config_data["bid_edge"] = inputs["bid_edge"]
         self.config_data["sort_order"] = inputs["sort_order"]
         self.config_data["sorting_settings"] = inputs["sorting_settings"]
@@ -1511,6 +2069,8 @@ class BidGUI(QMainWindow):
         else:
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
+            if self.preference_refresh_pending:
+                QTimer.singleShot(150, self._refresh_after_preference_change)
 
     def _log(self, message: str) -> None:
         self.message_queue.put(("log", message))
@@ -1742,32 +2302,13 @@ class BidGUI(QMainWindow):
     # -------------------------- Processing logic --------------------------
 
     def _on_bid_edge_changed(self) -> None:
+        if self._loading_saved_values:
+            return
         self.config_data["bid_edge"] = self.bid_edge_combo.currentText().strip().lower() or "none"
         save_config(self.config_data)
-        self._clear_bid_string("Bid edge changed. Generate the bid string again after sorting.")
-
-        if not self.trips_path_edit.text().strip() or not self.lines_path_edit.text().strip():
-            self.pdf_status_label.setText("Bid edge preference saved. Choose PDFs when ready.")
-            return
-
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.pdf_status_label.setText("Bid edge changed. Refresh after the current job finishes.")
-            return
-
-        try:
-            inputs = self._collect_inputs()
-            self._save_inputs_to_config(inputs)
-        except Exception as exc:
-            self.pdf_status_label.setText("Bid edge changed. Analyzer refresh skipped.")
-            self._write_log(f"Bid edge changed, but analyzer could not refresh yet: {exc}")
-            return
-
-        if self.cached_trips is None or self.cached_lines is None:
-            self.pdf_status_label.setText("Bid edge changed. Click Load PDFs into UPS Bid Analyzer.")
-            return
-
-        self.pdf_status_label.setText("Bid edge changed. Refreshing analyzer...")
-        self._start_worker(self._load_worker, inputs, False)
+        self._schedule_preference_refresh(
+            "Bid edge preference changed. Sorting columns will refresh automatically."
+        )
 
     def load_pdfs(self) -> None:
         try:
@@ -1894,19 +2435,229 @@ class BidGUI(QMainWindow):
         self._log("PDF extraction complete.")
         return trips, lines
 
-    def _build_dataframe(self, inputs: dict[str, Any], *, apply_sort: bool) -> tuple[pd.DataFrame, list[dict[str, str]] | None]:
+    @staticmethod
+    def _pay_hours(value: Any) -> float:
+        """Convert common UPS time formats to decimal hours."""
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+
+        text = str(value).strip()
+        if not text or text in {"-", "None", "nan", "NaN"}:
+            return 0.0
+
+        hhmm_match = re.fullmatch(r"(\d+):(\d{1,2})", text)
+        if hhmm_match:
+            return int(hhmm_match.group(1)) + int(hhmm_match.group(2)) / 60.0
+
+        trip_time_match = re.fullmatch(r"(\d+)h(\d{1,2})(?:[A-Za-z])?", text)
+        if trip_time_match:
+            return int(trip_time_match.group(1)) + int(trip_time_match.group(2)) / 60.0
+
+        try:
+            return float(text.replace(",", "").replace("$", ""))
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _pay_number(value: Any) -> float:
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace(",", "").replace("$", "")
+        if not text or text == "-":
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _add_pay_fallback(
+        self,
+        master_lines: dict[Any, dict[str, Any]],
+        hourly_rate: float,
+        default_pp_guarantee_hours: float = 75.0,
+    ) -> None:
+        """
+        Apply the documented pay formula when the current processing function
+        encounters its local-variable ``pp`` bug.
+
+        The normal Processing_fucntions.add_pay_to_master_lines() function is
+        always attempted first. This fallback only runs for that specific bug.
+        """
+        hourly_rate = float(hourly_rate)
+
+        for line_data in master_lines.values():
+            pay_period_details: list[dict[str, Any]] = []
+            total_extracted_credit = 0.0
+            total_paid_credit = 0.0
+            total_base_pay = 0.0
+            total_premium = 0.0
+            total_per_diem = 0.0
+
+            for pp_index, pay_period in enumerate(line_data.get("PPs") or [], start=1):
+                extracted_credit = self._pay_hours(pay_period.get("CT"))
+                guarantee_hours = float(default_pp_guarantee_hours)
+                paid_credit = max(extracted_credit, guarantee_hours)
+                guarantee_added = max(0.0, paid_credit - extracted_credit)
+                base_pay = paid_credit * hourly_rate
+
+                total_extracted_credit += extracted_credit
+                total_paid_credit += paid_credit
+                total_base_pay += base_pay
+
+                for assignment in pay_period.get("assignments") or []:
+                    total_premium += self._pay_number(assignment.get("premium"))
+                    total_per_diem += self._pay_number(assignment.get("per_diem"))
+
+                pay_period_details.append({
+                    "pp": pay_period.get("pp") or f"PP{pp_index}",
+                    "extracted_credit_hours": round(extracted_credit, 2),
+                    "guarantee_hours": round(guarantee_hours, 2),
+                    "paid_credit_hours": round(paid_credit, 2),
+                    "guarantee_credit_added": round(guarantee_added, 2),
+                    "base_pay": round(base_pay, 2),
+                })
+
+            guarantee_credit_added = max(0.0, total_paid_credit - total_extracted_credit)
+            taxable_pay = total_base_pay + total_premium
+            cash_pay = taxable_pay + total_per_diem
+
+            line_data["pay"] = {
+                "hourly_rate": round(hourly_rate, 2),
+                "pay_periods": pay_period_details,
+                "extracted_CT": round(total_extracted_credit, 2),
+                "paid_CT": round(total_paid_credit, 2),
+                "guarantee_credit_added": round(guarantee_credit_added, 2),
+                "total_base_pay": round(total_base_pay, 2),
+                "total_premium": round(total_premium, 2),
+                "total_per_diem": round(total_per_diem, 2),
+                "taxable_pay_estimate": round(taxable_pay, 2),
+                "cash_pay_estimate": round(cash_pay, 2),
+            }
+
+            # Flat numeric fields used by master_lines_to_dataframe and sorting.
+            line_data["pay_cash_estimate"] = round(cash_pay, 2)
+            line_data["pay_taxable_estimate"] = round(taxable_pay, 2)
+            line_data["pay_base"] = round(total_base_pay, 2)
+            line_data["pay_premium"] = round(total_premium, 2)
+            line_data["pay_per_diem"] = round(total_per_diem, 2)
+            line_data["paid_CT"] = round(total_paid_credit, 2)
+            line_data["guarantee_credit_added"] = round(guarantee_credit_added, 2)
+
+    def _build_dataframe(
+        self,
+        inputs: dict[str, Any],
+        *,
+        apply_sort: bool,
+    ) -> tuple[pd.DataFrame, list[dict[str, Any]] | None]:
         trips, lines = self._extract_pdfs(inputs)
 
-        bid_period_info = {x: lines[x] for x in ("bid_period_date_range", "pay_period_date_ranges")}
+        bid_period_info = {
+            key: lines[key]
+            for key in ("bid_period_date_range", "pay_period_date_ranges")
+        }
+
+        # Build the bid-period airport lookup before creating_master_line.
+        pdf_key = (inputs["trips_pdf_path"], inputs["lines_pdf_path"])
+        if self.cached_airport_lookup_key == pdf_key and self.cached_airport_lookup is not None:
+            self._log("Using cached bid-period airport lookup...")
+            airport_lookup = self.cached_airport_lookup
+        else:
+            airports_csv_path = resource_path("airports.csv")
+            if not airports_csv_path.exists():
+                raise FileNotFoundError(
+                    "airports.csv was not found next to the program. "
+                    "Add it to the project folder and to the PyInstaller data files."
+                )
+
+            self._log("Collecting bid-period destination airports...")
+            destination_codes = pf.collect_unique_arrival_destinations_from_trips(
+                trips,
+                ignore_sba_sbg=True,
+            )
+
+            self._log("Building bid-period airport lookup...")
+            airport_lookup, unmatched_airports, matched_airports_df = (
+                pf.build_bid_period_airport_lookup(
+                    str(airports_csv_path),
+                    destination_codes,
+                    allowed_types=("large_airport", "medium_airport"),
+                )
+            )
+
+            self.cached_airport_lookup_key = pdf_key
+            self.cached_airport_lookup = airport_lookup
+            self.cached_unmatched_airports = unmatched_airports
+            self.cached_matched_airports_df = matched_airports_df
+
+            try:
+                unmatched_count = len(unmatched_airports)
+            except TypeError:
+                unmatched_count = 0
+
+            if unmatched_count:
+                self._log(
+                    f"Airport lookup completed with {unmatched_count} "
+                    "unmatched destination code(s)."
+                )
+            else:
+                self._log("Airport lookup completed with all destination codes matched.")
 
         self._log("Creating master lines...")
         master_lines = creating_master_line(trips, lines)
 
-        self._log("Adding scores...")
+        # Keep the processing calls explicit here so this method is the single,
+        # easy-to-read list of everything applied to master_lines.
+        self._log("Adding blockiness scores...")
         pf.add_blockiness_scores(master_lines, bid_period_info)
+
+        self._log("Adding company-ticket percentages...")
         pf.add_company_ticket_percentages(master_lines)
 
+        self._log("Adding line-type preference scores...")
+        pf.add_line_type_preference_scores(
+            master_lines,
+            inputs["line_type_preference_order"],
+            power_law_coeff=3
+        )
+
+        self._log("Adding estimated pay...")
+        try:
+            pf.add_pay(
+                master_lines,
+                inputs["hourly_rate"],
+            )
+        except UnboundLocalError as exc:
+            if "local variable 'pp'" not in str(exc) and 'local variable "pp"' not in str(exc):
+                raise
+            self._log(
+                "The current add_pay function hit its local-variable "
+                "'pp' bug. Applying the same documented pay formula with the GUI fallback."
+            )
+            self._add_pay_fallback(master_lines, inputs["hourly_rate"])
+
+        self._log("Adding complete-weekends-off percentages...")
+        pf.add_weekends_off_percentage(master_lines)
+
+        self._log("Adding international-destination scores...")
+        pf.add_international_destination_scores(
+            master_lines,
+            airport_lookup,
+        )
+
+        if inputs["requested_dates"] is not None:
+            self._log("Adding requested-days-off scores...")
+            pf.add_requested_days_off_scores(
+                master_lines,
+                bid_period_info,
+                inputs["requested_dates"],
+            )
+
         if inputs["vacation_ranges"] is not None:
+            self._log("Adding vacation scores...")
             new_vacation_ranges = pf.add_vacation_days_off_score(
                 master_lines,
                 inputs["vacation_ranges"],
@@ -1916,7 +2667,8 @@ class BidGUI(QMainWindow):
         else:
             new_vacation_ranges = None
 
-        if inputs["training_start"] is not None or inputs["training_end"] is not None:
+        if inputs["training_start"] is not None:
+            self._log("Adding training-fit scores...")
             pf.add_training_fit_score(
                 master_lines,
                 inputs["training_start"],
@@ -1924,10 +2676,16 @@ class BidGUI(QMainWindow):
                 bid_period_info,
             )
 
+        self._log("Adding average legs per work day...")
         pf.add_avg_legs_per_work_day(master_lines)
 
         if inputs["bid_edge"] != "none":
-            pf.add_bid_edge_days_off(master_lines, bid_period_info, edge=inputs["bid_edge"])
+            self._log("Adding bid-edge days-off scores...")
+            pf.add_bid_edge_days_off(
+                master_lines,
+                bid_period_info,
+                edge=inputs["bid_edge"],
+            )
 
         self._log("Creating DataFrame...")
         df = master_lines_to_dataframe(master_lines, bid_period_info)
@@ -1938,7 +2696,7 @@ class BidGUI(QMainWindow):
                 "Sorting DataFrame "
                 f"({sorting_settings['default_mode']}, "
                 f"{sorting_settings['weighting_style']}, "
-                f"soft weights {sorting_settings['soft_min_weight']}–{sorting_settings['soft_max_weight']})..."
+                f"soft weights {sorting_settings['soft_min_weight']}–{sorting_settings['soft_max_weight']})."
             )
             df = sort_dataframe_by_conditions(
                 df,
