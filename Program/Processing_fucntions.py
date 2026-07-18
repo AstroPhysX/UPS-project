@@ -2771,12 +2771,12 @@ def add_pay(
                 }
         """
 
-    pp_name = pp.get("pp")
+        pp_name = pp.get("pp")
 
-    if pp_guarantees and pp_name in pp_guarantees:
-        return float(pp_guarantees[pp_name])
+        if pp_guarantees and pp_name in pp_guarantees:
+            return float(pp_guarantees[pp_name])
 
-    return float(default_guarantee_hours)
+        return float(default_guarantee_hours)
 
     if not mutate:
         master_lines = deepcopy(master_lines)

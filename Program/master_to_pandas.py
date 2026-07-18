@@ -110,6 +110,26 @@ def build_line_calendar_values(line_data, bid_dates, off_value=""):
             parts_by_date[d] += piece
         else:
             parts_by_date[d] += piece
+    def append_separate_piece(parts_by_date, d, piece):
+        """
+        Adds a stand-alone calendar item with a space between it
+        and any other content on the same date.
+        """
+        if d is None or not piece:
+            return
+
+        piece = str(piece).strip()
+
+        if not piece:
+            return
+
+        if parts_by_date[d] == "*":
+            parts_by_date[d] = ""
+
+        if parts_by_date[d] and not parts_by_date[d].endswith(" "):
+            parts_by_date[d] += " "
+
+        parts_by_date[d] += piece
 
     def render_trip(assignment):
         trip_id = assignment.get("trip_id")
@@ -119,6 +139,46 @@ def build_line_calendar_values(line_data, bid_dates, off_value=""):
         previous_arrival = None
         previous_end_date = None
         previous_rest = None
+        previous_was_code = False
+
+        def get_flight_code(flight):
+            code = flight.get("code")
+
+            if code is None:
+                return None
+
+            code = str(code).strip()
+
+            if not code or code.lower() in {"none", "nan"}:
+                return None
+
+            return code
+
+        coded_only_assignment = (
+            bool(flights)
+            and all(
+                get_flight_code(flight) is not None
+                for flight in flights
+            )
+        )
+        # Only normal flights receive the trip-opening and closing braces.
+        normal_flight_indexes = [
+            index
+            for index, flight in enumerate(flights)
+            if get_flight_code(flight) is None
+        ]
+
+        first_normal_index = (
+            normal_flight_indexes[0]
+            if normal_flight_indexes
+            else None
+        )
+
+        last_normal_index = (
+            normal_flight_indexes[-1]
+            if normal_flight_indexes
+            else None
+        )
 
         for index, flight in enumerate(flights):
             dep = flight.get("departure")
@@ -136,22 +196,77 @@ def build_line_calendar_values(line_data, bid_dates, off_value=""):
             if end_date is None:
                 end_date = start_date
 
-            route_flags = format_route_flags(flight.get("route_flags"))
+            flight_code = get_flight_code(flight)
             rest = flight.get("rest")
 
-            is_first_flight = index == 0
-            is_last_flight = index == len(flights) - 1
+            # -------------------------------------------------------------
+            # SBA, SBG, or any other coded flight
+            # -------------------------------------------------------------
+            if flight_code is not None:
+                formatted_rest = (
+                    format_rest(rest)
+                    if rest not in (None, "")
+                    else ""
+                )
 
-            trip_open = f"{{{trip_id}" if is_first_flight else ""
+                if formatted_rest:
+                    # Example: SBG3@[DFW16]
+                    code_text = (
+                        f"{flight_code}"
+                        f"@[{arr or dep}{formatted_rest}]"
+                    )
+                else:
+                    # Example: SBA@SDF
+                    code_text = (
+                        f"{flight_code}"
+                        f"@{dep or arr}"
+                    )
+
+                # Standalone coded assignments receive their own trip braces.
+                # Example: {1964 SBA@SDF}
+                if coded_only_assignment and trip_id is not None:
+                    code_piece = f"{{{trip_id} {code_text}}}"
+                else:
+                    code_piece = code_text
+
+                append_separate_piece(
+                    parts_by_date,
+                    start_date,
+                    code_piece,
+                )
+
+                previous_arrival = arr
+                previous_end_date = end_date
+                previous_rest = rest
+                previous_was_code = True
+
+                continue
+
+            # -------------------------------------------------------------
+            # Normal flight
+            # -------------------------------------------------------------
+            route_flags = format_route_flags(
+                flight.get("route_flags")
+            )
+
+            is_first_normal_flight = index == first_normal_index
+            is_last_normal_flight = index == last_normal_index
+
+            trip_open = (
+                f"{{{trip_id}"
+                if is_first_normal_flight
+                else ""
+            )
 
             arrival = arrival_text(
                 arr,
                 rest=rest,
-                close_trip=is_last_flight,
+                close_trip=is_last_normal_flight,
             )
 
             can_compress_departure = (
-                not is_first_flight
+                not is_first_normal_flight
+                and not previous_was_code
                 and previous_arrival == dep
                 and previous_end_date == start_date
                 and previous_rest is None
@@ -162,9 +277,18 @@ def build_line_calendar_values(line_data, bid_dates, off_value=""):
                 if can_compress_departure:
                     piece = f"-{route_flags}{arrival}"
                 else:
-                    piece = f"{trip_open}{dep}-{route_flags}{arrival}"
+                    piece = (
+                        f"{trip_open}"
+                        f"{dep}-"
+                        f"{route_flags}"
+                        f"{arrival}"
+                    )
 
-                append_piece(parts_by_date, start_date, piece)
+                append_piece(
+                    parts_by_date,
+                    start_date,
+                    piece,
+                )
 
             else:
                 if can_compress_departure:
@@ -174,23 +298,43 @@ def build_line_calendar_values(line_data, bid_dates, off_value=""):
 
                 arrival_piece = f"{route_flags}{arrival}"
 
-                append_piece(parts_by_date, start_date, departure_piece)
-                append_piece(parts_by_date, end_date, arrival_piece)
+                append_piece(
+                    parts_by_date,
+                    start_date,
+                    departure_piece,
+                )
 
+                append_piece(
+                    parts_by_date,
+                    end_date,
+                    arrival_piece,
+                )
+
+            # Add a dash on completely empty dates between normal flights.
             if index < len(flights) - 1:
                 next_flight = flights[index + 1]
-                next_start = to_date(next_flight.get("start_date"))
+                next_start = to_date(
+                    next_flight.get("start_date")
+                )
 
                 if next_start is not None:
                     gap_start = end_date + timedelta(days=1)
                     gap_end = next_start - timedelta(days=1)
 
-                    for gap_day in date_range_strict(gap_start, gap_end):
-                        append_piece(parts_by_date, gap_day, "*")
+                    for gap_day in date_range_strict(
+                        gap_start,
+                        gap_end,
+                    ):
+                        append_piece(
+                            parts_by_date,
+                            gap_day,
+                            "*",
+                        )
 
             previous_arrival = arr
             previous_end_date = end_date
             previous_rest = rest
+            previous_was_code = False
 
         return parts_by_date
 

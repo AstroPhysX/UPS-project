@@ -34,10 +34,8 @@ def trip_duration_to_minutes(value):
 
     return hours * 60 + minutes
 
-
 def minutes_to_decimal_hours(total_minutes, decimals=2):
     return round(total_minutes / 60, decimals)
-
 
 def safe_int(value, default=0):
     if value is None or value == "-":
@@ -47,7 +45,6 @@ def safe_int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return default
-
 
 def safe_float(value, default=0.0):
     if value is None or value == "-":
@@ -77,7 +74,6 @@ def parse_duration(value):
     minutes = int(match.group(2))
 
     return timedelta(hours=hours, minutes=minutes)
-
 
 def datetime_at_or_after(reference_dt, time_value):
     if reference_dt is None:
@@ -109,7 +105,6 @@ def unique_preserve_order(items):
 
     return result
 
-
 def extract_route_flags(flight):
     flags = []
 
@@ -138,7 +133,7 @@ def extract_route_flags(flight):
             flags.append("BUS")
 
     return unique_preserve_order(flags)
-    
+
 def extract_flight_code(flight):
     """
     Detects special flight codes like:
@@ -165,6 +160,136 @@ def extract_flight_code(flight):
 
     return None
 
+def normalize_sba_sbg_line_code(value):
+    """
+    Detects line codes like:
+        SBA
+        SBA3
+        SBG
+        SBG5
+
+    Returns:
+        'SBA'
+        'SBA3'
+        'SBG'
+        'SBG5'
+        None
+    """
+    if value is None:
+        return None
+
+    text = str(value).upper().strip()
+
+    match = re.match(r"^(SBA|SBG)\d*$", text)
+
+    if match:
+        return text
+
+    return None
+
+def get_first_flight_code_in_block(block):
+    """
+    Looks through the flights inside one block and returns
+    the first SBA/SBG code found.
+    """
+    for flight in block.get("flights", []):
+        code = extract_flight_code(flight)
+
+        if code is not None:
+            return code
+
+    return None
+
+def get_sba_sbg_block_for_assignment(trip, assignment):
+    """
+    Gets the block to use for an SBA/SBG no-start-time assignment.
+
+    The creating_master_line() function adds:
+        assignment["_sba_sbg_block_index"]
+
+    That lets each repeated SBA/SBG date grab the next block
+    from the trip package.
+    """
+    blocks = trip.get("blocks", [])
+
+    if not blocks:
+        return None
+
+    block_index = safe_int(assignment.get("_sba_sbg_block_index"))
+
+    # If there are more assignments than blocks, wrap around rather than crash.
+    block_index = block_index % len(blocks)
+
+    return blocks[block_index]
+
+def build_sba_sbg_master_assignment(assignment, trip):
+    """
+    Builds a synthetic one-flight assignment for SBA/SBG cases where
+    the Lines package has:
+        type='trip'
+        start_time=None
+        line_code='SBA' / 'SBA3' / 'SBG5'
+
+    Most of the flight/block data is pulled from the Trips package.
+    The date is pulled from the Lines package.
+    """
+    assignment_date = assignment.get("date")
+    line_code = normalize_sba_sbg_line_code(assignment.get("line_code"))
+
+    block = get_sba_sbg_block_for_assignment(trip, assignment)
+
+    if block is None:
+        return {
+            "trip_id": assignment.get("value"),
+            "date": assignment_date,
+            "code": line_code,
+            "error": "SBA/SBG assignment has no usable block in trip",
+            "flights": []
+        }
+
+    flights = block.get("flights", [])
+    first_flight = flights[0] if flights else {}
+
+    # Prefer the exact SBA/SBG code from the Trips package.
+    # Example: line_code='SBA' can become code='SBA2'
+    # if the trip-package flight says SBA2.
+    trip_code = get_first_flight_code_in_block(block)
+    code = trip_code or line_code
+
+    record = {
+        "start_date": assignment_date,
+        "departure": first_flight.get("departure"),
+
+        "end_date": assignment_date,
+        "arrival": first_flight.get("arrival"),
+
+        "route_flags": extract_route_flags(first_flight),
+        "code": code,
+
+        "rest": block.get("rest") if block.get("rest") != "-" else None,
+        "block": block.get("block"),
+        "credit": block.get("credit"),
+        "duty": block.get("duty"),
+    }
+
+    return {
+        "trip_id": assignment.get("value"),
+
+        # Keep the same assignment-level shape as normal trips,
+        # but use only this one selected block.
+        "premium": 0.0,
+        "tafb": None,
+        "per_diem": 0.0,
+        "ldgs": 0,
+
+        "credit_time": block.get("credit"),
+        "duty_time": block.get("duty"),
+        "block_time": block.get("block"),
+        "total_blocks": 1,
+
+        "total_days_gone": 1,
+        "flights": [record]
+    }
 
 def build_master_assignment(assignment, trips):
     assignment_type = assignment.get("type")
@@ -200,6 +325,17 @@ def build_master_assignment(assignment, trips):
     assignment_date = assignment.get("date")
     assignment_start_time = assignment.get("start_time")
 
+    # -------------------------
+    # SBA / SBG no-start-time edge case
+    # -------------------------
+    line_code = normalize_sba_sbg_line_code(assignment.get("line_code"))
+
+    if assignment_start_time is None and line_code is not None:
+        return build_sba_sbg_master_assignment(assignment, trip)
+
+    # -------------------------
+    # Other missing-date / missing-start-time trip errors
+    # -------------------------
     if assignment_date is None or assignment_start_time is None:
         return {
             "trip_id": trip_id,
@@ -281,14 +417,9 @@ def build_master_assignment(assignment, trips):
                 "end_date": flight_end_dt.date().isoformat(),
                 "arrival": flight.get("arrival"),
 
-                # DH / BUS stay as route flags.
                 "route_flags": extract_route_flags(flight),
-
-                # SBG / SBA are saved as code, not route_flags.
                 "code": extract_flight_code(flight),
 
-                # Block-level info is stored only on the last flight of the block,
-                # same idea as rest.
                 "rest": block.get("rest")
                     if is_last_flight_in_block and block.get("rest") != "-"
                     else None,
@@ -353,14 +484,6 @@ def build_master_assignment(assignment, trips):
         "flights": flight_records
     }
 
-def minutes_to_decimal_hours(total_minutes, decimals=2):
-    """
-    Converts:
-        4350 -> 72.5
-        2559 -> 42.65
-    """
-    return round(total_minutes / 60, decimals)
-
 def hhmm_to_minutes(value):
     """
     Converts:
@@ -372,7 +495,6 @@ def hhmm_to_minutes(value):
 
     hours, minutes = value.split(":")
     return int(hours) * 60 + int(minutes)
-
 
 def minutes_to_hhmm(total_minutes):
     """
@@ -396,7 +518,7 @@ def creating_master_line(trips, lines):
         total_DD = 0
         total_DO = 0
 
-        total_trip_count = 0
+        total_tafb_count = 0
 
         # Used only for avg_BT / avg_CT / avg_DT.
         # Not saved in final master_lines.
@@ -409,6 +531,10 @@ def creating_master_line(trips, lines):
         # Used only for avg_rest.
         total_rest_minutes = 0
         total_rest_count = 0
+
+        # Used to assign the correct block from the Trips package
+        # for SBA/SBG assignments that have no start_time.
+        sba_sbg_block_counter = {}
 
         line_num = line["line_number"]
 
@@ -454,7 +580,34 @@ def creating_master_line(trips, lines):
             }
 
             for assignment in pp["assignments"]:
-                master_assignment = build_master_assignment(assignment, trips)
+                assignment_for_master = dict(assignment)
+
+                line_code = normalize_sba_sbg_line_code(
+                    assignment_for_master.get("line_code")
+                )
+
+                # SBA/SBG no-start-time edge case:
+                # Assign each repeated date to the next block in the trip package.
+                if (
+                    assignment_for_master.get("type") in TRIP_TYPES
+                    and assignment_for_master.get("start_time") is None
+                    and line_code is not None
+                ):
+                    counter_key = (
+                        pp.get("pp"),
+                        assignment_for_master.get("value"),
+                        line_code
+                    )
+
+                    block_index = sba_sbg_block_counter.get(counter_key, 0)
+                    assignment_for_master["_sba_sbg_block_index"] = block_index
+                    sba_sbg_block_counter[counter_key] = block_index + 1
+
+                master_assignment = build_master_assignment(
+                    assignment_for_master,
+                    trips
+                )
+
                 master_pp["assignments"].append(master_assignment)
 
                 # Skip VTO / RA / RB / SA / SB / VOR / etc.
@@ -464,8 +617,6 @@ def creating_master_line(trips, lines):
                 # Skip missing-trip or bad trip assignments.
                 if master_assignment.get("error"):
                     continue
-
-                total_trip_count += 1
 
                 trip_blocks = safe_int(master_assignment.get("total_blocks"))
                 total_blocks += trip_blocks
@@ -482,16 +633,18 @@ def creating_master_line(trips, lines):
                     master_assignment.get("duty_time")
                 )
 
-                tafb_minutes = trip_duration_to_minutes(
-                    master_assignment.get("tafb")
-                )
+                tafb_value = master_assignment.get("tafb")
+                tafb_minutes = trip_duration_to_minutes(tafb_value)
 
                 total_trip_block_minutes += block_minutes
                 total_trip_credit_minutes += credit_minutes
                 total_trip_duty_minutes += duty_minutes
 
                 total_DT_minutes += duty_minutes
-                total_tafb_minutes += tafb_minutes
+
+                if tafb_value is not None:
+                    total_tafb_minutes += tafb_minutes
+                    total_tafb_count += 1
 
                 # Average rest is based on the rest values stored in flights.
                 # Since only the last flight of each block carries rest,
@@ -530,10 +683,12 @@ def creating_master_line(trips, lines):
             master_lines[line_num]["avg_CT"] = 0
             master_lines[line_num]["avg_DT"] = 0
 
-        # Average TAFB per trip.
-        if total_trip_count > 0:
+        # Average TAFB per assignment that actually has TAFB.
+        # SBA/SBG synthetic daily blocks usually have tafb=None,
+        # so they do not drag avg_tafb down.
+        if total_tafb_count > 0:
             master_lines[line_num]["avg_tafb"] = minutes_to_decimal_hours(
-                total_tafb_minutes / total_trip_count
+                total_tafb_minutes / total_tafb_count
             )
         else:
             master_lines[line_num]["avg_tafb"] = 0

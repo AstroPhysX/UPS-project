@@ -555,8 +555,67 @@ def extract_trips_from_pdf(
 
 #Simply run: lines = parse_line_report_pdf(pdf_path, first_calendar_page=3)
 
-#DOWS = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"}
+def find_trip_number_under_special_code(
+    words,
+    code_word,
+    x_tolerance=20,
+    min_y_distance=2,
+    max_y_distance=28,
+):
+    """
+    Finds the trip number printed underneath a special line-report code
+    such as SBA, SBA3, SBG, SBG3.
 
+    Visual example:
+
+        SBA
+        1964
+
+    or:
+
+        SBA3
+        1965
+    """
+
+    code_x = word_center(code_word)
+
+    candidates = []
+
+    for w in words:
+        token = w["text"].strip()
+
+        if not re.fullmatch(r"\d+", token):
+            continue
+
+        y_distance = w["top"] - code_word["top"]
+
+        # Must be below the SBA/SBG word.
+        if y_distance < min_y_distance or y_distance > max_y_distance:
+            continue
+
+        x_distance = abs(word_center(w) - code_x)
+
+        if x_distance > x_tolerance:
+            continue
+
+        candidates.append({
+            "word": w,
+            "token": token,
+            "x_distance": x_distance,
+            "y_distance": y_distance,
+        })
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda c: (
+            c["y_distance"],
+            c["x_distance"],
+        )
+    )
+
+    return candidates[0]
 
 def parse_bid_range(page_text):
     m = re.search(
@@ -739,12 +798,11 @@ def nearest_column_index(x, columns, max_distance=12.5):
     return None
 
 
-ASSIGNMENT_PATTERN = r"(?:\d+|VTO|VOR|RA|SA|RB|SB)"
-TIME_PATTERN = r"(?:[01]\d|2[0-3])[0-5]\d"
+NORMAL_CODE_PATTERN = r"(?:VTO|VOR|RA|SA|RB|SB)"
+SPECIAL_TRIP_CODE_PATTERN = r"(?:SBA\d*|SBG\d*)"
 
-
+ASSIGNMENT_PATTERN = rf"(?:\d+|{NORMAL_CODE_PATTERN}|{SPECIAL_TRIP_CODE_PATTERN})"
 TIME_PATTERN = r"(?:[01]\d|2[0-3])[0-5]\d"
-ASSIGNMENT_PATTERN = r"(?:\d+|VTO|VOR|RA|SA|RB|SB)"
 
 
 def word_center(w):
@@ -974,6 +1032,7 @@ def parse_pp(words, pp_anchor, bid_start):
     for item in assignment_words:
         token = item["token"]
         assignment_word = item["word"]
+        date_column_index = item["column_index"]
 
         if token.isdigit():
             start_time_info = find_start_time_for_trip(
@@ -982,23 +1041,21 @@ def parse_pp(words, pp_anchor, bid_start):
             )
 
             start_time = None
-            date_column_index = item["column_index"]
 
             if start_time_info is not None:
                 start_time_token = start_time_info["token"]
-                start_time_word = start_time_info["word"]
-
                 start_time = format_hhmm(start_time_token)
 
-                # Important:
-                # Use the time to choose left/right date only when near a date boundary.
                 date_column_index = choose_trip_column_by_time(
-                            x=word_center(assignment_word),
-                            start_time_token=start_time_token,
-                            columns=columns,
-                            fallback_index=item["column_index"],
-                            boundary_tolerance=8,
-                            )
+                    x=word_center(assignment_word),
+                    start_time_token=start_time_token,
+                    columns=columns,
+                    fallback_index=item["column_index"],
+                    boundary_tolerance=8,
+                )
+
+            if date_column_index is None:
+                date_column_index = item["column_index"]
 
             assignments.append({
                 "date": columns[date_column_index]["date"],
@@ -1007,10 +1064,33 @@ def parse_pp(words, pp_anchor, bid_start):
                 "value": int(token),
             })
 
+        elif re.fullmatch(SPECIAL_TRIP_CODE_PATTERN, token):
+            trip_number_info = find_trip_number_under_special_code(
+                words=words,
+                code_word=assignment_word,
+            )
+
+            if trip_number_info is not None:
+                assignments.append({
+                    "date": columns[date_column_index]["date"],
+                    "start_time": None,
+                    "type": "trip",
+                    "value": int(trip_number_info["token"]),
+                    "line_code": token,
+                })
+            else:
+                # Fallback: preserve the SBA/SBG code even if the trip number
+                # could not be found underneath it.
+                assignments.append({
+                    "date": columns[date_column_index]["date"],
+                    "type": "special_trip_code",
+                    "value": token,
+                    "trip_id": None,
+                })
+
         else:
-            # VTO / VOR / RA / SA / RB / SB do not need time logic.
             assignments.append({
-                "date": columns[item["column_index"]]["date"],
+                "date": columns[date_column_index]["date"],
                 "type": "code",
                 "value": token,
             })
