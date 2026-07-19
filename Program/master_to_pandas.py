@@ -2,6 +2,7 @@ import pandas as pd
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 import math
+import re
 
 def build_line_calendar_values(line_data, bid_dates, off_value=""):
     """
@@ -450,10 +451,9 @@ def master_lines_to_dataframe(
             "Training": line_data.get("training_fit_score", 0),
             "Blockiness": line_data.get("blockiness_score", 0),
             "Total DO": line_data.get("tot_DO", 0),
-            "% tickets paid": line_data.get("pct_company_ticket", 0),
+            "% tickets paid": line_data.get("pct_company_tickets", 0),
             "Avg # of legs": line_data.get("avg_legs_per_work_day",math.nan),
             "Total CT": line_data.get("tot_CT",0),
-            "Premium": int(line_data.get("tot_Premium", line_data.get("tot_premium", 0))),
             "Avg CT": line_data.get("avg_CT", 0),
             "Avg DT": line_data.get("avg_DT",0),
             "Avg Rest": line_data.get("avg_rest",0),
@@ -466,6 +466,7 @@ def master_lines_to_dataframe(
             "% Weekends off": line_data.get("pct_weekends_off",0),
             r"% of Days off Requested": line_data.get("pct_requested_days_off",0),
             "Pay": line_data.get("tot_pay",0),
+            "Tax-Free Pay":line_data.get("pay_per_diem")
         })
 
         if include_start_bid_off:
@@ -492,123 +493,703 @@ def master_lines_to_dataframe(
 
     return pd.DataFrame(rows).sort_values("Line Number").reset_index(drop=True)
 
+#--------------------------------------------------------------------------------------------------------------------
+#New Sorting
+#New sorting helper functions
+def normalize_sort_direction(direction):
+    """
+    Returns True for ascending, False for descending.
+    """
 
+    if isinstance(direction, bool):
+        return direction
+
+    direction = str(direction).lower().strip()
+
+    ascending_words = {
+        "asc",
+        "ascending",
+        "low_to_high",
+        "small_to_large",
+        "smallest_to_largest",
+        "lower_is_better",
+    }
+
+    descending_words = {
+        "desc",
+        "descending",
+        "high_to_low",
+        "large_to_small",
+        "largest_to_smallest",
+        "higher_is_better",
+    }
+
+    if direction in ascending_words:
+        return True
+
+    if direction in descending_words:
+        return False
+
+    raise ValueError(
+        f"Invalid sort direction: {direction}. "
+        "Use 'asc', 'desc', 'low_to_high', or 'high_to_low'."
+    )
+def normalize_sort_mode(mode):
+    """
+    Returns:
+        ("strict", None)
+        ("weighted", "new")
+        ("weighted", "equal")
+    """
+
+    mode = str(mode).lower().strip()
+
+    strict_words = {
+        "strict",
+        "fixed",
+        "priority",
+        "tie_breaker",
+        "tiebreaker",
+        "tie-breaker",
+    }
+
+    weighted_words = {
+        "weighted",
+        "flexible",
+        "score",
+        "combined",
+        "combined_score",
+        "new_weight",
+        "new_level",
+    }
+
+    equal_words = {
+        "equal",
+        "same",
+        "same_weight",
+        "same_level",
+    }
+
+    if mode in strict_words:
+        return "strict", None
+
+    if mode in weighted_words:
+        return "weighted", "new"
+
+    if mode in equal_words:
+        return "weighted", "equal"
+
+    raise ValueError(
+        f"Invalid sort mode: {mode}. "
+        "Use 'strict', 'weighted', or 'equal'."
+    )
+def normalize_sort_conditions(sort_conditions, *, default_mode="strict"):
+    """
+    Normalizes sort conditions into dictionaries.
+
+    Accepted formats:
+
+        ("Training", "high_to_low")
+
+        ("Training", "high_to_low", "weighted")
+
+        {
+            "column": "Training",
+            "direction": "high_to_low",
+            "mode": "weighted",
+        }
+    """
+
+    normalized = []
+
+    for item in sort_conditions:
+
+        if isinstance(item, dict):
+            col = item.get("column")
+            direction = item.get("direction", item.get("order", "desc"))
+            mode = item.get("mode", default_mode)
+
+        else:
+            if len(item) == 2:
+                col, direction = item
+                mode = default_mode
+
+            elif len(item) == 3:
+                col, direction, mode = item
+
+            else:
+                raise ValueError(
+                    "Each sort condition must be one of these formats:\n"
+                    "    (column, direction)\n"
+                    "    (column, direction, mode)\n"
+                    f"Got: {item}"
+                )
+
+        if col is None:
+            raise ValueError(f"Sort condition is missing a column name: {item}")
+
+        normalized_mode, weight_role = normalize_sort_mode(mode)
+
+        normalized.append({
+            "column": col,
+            "ascending": normalize_sort_direction(direction),
+            "direction_text": str(direction),
+            "mode": normalized_mode,
+            "weight_role": weight_role,
+            "original_mode": str(mode),
+        })
+
+    return normalized
+def is_date_column_name(col,*,date_col_format="%Y-%m-%d",extra_date_formats=None):
+    """
+    Returns True if the column name looks like a date.
+
+    Date columns should never be dropped.
+    """
+
+    if extra_date_formats is None:
+        extra_date_formats = []
+
+    if isinstance(col, (datetime, date, pd.Timestamp)):
+        return True
+
+    text = str(col).strip()
+
+    formats_to_try = [
+        date_col_format,
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%Y/%m/%d",
+        "%Y%m%d",
+    ]
+
+    no_year_formats = [
+        "%b %d",
+        "%a %b %d",
+        "%a, %b %d",
+        "%m/%d",
+    ]
+
+    formats_to_try.extend(extra_date_formats)
+
+    for fmt in formats_to_try:
+        try:
+            datetime.strptime(text, fmt)
+            return True
+        except ValueError:
+            pass
+
+    # Avoid deprecation warning by injecting a leap year.
+    for fmt in no_year_formats:
+        try:
+            datetime.strptime(f"2000 {text}", f"%Y {fmt}")
+            return True
+        except ValueError:
+            pass
+
+    return False
+def numeric_series(df, col, *, fill_missing=False):
+    """
+    Converts a DataFrame column to numeric.
+
+    Handles:
+        10
+        "10"
+        "10%"
+        ""
+        None
+        NaN
+    """
+
+    cleaned = (
+        df[col]
+        .astype(str)
+        .str.replace("%", "", regex=False)
+        .str.strip()
+        .replace({
+            "": None,
+            "None": None,
+            "nan": None,
+            "NaN": None,
+        })
+    )
+
+    result = pd.to_numeric(cleaned, errors="coerce")
+
+    if fill_missing:
+        result = result.fillna(0)
+
+    return result
+def column_is_all_empty_or_zero(df, col):
+    """
+    Returns True if every value in the column is one of:
+
+        0
+        0.0
+        "0"
+        "0.0"
+        "$0"
+        "0%"
+        None
+        NaN
+        ""
+        "nan"
+        "None"
+
+    Important:
+        Non-empty text values like "SBA", "66:00", "RFD", "0h00"
+        are treated as real data and will prevent the column from being dropped.
+    """
+
+    s = df[col]
+
+    text = s.astype(str).str.strip()
+
+    empty_mask = (
+        s.isna()
+        | text.str.lower().isin({
+            "",
+            "none",
+            "nan",
+            "nat",
+            "null",
+            "<na>",
+        })
+    )
+
+    numeric_text = (
+        text
+        .str.replace("%", "", regex=False)
+        .str.replace("$", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.strip()
+    )
+
+    numeric_values = pd.to_numeric(numeric_text, errors="coerce")
+
+    zero_mask = numeric_values.eq(0)
+
+    # Non-empty, non-numeric text means the column has real data.
+    # Examples:
+    #   "SBA"
+    #   "66:00"
+    #   "RFD"
+    #   "0h00"
+    non_empty_text_mask = ~empty_mask & numeric_values.isna()
+
+    if non_empty_text_mask.any():
+        return False
+
+    return (empty_mask | zero_mask).all()
+def make_unique_temp_col(df, base_name):
+    temp_col = base_name
+
+    while temp_col in df.columns:
+        temp_col += "_"
+
+    return temp_col
+def remove_existing_sort_prefix(col):
+    """
+    Turns:
+        '1. Training'
+    back into:
+        'Training'
+
+    This prevents repeated renaming like:
+        '1. 1. Training'
+    """
+
+    return re.sub(r"^\d+\.\s+", "", str(col)).strip()
+
+#Sort percentage based off sort order
+def get_sort_percent_contributions(
+    sort_order,
+    *,
+    weighting_style="soft",
+    soft_max_weight=3.0,
+    soft_min_weight=1.0,
+    round_digits=2,
+):
+    """
+    Returns a list of percentage contributions for each sort criteria.
+
+    Example
+    -------
+    sort_order = [
+        ("Extra Vacation Days", "high_to_low", "strict"),
+        ("Training", "high_to_low", "weighted"),
+        ("Blockiness", "high_to_low", "weighted"),
+        ("Total DO", "high_to_low", "weighted"),
+        ("Premium", "high_to_low", "weighted"),
+        ("% tickets paid", "high_to_low", "weighted"),
+    ]
+
+    returns something like:
+
+        [nan, 30.0, 25.0, 20.0, 15.0, 10.0]
+
+    Rules
+    -----
+    strict:
+        Not part of weighted score.
+        Returns math.nan.
+        Resets the current weighted group.
+
+    weighted:
+        Starts a new weight level.
+
+    equal:
+        Uses the same weight level as the previous weighted/equal item.
+
+    weighting_style:
+        "hard":
+            Stronger weighting by position.
+            Example with 5 levels:
+                5, 4, 3, 2, 1
+
+        "soft":
+            Softer weighting by position.
+            Example with 5 levels and defaults:
+                3.0, 2.5, 2.0, 1.5, 1.0
+
+        "equal":
+            Every weighted item has the same contribution.
+    """
+
+    def normalize_mode(mode):
+        mode = str(mode).lower().strip()
+
+        strict_words = {
+            "strict",
+            "hard_priority",
+            "hard priority",
+            "priority",
+            "tie_breaker",
+            "tiebreaker",
+            "tie-breaker",
+        }
+
+        weighted_words = {
+            "weighted",
+            "new_weight",
+            "new weight",
+            "new_weighted_factor",
+            "new weighted factor",
+            "new_level",
+            "new level",
+        }
+
+        equal_words = {
+            "equal",
+            "same",
+            "same_weight",
+            "same weight",
+            "same_weight_as_above",
+            "same weight as above",
+            "same_level",
+            "same level",
+        }
+
+        if mode in strict_words:
+            return "strict"
+
+        if mode in weighted_words:
+            return "weighted"
+
+        if mode in equal_words:
+            return "equal"
+
+        raise ValueError(
+            f"Invalid sort mode: {mode}. "
+            "Use 'strict', 'weighted', or 'equal'."
+        )
+
+    def get_mode(item):
+        if isinstance(item, dict):
+            return item.get("mode", "strict")
+
+        if len(item) >= 3:
+            return item[2]
+
+        return "strict"
+
+    def make_level_weights(max_level):
+        style = str(weighting_style).lower().strip()
+
+        if style in {"equal", "flat", "none"}:
+            return {
+                level: 1.0
+                for level in range(1, max_level + 1)
+            }
+
+        if style in {"hard", "auto_hard"}:
+            return {
+                level: float(max_level - level + 1)
+                for level in range(1, max_level + 1)
+            }
+
+        if style in {"soft", "auto_soft"}:
+            if max_level == 1:
+                return {1: 1.0}
+
+            weight_range = soft_max_weight - soft_min_weight
+
+            return {
+                level: float(
+                    soft_max_weight
+                    - weight_range * (level - 1) / (max_level - 1)
+                )
+                for level in range(1, max_level + 1)
+            }
+
+        raise ValueError(
+            f"Invalid weighting_style: {weighting_style}. "
+            "Use 'soft', 'hard', or 'equal'."
+        )
+
+    def finalize_group(group_indexes, group_levels, result):
+        """
+        Converts one weighted group into percent contributions.
+        """
+
+        if not group_indexes:
+            return
+
+        max_level = max(group_levels)
+        level_weights = make_level_weights(max_level)
+
+        raw_weights = [
+            level_weights[level]
+            for level in group_levels
+        ]
+
+        total_weight = sum(raw_weights)
+
+        for index, raw_weight in zip(group_indexes, raw_weights):
+            percent = raw_weight / total_weight * 100
+
+            if round_digits is not None:
+                percent = round(percent, round_digits)
+
+            result[index] = percent
+
+    result = [math.nan] * len(sort_order)
+
+    group_indexes = []
+    group_levels = []
+    current_level = 0
+
+    for index, item in enumerate(sort_order):
+        mode = normalize_mode(get_mode(item))
+
+        if mode == "strict":
+            finalize_group(group_indexes, group_levels, result)
+
+            group_indexes = []
+            group_levels = []
+            current_level = 0
+
+            result[index] = math.nan
+
+        elif mode == "weighted":
+            current_level += 1
+
+            group_indexes.append(index)
+            group_levels.append(current_level)
+
+        elif mode == "equal":
+            if current_level == 0:
+                current_level = 1
+
+            group_indexes.append(index)
+            group_levels.append(current_level)
+
+    finalize_group(group_indexes, group_levels, result)
+
+    return result
+
+#Drop empty columns
+def drop_empty_sort_columns(
+    df,
+    *,
+    columns_to_check=None,
+    sort_conditions=None,
+    always_check_cols=("Extra Vacation Days", "Training"),
+    never_drop_cols=("Line Number",),
+    date_col_format="%Y-%m-%d",
+    extra_date_formats=None,
+    default_mode="strict",
+    check_all_columns=False,
+    return_dropped=False,
+):
+    """
+    Drops columns where every value is 0, 0.0, None, blank, or NaN.
+
+    Important:
+        - Date columns are NEVER dropped.
+        - Line Number is NEVER dropped by default.
+        - Non-numeric text values are treated as real data.
+        - If check_all_columns=True, every DataFrame column is checked.
+    """
+
+    df = df.copy()
+
+    cols_to_check = []
+
+    if check_all_columns:
+        cols_to_check.extend(df.columns)
+
+    elif columns_to_check == "all":
+        cols_to_check.extend(df.columns)
+
+    else:
+        if columns_to_check:
+            cols_to_check.extend(columns_to_check)
+
+        if always_check_cols:
+            cols_to_check.extend(always_check_cols)
+
+        if sort_conditions:
+            normalized = normalize_sort_conditions(
+                sort_conditions,
+                default_mode=default_mode,
+            )
+
+            cols_to_check.extend([
+                rule["column"]
+                for rule in normalized
+            ])
+
+    # Remove duplicates while preserving order
+    seen = set()
+    cols_to_check = [
+        col for col in cols_to_check
+        if not (col in seen or seen.add(col))
+    ]
+
+    dropped_columns = []
+
+    for col in cols_to_check:
+
+        if col not in df.columns:
+            continue
+
+        if col in never_drop_cols:
+            continue
+
+        # Absolute rule:
+        # date columns are never deleted.
+        if is_date_column_name(
+            col,
+            date_col_format=date_col_format,
+            extra_date_formats=extra_date_formats,
+        ):
+            continue
+
+        if column_is_all_empty_or_zero(df, col):
+            df = df.drop(columns=[col])
+            dropped_columns.append(col)
+
+    if return_dropped:
+        return df, dropped_columns
+
+    return df
+
+#New Sort by condition
 def sort_dataframe_by_conditions(
     df,
     sort_conditions,
     *,
     fixed_start_cols=("Line Number", "Extra Vacation Days"),
     date_col_format="%Y-%m-%d",
-    drop_all_zero_or_none_cols=True,
-    drop_fixed_cols_if_all_zero=True,
-    reset_index=True,
-    missing_col_action="raise",
+    extra_date_formats=None,
 
-    # New options
+    # Sorting behavior
     default_mode="strict",
     weighting_style="soft",
-    weights=None,
     soft_max_weight=3.0,
     soft_min_weight=1.0,
     missing_score=0.0,
-    keep_score_columns=False,
-    score_col_prefix="sort score",
     score_round_digits=None,
+
+    # Output behavior
+    reset_index=True,
+    missing_col_action="ignore",
+    reorder_columns=True,
+    add_sort_numbers=True,
+    strip_existing_sort_prefixes=True,
     return_sort_details=False,
 ):
     """
-    Sorts, scores, and reorders a DataFrame using strict and/or weighted
-    sorting conditions.
+    Sorts, reorders columns, and optionally adds sort numbers to sorted columns.
 
-    sort_conditions accepts either:
+    This function does NOT drop empty columns.
+    Use drop_empty_sort_columns() before this function.
 
-        Old/simple format:
-            [
-                ("Training", "desc"),
-                ("Blockiness", "desc"),
-                ("Avg # of legs", "asc"),
-            ]
+    Supported sort condition formats:
 
-        Hybrid format:
-            [
-                ("Extra Vacation Days", "high_to_low", "strict"),
-                ("Training", "high_to_low", "weighted"),
-                ("Blockiness", "high_to_low", "weighted"),
-                ("Total DO", "high_to_low", "strict"),
-                ("% tickets paid", "high_to_low", "weighted"),
-            ]
+        ("Training", "high_to_low")
 
-    Modes:
-        "strict":
-            Used as a normal priority / tie-breaker sort.
+        ("Training", "high_to_low", "weighted")
 
-        "weighted":
-            Consecutive weighted conditions are blended into a percentile-rank
-            combined score.
+        ("Blockiness", "high_to_low", "equal")
 
-    weighting_style:
-        "equal":
-            Every weighted item in a group gets weight 1.
+        {
+            "column": "Training",
+            "direction": "high_to_low",
+            "mode": "weighted",
+        }
 
-        "hard":
-            Position-based weights within each weighted group.
-            Example with 4 weighted items:
-                [4, 3, 2, 1]
+    Modes
+    -----
+    strict:
+        Hard priority / tie-breaker sorting.
 
-        "soft":
-            Softer position-based weights within each weighted group.
-            Example with 4 weighted items and defaults:
-                [3.0, 2.33, 1.67, 1.0]
+    weighted:
+        Starts a new weighted level.
 
-    weights:
-        Optional manual weight overrides by column name.
+    equal:
+        Same weighted level as the previous weighted/equal item.
 
-        Example:
-            {
-                "Blockiness": 2,
-                "Training": 1,
-            }
+    Example
+    -------
+    sort_conditions = [
+        ("Extra Vacation Days", "high_to_low", "strict"),
+        ("Training", "high_to_low", "weighted"),
+        ("Blockiness", "high_to_low", "weighted"),
+        ("Total DO", "high_to_low", "equal"),
+        ("Premium", "high_to_low", "weighted"),
+        ("% tickets paid", "high_to_low", "weighted"),
+    ]
 
-        Manual weights override the automatic/equal weight for that column.
-
-    default_mode:
-        Used when a condition only has two items: (column, direction).
-
-        Default is "strict", so old sort_orders behave like your original
-        tie-breaker sorting function.
-
-        Use default_mode="weighted" if you want all 2-item conditions to be
-        treated as weighted.
-
-    score_round_digits:
-        If not None, weighted score columns are rounded before sorting.
-
-        This can make later strict/tie-breaker stages matter more.
-        Example:
-            score_round_digits=3
-
-    keep_score_columns:
-        If True, keeps the generated combined score columns in the DataFrame.
-        If False, uses them for sorting and then removes them.
-
-    return_sort_details:
-        If True, returns:
-            df, details
-
-        instead of just:
-            df
+    Numbered columns become:
+        1. Extra Vacation Days
+        2. Training
+        3. Blockiness
+        3. Total DO
+        4. Premium
+        5. % tickets paid
     """
 
     df = df.copy()
 
-    if weights is None:
-        weights = {}
-    elif not isinstance(weights, dict):
-        raise ValueError("weights must be None or a dictionary.")
+    if extra_date_formats is None:
+        extra_date_formats = []
 
     # ------------------------------------------------------------
     # Helper functions
     # ------------------------------------------------------------
+
+    def remove_existing_sort_prefix(col):
+        """
+        Turns:
+            '1. Training'
+        back into:
+            'Training'
+        """
+
+        return re.sub(r"^\d+\.\s+", "", str(col)).strip()
 
     def normalize_sort_direction(direction):
         """
@@ -651,15 +1232,20 @@ def sort_dataframe_by_conditions(
 
     def normalize_sort_mode(mode):
         """
-        Returns either 'strict' or 'weighted'.
+        Returns:
+            ("strict", None)
+            ("weighted", "new")
+            ("weighted", "equal")
         """
 
         mode = str(mode).lower().strip()
 
         strict_words = {
             "strict",
-            "fixed",
             "priority",
+            "hard_priority",
+            "hard priority",
+            "fixed",
             "tie_breaker",
             "tiebreaker",
             "tie-breaker",
@@ -667,42 +1253,144 @@ def sort_dataframe_by_conditions(
 
         weighted_words = {
             "weighted",
-            "flexible",
+            "new_weight",
+            "new weight",
+            "new_weighted_factor",
+            "new weighted factor",
+            "new_level",
+            "new level",
             "score",
             "combined",
             "combined_score",
         }
 
+        equal_words = {
+            "equal",
+            "same",
+            "same_weight",
+            "same weight",
+            "same_weight_as_above",
+            "same weight as above",
+            "same_level",
+            "same level",
+        }
+
         if mode in strict_words:
-            return "strict"
+            return "strict", None
 
         if mode in weighted_words:
-            return "weighted"
+            return "weighted", "new"
+
+        if mode in equal_words:
+            return "weighted", "equal"
 
         raise ValueError(
             f"Invalid sort mode: {mode}. "
-            "Use 'strict' or 'weighted'."
+            "Use 'strict', 'weighted', or 'equal'."
         )
 
-    def is_calendar_col(col):
+    def normalize_sort_conditions(sort_conditions):
         """
-        Returns True if the column name looks like a calendar date column.
+        Converts tuple/list/dict conditions into normalized dictionaries.
         """
 
-        try:
-            datetime.strptime(str(col), date_col_format)
+        normalized = []
+
+        for item in sort_conditions:
+
+            if isinstance(item, dict):
+                col = item.get("column")
+                direction = item.get("direction", item.get("order", "desc"))
+                mode = item.get("mode", default_mode)
+
+            else:
+                if len(item) == 2:
+                    col, direction = item
+                    mode = default_mode
+
+                elif len(item) == 3:
+                    col, direction, mode = item
+
+                else:
+                    raise ValueError(
+                        "Each sort condition must be one of these formats:\n"
+                        "    (column, direction)\n"
+                        "    (column, direction, mode)\n"
+                        f"Got: {item}"
+                    )
+
+            if col is None:
+                raise ValueError(f"Sort condition is missing a column name: {item}")
+
+            normalized_mode, weight_role = normalize_sort_mode(mode)
+
+            normalized.append({
+                "column": col,
+                "ascending": normalize_sort_direction(direction),
+                "mode": normalized_mode,
+                "weight_role": weight_role,
+                "original_mode": str(mode),
+            })
+
+        return normalized
+
+    def is_date_column_name(col):
+        """
+        Returns True if the column name looks like a date.
+
+        Date/calendar columns should not be renamed with sort numbers.
+        """
+
+        if isinstance(col, (datetime, date, pd.Timestamp)):
             return True
-        except ValueError:
-            return False
+
+        text = str(col).strip()
+
+        formats_to_try = [
+            date_col_format,
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+            "%m/%d/%y",
+            "%Y/%m/%d",
+            "%Y%m%d",
+        ]
+
+        no_year_formats = [
+            "%b %d",
+            "%a %b %d",
+            "%a, %b %d",
+            "%m/%d",
+        ]
+
+        formats_to_try.extend(extra_date_formats)
+
+        for fmt in formats_to_try:
+            try:
+                datetime.strptime(text, fmt)
+                return True
+            except ValueError:
+                pass
+
+        # Avoid Python's warning about parsing dates without a year.
+        # Use 2000 because it is a leap year.
+        for fmt in no_year_formats:
+            try:
+                datetime.strptime(f"2000 {text}", f"%Y {fmt}")
+                return True
+            except ValueError:
+                pass
+
+        return False
 
     def numeric_series(col, *, fill_missing=False):
         """
-        Converts a column to numeric.
+        Converts a column to numeric for sorting/scoring.
 
         Handles:
             10
             "10"
             "10%"
+            "$10"
             ""
             None
             NaN
@@ -712,12 +1400,16 @@ def sort_dataframe_by_conditions(
             df[col]
             .astype(str)
             .str.replace("%", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
             .str.strip()
             .replace({
                 "": None,
                 "None": None,
                 "nan": None,
                 "NaN": None,
+                "NaT": None,
+                "<NA>": None,
             })
         )
 
@@ -729,10 +1421,6 @@ def sort_dataframe_by_conditions(
         return result
 
     def make_unique_temp_col(base_name):
-        """
-        Makes a temporary column name that does not already exist.
-        """
-
         temp_col = base_name
 
         while temp_col in df.columns:
@@ -740,100 +1428,81 @@ def sort_dataframe_by_conditions(
 
         return temp_col
 
-    def normalize_condition(item):
+    def make_weight_by_level(max_level):
         """
-        Converts tuple/list/dict sort condition into a standard dictionary.
+        Creates raw weights by weighted level.
         """
-
-        if isinstance(item, dict):
-            col = item.get("column")
-            direction = item.get("direction", item.get("order", "desc"))
-            mode = item.get("mode", default_mode)
-
-        else:
-            if len(item) == 2:
-                col, direction = item
-                mode = default_mode
-
-            elif len(item) == 3:
-                col, direction, mode = item
-
-            else:
-                raise ValueError(
-                    "Each sort condition must be either "
-                    "(column, direction) or (column, direction, mode). "
-                    f"Got: {item}"
-                )
-
-        if col is None:
-            raise ValueError(f"Sort condition is missing a column name: {item}")
-
-        return {
-            "column": col,
-            "ascending": normalize_sort_direction(direction),
-            "mode": normalize_sort_mode(mode),
-        }
-
-    def make_group_weights(weighted_group):
-        """
-        Creates weights for one consecutive weighted group.
-        Manual weights override automatic/equal weights.
-        """
-
-        columns = [rule["column"] for rule in weighted_group]
-        n = len(columns)
 
         style = str(weighting_style).lower().strip()
 
         if style in {"equal", "none", "flat"}:
-            base_weights = {
-                col: 1.0
-                for col in columns
+            return {
+                level: 1.0
+                for level in range(1, max_level + 1)
             }
 
-        elif style in {"hard", "auto", "auto_hard"}:
-            base_weights = {
-                col: float(n - index)
-                for index, col in enumerate(columns)
+        if style in {"hard", "auto", "auto_hard"}:
+            return {
+                level: float(max_level - level + 1)
+                for level in range(1, max_level + 1)
             }
 
-        elif style in {"soft", "auto_soft"}:
-            if n == 1:
-                base_weights = {
-                    columns[0]: 1.0
-                }
-            else:
-                weight_range = soft_max_weight - soft_min_weight
+        if style in {"soft", "auto_soft"}:
+            if max_level == 1:
+                return {1: 1.0}
 
-                base_weights = {
-                    col: float(
-                        soft_max_weight
-                        - (weight_range * index / (n - 1))
-                    )
-                    for index, col in enumerate(columns)
-                }
+            weight_range = soft_max_weight - soft_min_weight
 
-        else:
-            raise ValueError(
-                f"Invalid weighting_style: {weighting_style}. "
-                "Use 'equal', 'hard', or 'soft'."
-            )
-
-        # Manual weights override automatic/equal weights.
-        for col in columns:
-            if col in weights:
-                base_weights[col] = float(weights[col])
-
-            if base_weights[col] < 0:
-                raise ValueError(
-                    f"Weight for column '{col}' cannot be negative."
+            return {
+                level: float(
+                    soft_max_weight
+                    - weight_range * (level - 1) / (max_level - 1)
                 )
+                for level in range(1, max_level + 1)
+            }
 
-        return base_weights
+        raise ValueError(
+            f"Invalid weighting_style: {weighting_style}. "
+            "Use 'soft', 'hard', or 'equal'."
+        )
 
-    def split_into_stages(active_rules):
+    def get_group_weights_from_rules(weighted_rules):
         """
-        Weighted rules are grouped until a strict rule appears.
+        Creates automatic weights for one weighted group.
+
+        weighted = new level
+        equal    = same level as previous weighted/equal item
+        """
+
+        current_level = 0
+        level_by_column = {}
+
+        for rule in weighted_rules:
+            col = rule["column"]
+
+            if rule["weight_role"] == "new":
+                current_level += 1
+
+            elif rule["weight_role"] == "equal":
+                if current_level == 0:
+                    current_level = 1
+
+            level_by_column[col] = current_level
+
+        max_level = max(level_by_column.values())
+
+        weight_by_level = make_weight_by_level(max_level)
+
+        weight_by_column = {
+            col: weight_by_level[level]
+            for col, level in level_by_column.items()
+        }
+
+        return weight_by_column, level_by_column
+
+    def split_rules_into_sort_stages(active_rules):
+        """
+        Consecutive weighted/equal rules are combined into one weighted group.
         Strict rules become their own sort stage.
         """
 
@@ -841,6 +1510,7 @@ def sort_dataframe_by_conditions(
         weighted_group = []
 
         for rule in active_rules:
+
             if rule["mode"] == "weighted":
                 weighted_group.append(rule)
 
@@ -865,21 +1535,75 @@ def sort_dataframe_by_conditions(
 
         return stages
 
+    def build_sort_number_map(normalized_rules):
+        """
+        Builds the numbering used for column renaming.
+
+        strict:
+            gets a new number.
+
+        weighted:
+            gets a new number.
+
+        equal:
+            gets the same number as the previous weighted/equal item.
+        """
+
+        sort_number_by_column = {}
+
+        sort_number = 0
+        current_weight_number = None
+
+        for rule in normalized_rules:
+            col = rule["column"]
+
+            if rule["mode"] == "strict":
+                sort_number += 1
+                current_weight_number = None
+                sort_number_by_column[col] = sort_number
+
+            else:
+                if rule["weight_role"] == "new":
+                    sort_number += 1
+                    current_weight_number = sort_number
+
+                elif rule["weight_role"] == "equal":
+                    if current_weight_number is None:
+                        sort_number += 1
+                        current_weight_number = sort_number
+
+                sort_number_by_column[col] = current_weight_number
+
+        return sort_number_by_column
+
     # ------------------------------------------------------------
-    # 1. Normalize, validate, and activate sorting columns
+    # 1. Remove existing sort prefixes
     # ------------------------------------------------------------
 
-    normalized_conditions = [
-        normalize_condition(item)
-        for item in sort_conditions
-    ]
+    if strip_existing_sort_prefixes:
+        rename_map = {}
+        existing_cols = set(df.columns)
+
+        for col in df.columns:
+            base_col = remove_existing_sort_prefix(col)
+
+            # Only rename if it will not collide with an existing column.
+            if base_col != col and base_col not in existing_cols:
+                rename_map[col] = base_col
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+    # ------------------------------------------------------------
+    # 2. Normalize and validate sort conditions
+    # ------------------------------------------------------------
+
+    normalized_rules = normalize_sort_conditions(sort_conditions)
 
     active_rules = []
-    dropped_columns = []
-    inactive_all_zero_columns = []
     missing_columns = []
 
-    for rule in normalized_conditions:
+    for rule in normalized_rules:
         col = rule["column"]
 
         if col not in df.columns:
@@ -895,48 +1619,23 @@ def sort_dataframe_by_conditions(
                     "missing_col_action must be 'raise' or 'ignore'."
                 )
 
-        col_numeric = numeric_series(col, fill_missing=True)
-        all_zero_or_none = col_numeric.eq(0).all()
-
-        col_is_fixed = col in fixed_start_cols or is_calendar_col(col)
-
-        should_drop_col = (
-            drop_all_zero_or_none_cols
-            and all_zero_or_none
-            and (
-                not col_is_fixed
-                or drop_fixed_cols_if_all_zero
-            )
-        )
-
-        if should_drop_col:
-            df = df.drop(columns=[col])
-            dropped_columns.append(col)
-            continue
-
-        # Keep inactive all-zero protected columns, but do not use them
-        # as active sorting criteria.
-        if all_zero_or_none:
-            inactive_all_zero_columns.append(col)
-            continue
-
         active_rules.append(rule)
 
     # ------------------------------------------------------------
-    # 2. Build staged sort columns
+    # 3. Build sort stages
     # ------------------------------------------------------------
 
-    stages = split_into_stages(active_rules)
+    stages = split_rules_into_sort_stages(active_rules)
 
     sort_by_cols = []
     ascending_values = []
     temp_cols_to_drop = []
-    score_cols_created = []
     stage_details = []
 
     weighted_group_count = 0
 
     for stage in stages:
+
         if stage["type"] == "strict":
             rule = stage["rules"][0]
             col = rule["column"]
@@ -960,10 +1659,10 @@ def sort_dataframe_by_conditions(
             group_rules = stage["rules"]
 
             score_col = make_unique_temp_col(
-                f"{score_col_prefix}_{weighted_group_count}"
+                f"__weighted_score_{weighted_group_count}"
             )
 
-            group_weights = make_group_weights(group_rules)
+            group_weights, group_levels = get_group_weights_from_rules(group_rules)
 
             total_weight = sum(
                 group_weights[rule["column"]]
@@ -977,7 +1676,7 @@ def sort_dataframe_by_conditions(
                     "At least one weighted column must have a positive weight."
                 )
 
-            combined_score = 0
+            combined_score = pd.Series(0.0, index=df.index)
 
             for rule in group_rules:
                 col = rule["column"]
@@ -986,13 +1685,11 @@ def sort_dataframe_by_conditions(
                 if weight == 0:
                     continue
 
-                # For score ranking:
-                # - high_to_low / desc means bigger raw value is better
-                # - low_to_high / asc means smaller raw value is better
+                # high_to_low / desc:
+                #     larger raw value gets a higher percentile.
                 #
-                # pandas rank ascending=True gives the largest raw value
-                # the highest percentile.
-                # Therefore rank_ascending is the opposite of sort ascending.
+                # low_to_high / asc:
+                #     smaller raw value gets a higher percentile.
                 rank_ascending = not rule["ascending"]
 
                 rank_score = numeric_series(
@@ -1013,24 +1710,18 @@ def sort_dataframe_by_conditions(
 
             sort_by_cols.append(score_col)
             ascending_values.append(False)
-
-            score_cols_created.append(score_col)
-
-            if not keep_score_columns:
-                temp_cols_to_drop.append(score_col)
+            temp_cols_to_drop.append(score_col)
 
             stage_details.append({
                 "type": "weighted_group",
                 "columns": [rule["column"] for rule in group_rules],
                 "score_column": score_col,
-                "weights": {
-                    rule["column"]: group_weights[rule["column"]]
-                    for rule in group_rules
-                },
+                "weights": group_weights,
+                "levels": group_levels,
             })
 
     # ------------------------------------------------------------
-    # 3. Sort
+    # 4. Sort
     # ------------------------------------------------------------
 
     if sort_by_cols:
@@ -1051,68 +1742,97 @@ def sort_dataframe_by_conditions(
         df = df.reset_index(drop=True)
 
     # ------------------------------------------------------------
-    # 4. Reorder columns
+    # 5. Reorder columns
     # ------------------------------------------------------------
 
-    current_cols = list(df.columns)
+    if reorder_columns:
+        current_cols = list(df.columns)
 
-    fixed_cols = [
-        col for col in fixed_start_cols
-        if col in current_cols
-    ]
+        fixed_cols = [
+            col for col in fixed_start_cols
+            if col in current_cols
+        ]
 
-    calendar_cols = [
-        col for col in current_cols
-        if col not in fixed_cols and is_calendar_col(col)
-    ]
+        calendar_cols = [
+            col for col in current_cols
+            if (
+                col not in fixed_cols
+                and is_date_column_name(col)
+            )
+        ]
 
-    sort_order_cols = []
+        sort_order_cols = []
 
-    for rule in normalized_conditions:
-        col = rule["column"]
+        for rule in active_rules:
+            col = rule["column"]
 
-        if (
-            col in df.columns
-            and col not in fixed_cols
-            and col not in calendar_cols
-            and col not in sort_order_cols
-        ):
-            sort_order_cols.append(col)
+            if (
+                col in df.columns
+                and col not in fixed_cols
+                and col not in calendar_cols
+                and col not in sort_order_cols
+            ):
+                sort_order_cols.append(col)
 
-    visible_score_cols = [
-        col for col in score_cols_created
-        if col in df.columns
-    ]
+        remaining_cols = [
+            col for col in current_cols
+            if (
+                col not in fixed_cols
+                and col not in calendar_cols
+                and col not in sort_order_cols
+            )
+        ]
 
-    remaining_cols = [
-        col for col in current_cols
-        if (
-            col not in fixed_cols
-            and col not in calendar_cols
-            and col not in sort_order_cols
-            and col not in visible_score_cols
+        final_col_order = (
+            fixed_cols
+            + calendar_cols
+            + sort_order_cols
+            + remaining_cols
         )
-    ]
 
-    final_col_order = (
-        fixed_cols
-        + calendar_cols
-        + sort_order_cols
-        + visible_score_cols
-        + remaining_cols
-    )
+        df = df[final_col_order]
 
-    df = df[final_col_order]
+    # ------------------------------------------------------------
+    # 6. Add sort numbers to relevant columns
+    # ------------------------------------------------------------
+
+    if add_sort_numbers:
+        # Use only columns that still exist and are actually part of the active sort.
+        # This prevents dropped columns from consuming sort numbers.
+        active_numbering_rules = [
+            rule for rule in active_rules
+            if rule["column"] in df.columns
+        ]
+
+        sort_number_by_column = build_sort_number_map(active_numbering_rules)
+
+        rename_map = {}
+
+        for col in df.columns:
+            base_col = remove_existing_sort_prefix(col)
+
+            if base_col == "Line Number":
+                continue
+
+            if is_date_column_name(base_col):
+                continue
+
+            if base_col in sort_number_by_column:
+                rename_map[col] = f"{sort_number_by_column[base_col]}. {base_col}"
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+    # ------------------------------------------------------------
+    # 7. Return
+    # ------------------------------------------------------------
 
     if return_sort_details:
         details = {
-            "active_rules": active_rules,
             "stages": stage_details,
-            "dropped_columns": dropped_columns,
-            "inactive_all_zero_columns": inactive_all_zero_columns,
-            "missing_columns": missing_columns,
             "sort_by_columns": sort_by_cols,
             "ascending_values": ascending_values,
+            "missing_columns": missing_columns,
         }
 
         return df, details
