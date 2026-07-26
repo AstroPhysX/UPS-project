@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import platform
 import queue
@@ -41,8 +42,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from PySide6.QtCore import QDate, QPoint, QSize, QTimer, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QDate, QMimeData, QPoint, QSize, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QDrag, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -76,7 +77,12 @@ from PySide6.QtWidgets import (
 
 from pdf_extractors import extract_trips_from_pdf, parse_line_report_pdf, matching_bid_period
 from master_lines_creation import creating_master_line
-from master_to_pandas import master_lines_to_dataframe, sort_dataframe_by_conditions
+from master_to_pandas import (
+    get_sort_percent_contributions,
+    master_lines_to_dataframe,
+    drop_empty_sort_columns,
+    sort_dataframe_by_conditions,
+)
 from export_to_excel import export_master_lines_to_excel_table
 import Processing_fucntions as pf
 
@@ -107,6 +113,25 @@ LINE_TYPE_CODES = [
 ]
 
 DEFAULT_LINE_TYPE_PREFERENCE_ORDER = list(LINE_TYPE_CODES)
+
+MIN_SORT_CRITERIA_ROWS = 3
+
+SORT_DIRECTION_LABEL_TO_VALUE = {
+    "High to Low": "high_to_low",
+    "Low to High": "low_to_high",
+}
+SORT_DIRECTION_VALUE_TO_LABEL = {
+    value: label for label, value in SORT_DIRECTION_LABEL_TO_VALUE.items()
+}
+
+SORT_MODE_LABEL_TO_VALUE = {
+    "High Priority": "strict",
+    "Weighted": "weighted",
+    "Equal to Previous": "equal",
+}
+SORT_MODE_VALUE_TO_LABEL = {
+    value: label for label, value in SORT_MODE_LABEL_TO_VALUE.items()
+}
 
 DEFAULT_MODE_DESCRIPTIONS = {
     "strict": "Normal priority / tie-breaker sort. The first selected column dominates, then the next column breaks ties, and so on.",
@@ -483,12 +508,21 @@ class RequestedDateRangeDialog(QDialog):
         title: str,
         initial_start: str = "",
         initial_end: str = "",
+        initial_note: str = "",
     ) -> None:
         super().__init__(parent)
         self.result: dict[str, str] | None = None
         self.setWindowTitle(title)
         self.setModal(True)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        self.note_edit = QLineEdit(self)
+        self.note_edit.setText(initial_note)
+        self.note_edit.setPlaceholderText("Optional note")
+        self.note_edit.setToolTip(
+            "This note is saved only in your local bid_config.json and is not "
+            "passed into the requested-days scoring function."
+        )
 
         self.start_entry = DateEntry(self)
         self.start_entry.setText(initial_start)
@@ -501,12 +535,22 @@ class RequestedDateRangeDialog(QDialog):
         )
         help_label.setWordWrap(True)
 
+        privacy_label = QLabel(
+            "Notes are saved for your reference and do not affect scoring."
+        )
+        privacy_label.setWordWrap(True)
+        privacy_label.setStyleSheet("color: #E6D7C5;")
+
         main = QGridLayout(self)
+        main.setColumnStretch(1, 1)
         main.addWidget(help_label, 0, 0, 1, 2)
-        main.addWidget(QLabel("Date / start:"), 1, 0)
-        main.addWidget(self.start_entry, 1, 1)
-        main.addWidget(QLabel("Optional end:"), 2, 0)
-        main.addWidget(self.end_entry, 2, 1)
+        main.addWidget(QLabel("Notes:"), 1, 0)
+        main.addWidget(self.note_edit, 1, 1)
+        main.addWidget(QLabel("Date / start:"), 2, 0)
+        main.addWidget(self.start_entry, 2, 1)
+        main.addWidget(QLabel("Optional end:"), 3, 0)
+        main.addWidget(self.end_entry, 3, 1)
+        main.addWidget(privacy_label, 4, 0, 1, 2)
 
         save_button = QPushButton("Save")
         cancel_button = QPushButton("Cancel")
@@ -517,9 +561,9 @@ class RequestedDateRangeDialog(QDialog):
         buttons.addStretch(1)
         buttons.addWidget(cancel_button)
         buttons.addWidget(save_button)
-        main.addLayout(buttons, 3, 0, 1, 2)
+        main.addLayout(buttons, 5, 0, 1, 2)
 
-        self.resize(410, 175)
+        self.resize(540, 240)
 
     def _save(self) -> None:
         try:
@@ -527,7 +571,11 @@ class RequestedDateRangeDialog(QDialog):
             end = validate_date_or_blank(self.end_entry.text(), "Requested end date") or ""
             if end and end < start:
                 raise ValueError("Requested end date is before the start date.")
-            self.result = {"start": start, "end": end}
+            self.result = {
+                "note": self.note_edit.text().strip(),
+                "start": start,
+                "end": end,
+            }
             self.accept()
         except Exception as exc:
             QMessageBox.critical(self, "Requested date error", str(exc))
@@ -646,6 +694,461 @@ def get_sortable_columns_from_df(df: pd.DataFrame, include_text_columns: bool = 
 
 
 # ---------------------------------------------------------------------------
+# Drag-and-drop sorting-row helpers
+# ---------------------------------------------------------------------------
+
+class WheelSafeComboBox(QComboBox):
+    """Combo box that ignores mouse-wheel changes unless its popup is open."""
+
+    def wheelEvent(self, event: Any) -> None:
+        # Page scrolling should never accidentally change a sorting selection.
+        event.ignore()
+
+
+class NoInternalScrollListWidget(QListWidget):
+    """Compact list that shows every item and lets the page handle scrolling."""
+
+    def wheelEvent(self, event: Any) -> None:
+        # Do not scroll the line-type list internally. Let the outer page receive
+        # the wheel event instead.
+        event.ignore()
+
+    def resize_to_all_items(self) -> None:
+        count = self.count()
+        if count <= 0:
+            self.setFixedHeight(32)
+            return
+
+        row_height = max(
+            22,
+            max(self.sizeHintForRow(row) for row in range(count)),
+        )
+        spacing = max(0, self.spacing())
+        content_height = row_height * count + spacing * max(0, count - 1)
+        frame_height = self.frameWidth() * 2
+        self.setFixedHeight(content_height + frame_height + 6)
+
+
+SORT_ROW_MIME_TYPE = "application/x-ups-sort-criterion-row"
+
+
+class SortCriteriaListWidget(QWidget):
+    """
+    Expanding sorting-row container with live, widget-safe drag reordering.
+
+    The rows are regular widgets in a QVBoxLayout rather than item widgets
+    embedded in QListWidget. During a drag, the source row is hidden and a
+    visible placeholder moves through the layout. This makes the surrounding
+    rows shift immediately while avoiding Qt deleting or detaching controls.
+    """
+
+    orderPreviewed = Signal()
+    orderCommitted = Signal()
+    orderCancelled = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.rows_layout = QVBoxLayout(self)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(5)
+
+        self._items: list[QListWidgetItem] = []
+        self._widgets: dict[int, QWidget] = {}
+
+        self._drag_source_item: QListWidgetItem | None = None
+        self._drag_original_items: list[QListWidgetItem] = []
+        self._drag_placeholder: QFrame | None = None
+        self._drag_committed = False
+
+    @staticmethod
+    def _item_key(item: QListWidgetItem) -> int:
+        """Return a stable, hashable key for a QListWidgetItem wrapper."""
+        return id(item)
+
+    # QListWidget-like compatibility helpers used by the surrounding GUI.
+    def addItem(self, item: QListWidgetItem) -> None:
+        self._items.append(item)
+        self._rebuild_layout()
+
+    def setItemWidget(self, item: QListWidgetItem, widget: QWidget) -> None:
+        self._widgets[self._item_key(item)] = widget
+        self._rebuild_layout()
+
+    def itemWidget(self, item: QListWidgetItem) -> QWidget | None:
+        return self._widgets.get(self._item_key(item))
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def item(self, index: int) -> QListWidgetItem | None:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def row(self, item: QListWidgetItem) -> int:
+        try:
+            return self._items.index(item)
+        except ValueError:
+            return -1
+
+    def takeItem(self, index: int) -> QListWidgetItem | None:
+        if not 0 <= index < len(self._items):
+            return None
+        item = self._items.pop(index)
+        widget = self._widgets.pop(self._item_key(item), None)
+        if widget is not None:
+            self.rows_layout.removeWidget(widget)
+        self._rebuild_layout()
+        return item
+
+    def clear(self) -> None:
+        if self._drag_source_item is not None:
+            self._finish_drag(commit=False)
+
+        while self.rows_layout.count():
+            layout_item = self.rows_layout.takeAt(0)
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        for widget in self._widgets.values():
+            widget.deleteLater()
+
+        self._items.clear()
+        self._widgets.clear()
+        self.updateGeometry()
+
+    def setSpacing(self, spacing: int) -> None:
+        self.rows_layout.setSpacing(spacing)
+        self.updateGeometry()
+
+    def sizeHint(self) -> QSize:
+        width = 900
+        height = self.rows_layout.contentsMargins().top() + self.rows_layout.contentsMargins().bottom()
+        visible_count = 0
+        for item in self._items:
+            widget = self._widgets.get(self._item_key(item))
+            if widget is None:
+                continue
+            height += max(widget.minimumHeight(), widget.sizeHint().height())
+            visible_count += 1
+        if visible_count > 1:
+            height += self.rows_layout.spacing() * (visible_count - 1)
+        return QSize(width, max(1, height))
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    @staticmethod
+    def _refresh_widget_style(widget: QWidget | None) -> None:
+        if widget is None:
+            return
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+        widget.update()
+
+    def _create_placeholder(self, source_widget: QWidget) -> QFrame:
+        placeholder = QFrame(self)
+        placeholder.setObjectName("SortDropPlaceholder")
+        placeholder.setFixedHeight(max(46, source_widget.height(), source_widget.sizeHint().height()))
+        placeholder_layout = QHBoxLayout(placeholder)
+        placeholder_layout.setContentsMargins(12, 0, 12, 0)
+        placeholder_label = QLabel("Release to place sorting criterion")
+        placeholder_label.setAlignment(Qt.AlignCenter)
+        placeholder_label.setAttribute(Qt.WA_TransparentForMouseEvents)
+        placeholder_layout.addWidget(placeholder_label)
+        return placeholder
+
+    def _clear_layout_only(self) -> None:
+        while self.rows_layout.count():
+            self.rows_layout.takeAt(0)
+
+    def _rebuild_layout(self) -> None:
+        self._clear_layout_only()
+
+        for item in self._items:
+            if item is self._drag_source_item and self._drag_placeholder is not None:
+                self.rows_layout.addWidget(self._drag_placeholder)
+                continue
+
+            widget = self._widgets.get(self._item_key(item))
+            if widget is not None:
+                widget.show()
+                self.rows_layout.addWidget(widget)
+
+        self.rows_layout.invalidate()
+        self.rows_layout.activate()
+        self.updateGeometry()
+        self.adjustSize()
+        self.update()
+
+    def _mime_row_id(self, mime_data: QMimeData) -> int | None:
+        if not mime_data.hasFormat(SORT_ROW_MIME_TYPE):
+            return None
+        try:
+            return int(bytes(mime_data.data(SORT_ROW_MIME_TYPE)).decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+
+    def _source_row_id(self) -> int | None:
+        if self._drag_source_item is None:
+            return None
+        try:
+            return int(self._drag_source_item.data(Qt.UserRole))
+        except (TypeError, ValueError):
+            return None
+
+    def _target_index_for_y(self, y_position: int) -> int:
+        if self._drag_source_item is None:
+            return 0
+
+        remaining = [item for item in self._items if item is not self._drag_source_item]
+        insertion_index = 0
+
+        for item in remaining:
+            widget = self._widgets.get(self._item_key(item))
+            if widget is None or not widget.isVisible():
+                continue
+            if y_position < widget.geometry().center().y():
+                return insertion_index
+            insertion_index += 1
+
+        return len(remaining)
+
+    def _preview_source_at(self, insertion_index: int) -> None:
+        source_item = self._drag_source_item
+        if source_item is None:
+            return
+
+        remaining = [item for item in self._items if item is not source_item]
+        insertion_index = max(0, min(int(insertion_index), len(remaining)))
+        new_items = list(remaining)
+        new_items.insert(insertion_index, source_item)
+
+        if new_items == self._items:
+            return
+
+        self._items = new_items
+        self._rebuild_layout()
+        self.orderPreviewed.emit()
+
+    def begin_drag_for_item(self, item: QListWidgetItem) -> None:
+        if item not in self._items or self._drag_source_item is not None:
+            return
+
+        source_widget = self._widgets.get(self._item_key(item))
+        if source_widget is None:
+            return
+
+        try:
+            row_id = int(item.data(Qt.UserRole))
+        except (TypeError, ValueError):
+            return
+
+        source_pixmap = source_widget.grab()
+        self._drag_source_item = item
+        self._drag_original_items = list(self._items)
+        self._drag_placeholder = self._create_placeholder(source_widget)
+        self._drag_committed = False
+
+        source_widget.setProperty("dragging", True)
+        self._refresh_widget_style(source_widget)
+        source_widget.hide()
+        self._rebuild_layout()
+
+        mime_data = QMimeData()
+        mime_data.setData(SORT_ROW_MIME_TYPE, str(row_id).encode("utf-8"))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+
+        padding = 10
+        ghost = QPixmap(
+            source_pixmap.width() + padding * 2,
+            source_pixmap.height() + padding * 2,
+        )
+        ghost.fill(Qt.transparent)
+
+        painter = QPainter(ghost)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 110))
+        painter.drawRoundedRect(
+            padding,
+            padding + 4,
+            source_pixmap.width(),
+            source_pixmap.height(),
+            8,
+            8,
+        )
+        painter.setOpacity(0.96)
+        painter.drawPixmap(padding, padding, source_pixmap)
+        painter.end()
+
+        drag.setPixmap(ghost)
+        drag.setHotSpot(QPoint(min(40, ghost.width() // 3), ghost.height() // 2))
+
+        result = drag.exec(Qt.MoveAction)
+        if not self._drag_committed or result != Qt.MoveAction:
+            self._finish_drag(commit=False)
+
+    def _finish_drag(self, *, commit: bool) -> None:
+        source_item = self._drag_source_item
+        if source_item is None:
+            return
+
+        source_widget = self._widgets.get(self._item_key(source_item))
+
+        if not commit:
+            self._items = list(self._drag_original_items)
+
+        placeholder = self._drag_placeholder
+        self._drag_placeholder = None
+        self._drag_source_item = None
+
+        if placeholder is not None:
+            self.rows_layout.removeWidget(placeholder)
+            placeholder.deleteLater()
+
+        if source_widget is not None:
+            source_widget.setProperty("dragging", False)
+            self._refresh_widget_style(source_widget)
+            source_widget.show()
+
+        self._rebuild_layout()
+
+        self._drag_original_items = []
+        if commit:
+            self._drag_committed = True
+            self.orderCommitted.emit()
+        else:
+            self._drag_committed = False
+            self.orderCancelled.emit()
+
+    def dragEnterEvent(self, event: Any) -> None:
+        row_id = self._mime_row_id(event.mimeData())
+        if row_id is None or row_id != self._source_row_id():
+            event.ignore()
+            return
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+
+    def dragMoveEvent(self, event: Any) -> None:
+        row_id = self._mime_row_id(event.mimeData())
+        if row_id is None or row_id != self._source_row_id():
+            event.ignore()
+            return
+
+        insertion_index = self._target_index_for_y(event.position().toPoint().y())
+        self._preview_source_at(insertion_index)
+
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+
+    def dropEvent(self, event: Any) -> None:
+        row_id = self._mime_row_id(event.mimeData())
+        if row_id is None or row_id != self._source_row_id():
+            event.ignore()
+            return
+
+        self._finish_drag(commit=True)
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+
+
+class SortCriteriaDragHandle(QWidget):
+    """Six-dot handle that starts a polished live sorting-row drag."""
+
+    def __init__(
+        self,
+        list_widget: SortCriteriaListWidget,
+        item: QListWidgetItem,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.list_widget = list_widget
+        self.item = item
+        self.drag_start_position: QPoint | None = None
+        self._hovered = False
+        self._pressed = False
+
+        self.setFixedSize(28, 38)
+        self.setToolTip("Drag to reorder this sorting criterion.")
+        self.setCursor(Qt.OpenHandCursor)
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if self._pressed:
+            background = QColor(255, 181, 0, 105)
+        elif self._hovered:
+            background = QColor(255, 181, 0, 58)
+        else:
+            background = QColor(255, 181, 0, 25)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(background)
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 5, 5)
+
+        painter.setBrush(QColor(255, 181, 0))
+        for x in (10, 18):
+            for y in (11, 19, 27):
+                painter.drawEllipse(QPoint(x, y), 2, 2)
+        painter.end()
+
+    def enterEvent(self, event: Any) -> None:
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: Any) -> None:
+        self._hovered = False
+        self._pressed = False
+        self.setCursor(Qt.OpenHandCursor)
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: Any) -> None:
+        if event.button() == Qt.LeftButton:
+            self.drag_start_position = event.position().toPoint()
+            self._pressed = True
+            self.setCursor(Qt.ClosedHandCursor)
+            self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: Any) -> None:
+        if not (event.buttons() & Qt.LeftButton):
+            super().mouseMoveEvent(event)
+            return
+
+        if self.drag_start_position is None:
+            self.drag_start_position = event.position().toPoint()
+
+        distance = (
+            event.position().toPoint() - self.drag_start_position
+        ).manhattanLength()
+        if distance >= QApplication.startDragDistance():
+            self._pressed = False
+            self.setCursor(Qt.OpenHandCursor)
+            self.update()
+            self.list_widget.begin_drag_for_item(self.item)
+            self.drag_start_position = None
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: Any) -> None:
+        self.drag_start_position = None
+        self._pressed = False
+        self.setCursor(Qt.OpenHandCursor)
+        self.update()
+        super().mouseReleaseEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Main GUI
 # ---------------------------------------------------------------------------
 
@@ -709,6 +1212,31 @@ class BidGUI(QMainWindow):
                 border: none;
                 background: {UPS_BROWN};
             }}
+            QScrollArea#MainScrollArea QScrollBar:vertical {{
+                background: white;
+                width: 18px;
+                margin: 0;
+                border: none;
+            }}
+            QScrollArea#MainScrollArea QScrollBar::handle:vertical {{
+                background: #9A9A9A;
+                min-height: 30px;
+                margin: 2px;
+                border-radius: 5px;
+            }}
+            QScrollArea#MainScrollArea QScrollBar::handle:vertical:hover {{
+                background: #777777;
+            }}
+            QScrollArea#MainScrollArea QScrollBar::add-line:vertical,
+            QScrollArea#MainScrollArea QScrollBar::sub-line:vertical {{
+                height: 0;
+                border: none;
+                background: white;
+            }}
+            QScrollArea#MainScrollArea QScrollBar::add-page:vertical,
+            QScrollArea#MainScrollArea QScrollBar::sub-page:vertical {{
+                background: white;
+            }}
             QGroupBox {{
                 border: 2px solid {UPS_GOLD};
                 border-radius: 6px;
@@ -741,6 +1269,85 @@ class BidGUI(QMainWindow):
                 color: black;
                 selection-background-color: {UPS_BLUE};
                 selection-color: white;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: white;
+                color: black;
+                selection-background-color: {UPS_BLUE};
+                selection-color: white;
+                border: 1px solid #888888;
+                outline: 0;
+            }}
+            QListWidget#LineTypePreferenceList {{
+                background: white;
+                color: black;
+                border: 1px solid #8A8A8A;
+                border-radius: 4px;
+                padding: 2px;
+            }}
+            QListWidget#LineTypePreferenceList::item {{
+                min-height: 18px;
+                padding: 1px 7px;
+                border-bottom: 1px solid #E5E5E5;
+            }}
+            QListWidget#LineTypePreferenceList::item:selected {{
+                background: {UPS_BLUE};
+                color: white;
+            }}
+            QFrame#PreferenceDateCard {{
+                background-color: {UPS_BROWN_2};
+                border: 1px solid #71402E;
+                border-radius: 8px;
+            }}
+            QLabel#PreferenceCardTitle {{
+                color: {UPS_GOLD};
+                font-size: 11pt;
+                font-weight: bold;
+            }}
+            QLabel#PreferenceCardSubtitle {{
+                color: #E9DDD2;
+            }}
+            QLabel#PreferenceCardCount {{
+                color: {UPS_BROWN};
+                background: {UPS_GOLD};
+                border-radius: 9px;
+                padding: 2px 8px;
+                font-weight: bold;
+            }}
+            QTableWidget#PreferenceDateTable {{
+                background: white;
+                alternate-background-color: #F4F4F4;
+                color: black;
+                border: 1px solid #C7B9AE;
+                border-radius: 5px;
+                gridline-color: #E5E5E5;
+            }}
+            QTableWidget#PreferenceDateTable::item {{
+                padding: 4px;
+            }}
+            QWidget#SortCriteriaList {{
+                background: transparent;
+                border: none;
+            }}
+            QWidget#SortCriterionCard {{
+                background-color: {UPS_BROWN_2};
+                border: 1px solid #6A3A29;
+                border-radius: 7px;
+            }}
+            QWidget#SortCriterionCard:hover {{
+                background-color: #552C1D;
+                border: 1px solid {UPS_GOLD};
+            }}
+            QWidget#SortCriterionCard[dragging="true"] {{
+                background-color: #5D382A;
+                border: 2px dashed {UPS_GOLD};
+            }}
+            QFrame#SortDropPlaceholder {{
+                background-color: rgba(255, 181, 0, 32);
+                border: 2px dashed {UPS_GOLD};
+                border-radius: 7px;
+                color: {UPS_GOLD};
+                font-weight: bold;
             }}
             QTextEdit#LogText {{
                 background: {UPS_FIELD_BG};
@@ -787,9 +1394,44 @@ class BidGUI(QMainWindow):
             }}
         """)
 
+        # Combo-box popup lists are separate Qt windows on some platforms.
+        # Applying the same stylesheet at application level keeps every popup
+        # white and readable, including dropdowns opened from dialogs.
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(self.styleSheet())
+
     def _build_ui(self) -> None:
         scroll_area = QScrollArea(self)
+        scroll_area.setObjectName("MainScrollArea")
         scroll_area.setWidgetResizable(True)
+        scroll_area.verticalScrollBar().setStyleSheet("""
+            QScrollBar:vertical {
+                background: white;
+                width: 18px;
+                margin: 0;
+                border: none;
+            }
+            QScrollBar::handle:vertical {
+                background: #A0A0A0;
+                min-height: 34px;
+                margin: 2px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #777777;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0;
+                border: none;
+                background: white;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: white;
+            }
+        """)
         self.setCentralWidget(scroll_area)
 
         self.scrollable_frame = QWidget()
@@ -861,18 +1503,44 @@ class BidGUI(QMainWindow):
 
     def _build_preferences_section(self, container: QVBoxLayout) -> None:
         prefs_frame = QGroupBox("Preferences")
-        grid = QGridLayout(prefs_frame)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
+        main_layout = QVBoxLayout(prefs_frame)
+        main_layout.setSpacing(12)
 
         # Vacation ranges -------------------------------------------------
-        grid.addWidget(QLabel("Vacation ranges:"), 0, 0, alignment=Qt.AlignTop)
+        vacation_card = QFrame()
+        vacation_card.setObjectName("PreferenceDateCard")
+        vacation_card_layout = QVBoxLayout(vacation_card)
+        vacation_card_layout.setContentsMargins(10, 9, 10, 10)
+        vacation_card_layout.setSpacing(8)
 
-        vacation_area = QWidget()
-        vacation_layout = QHBoxLayout(vacation_area)
-        vacation_layout.setContentsMargins(0, 0, 0, 0)
+        vacation_header = QHBoxLayout()
+        vacation_title_area = QVBoxLayout()
+        vacation_title_area.setSpacing(1)
+        vacation_title = QLabel("Vacation ranges")
+        vacation_title.setObjectName("PreferenceCardTitle")
+        vacation_subtitle = QLabel(
+            "Add vacation periods and choose whether OCV / pay-period drop applies to each range."
+        )
+        vacation_subtitle.setObjectName("PreferenceCardSubtitle")
+        vacation_subtitle.setWordWrap(True)
+        vacation_title_area.addWidget(vacation_title)
+        vacation_title_area.addWidget(vacation_subtitle)
+
+        add_vacation = QPushButton("Add range")
+        edit_vacation = QPushButton("Edit")
+        remove_vacation = QPushButton("Remove")
+        clear_vacation = QPushButton("Clear")
+        add_vacation.clicked.connect(self._add_vacation_range)
+        edit_vacation.clicked.connect(self._edit_vacation_range)
+        remove_vacation.clicked.connect(self._remove_vacation_range)
+        clear_vacation.clicked.connect(self._clear_vacation_ranges)
+
+        vacation_header.addLayout(vacation_title_area, 1)
+        for button in (add_vacation, edit_vacation, remove_vacation, clear_vacation):
+            vacation_header.addWidget(button)
 
         self.vacation_table = QTableWidget(0, 3)
+        self.vacation_table.setObjectName("PreferenceDateTable")
         self.vacation_table.setHorizontalHeaderLabels(["Start", "End", "OCV"])
         self.vacation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.vacation_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -881,61 +1549,72 @@ class BidGUI(QMainWindow):
         self.vacation_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.vacation_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.vacation_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.vacation_table.setAlternatingRowColors(True)
+        self.vacation_table.setShowGrid(False)
         self.vacation_table.setMinimumHeight(125)
         self.vacation_table.itemChanged.connect(self._on_vacation_table_item_changed)
-        vacation_layout.addWidget(self.vacation_table, 1)
 
-        vacation_buttons = QVBoxLayout()
-        add_vacation = QPushButton("Add vacation range")
-        edit_vacation = QPushButton("Edit selected")
-        remove_vacation = QPushButton("Remove selected")
-        clear_vacation = QPushButton("Clear all")
-        add_vacation.clicked.connect(self._add_vacation_range)
-        edit_vacation.clicked.connect(self._edit_vacation_range)
-        remove_vacation.clicked.connect(self._remove_vacation_range)
-        clear_vacation.clicked.connect(self._clear_vacation_ranges)
-        for button in (add_vacation, edit_vacation, remove_vacation, clear_vacation):
-            vacation_buttons.addWidget(button)
-        vacation_buttons.addStretch(1)
-        vacation_layout.addLayout(vacation_buttons)
-        grid.addWidget(vacation_area, 0, 1, 1, 3)
+        vacation_card_layout.addLayout(vacation_header)
+        vacation_card_layout.addWidget(self.vacation_table)
+        main_layout.addWidget(vacation_card)
 
         # Requested days --------------------------------------------------
-        grid.addWidget(QLabel("Requested days off:"), 1, 0, alignment=Qt.AlignTop)
+        requested_card = QFrame()
+        requested_card.setObjectName("PreferenceDateCard")
+        requested_card_layout = QVBoxLayout(requested_card)
+        requested_card_layout.setContentsMargins(10, 9, 10, 10)
+        requested_card_layout.setSpacing(8)
 
-        requested_area = QWidget()
-        requested_layout = QHBoxLayout(requested_area)
-        requested_layout.setContentsMargins(0, 0, 0, 0)
+        requested_header = QHBoxLayout()
+        requested_title_area = QVBoxLayout()
+        requested_title_area.setSpacing(1)
+        requested_title = QLabel("Requested days off")
+        requested_title.setObjectName("PreferenceCardTitle")
+        requested_subtitle = QLabel(
+            "Add a single date or range. Notes are saved locally and never affect scoring."
+        )
+        requested_subtitle.setObjectName("PreferenceCardSubtitle")
+        requested_subtitle.setWordWrap(True)
+        requested_title_area.addWidget(requested_title)
+        requested_title_area.addWidget(requested_subtitle)
 
-        self.requested_dates_table = QTableWidget(0, 2)
-        self.requested_dates_table.setHorizontalHeaderLabels(["Date / Start", "End (optional)"])
-        self.requested_dates_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.requested_dates_table.verticalHeader().setVisible(False)
-        self.requested_dates_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.requested_dates_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.requested_dates_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.requested_dates_table.setMinimumHeight(120)
-        requested_layout.addWidget(self.requested_dates_table, 1)
-
-        requested_buttons = QVBoxLayout()
         add_requested = QPushButton("Add day or range")
-        edit_requested = QPushButton("Edit selected")
-        remove_requested = QPushButton("Remove selected")
-        clear_requested = QPushButton("Clear all")
+        edit_requested = QPushButton("Edit")
+        remove_requested = QPushButton("Remove")
+        clear_requested = QPushButton("Clear")
         add_requested.clicked.connect(self._add_requested_date_range)
         edit_requested.clicked.connect(self._edit_requested_date_range)
         remove_requested.clicked.connect(self._remove_requested_date_range)
         clear_requested.clicked.connect(self._clear_requested_date_ranges)
+
+        requested_header.addLayout(requested_title_area, 1)
         for button in (add_requested, edit_requested, remove_requested, clear_requested):
-            requested_buttons.addWidget(button)
-        requested_buttons.addStretch(1)
-        requested_layout.addLayout(requested_buttons)
-        grid.addWidget(requested_area, 1, 1, 1, 3)
+            requested_header.addWidget(button)
+
+        self.requested_dates_table = QTableWidget(0, 3)
+        self.requested_dates_table.setObjectName("PreferenceDateTable")
+        self.requested_dates_table.setHorizontalHeaderLabels(
+            ["Notes", "Date / Start", "End (optional)"]
+        )
+        self.requested_dates_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.requested_dates_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.requested_dates_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.requested_dates_table.verticalHeader().setVisible(False)
+        self.requested_dates_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.requested_dates_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.requested_dates_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.requested_dates_table.setAlternatingRowColors(True)
+        self.requested_dates_table.setShowGrid(False)
+        self.requested_dates_table.setMinimumHeight(125)
+
+        requested_card_layout.addLayout(requested_header)
+        requested_card_layout.addWidget(self.requested_dates_table)
+        main_layout.addWidget(requested_card)
 
         # Lower preferences: normal inputs on the left, line types on right.
         lower_area = QWidget()
         lower_layout = QHBoxLayout(lower_area)
-        lower_layout.setContentsMargins(0, 6, 0, 0)
+        lower_layout.setContentsMargins(0, 2, 0, 0)
         lower_layout.setSpacing(28)
 
         left_preferences = QWidget()
@@ -980,7 +1659,6 @@ class BidGUI(QMainWindow):
         self.hourly_rate_edit.setSingleStep(1.00)
         self.hourly_rate_edit.setValue(DEFAULT_HOURLY_RATE)
         self.hourly_rate_edit.setMaximumWidth(125)
-        self.hourly_rate_edit.setToolTip("Hourly pay rate in dollars used to estimate line pay.")
         self.hourly_rate_edit.editingFinished.connect(self._on_hourly_rate_changed)
 
         left_grid.addWidget(QLabel("Training dates:"), 0, 0)
@@ -996,10 +1674,13 @@ class BidGUI(QMainWindow):
         right_grid.setContentsMargins(0, 0, 0, 0)
         right_grid.setHorizontalSpacing(10)
 
-        self.line_type_preference_list = QListWidget()
-        self.line_type_preference_list.setMinimumHeight(185)
-        self.line_type_preference_list.setMinimumWidth(160)
-        self.line_type_preference_list.setMaximumWidth(210)
+        self.line_type_preference_list = NoInternalScrollListWidget()
+        self.line_type_preference_list.setObjectName("LineTypePreferenceList")
+        self.line_type_preference_list.setSpacing(1)
+        self.line_type_preference_list.setMinimumWidth(145)
+        self.line_type_preference_list.setMaximumWidth(180)
+        self.line_type_preference_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.line_type_preference_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.line_type_preference_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.line_type_preference_list.setDragEnabled(True)
         self.line_type_preference_list.viewport().setAcceptDrops(True)
@@ -1017,7 +1698,7 @@ class BidGUI(QMainWindow):
         line_type_controls.addWidget(reset_type_order)
         line_type_controls.addStretch(1)
 
-        line_type_help = QLabel("Drag items to reorder. Top = most preferred.")
+        line_type_help = QLabel("Drag items to reorder.\nTop = most preferred.")
         line_type_help.setWordWrap(True)
         line_type_help.setMaximumWidth(170)
 
@@ -1028,67 +1709,133 @@ class BidGUI(QMainWindow):
 
         lower_layout.addWidget(left_preferences, 1)
         lower_layout.addWidget(right_preferences, 1)
-        grid.addWidget(lower_area, 2, 0, 1, 4)
+        main_layout.addWidget(lower_area)
 
         container.addWidget(prefs_frame)
 
     def _build_sorting_section(self, container: QVBoxLayout) -> None:
         sort_frame = QGroupBox("Sorting")
-        grid = QGridLayout(sort_frame)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(2, 1)
+        main_layout = QVBoxLayout(sort_frame)
+        main_layout.setSpacing(8)
 
-        grid.addWidget(QLabel("Available columns"), 0, 0)
-        grid.addWidget(QLabel("Selected sorting priority"), 0, 2)
-
-        self.available_columns_list = QListWidget()
-        self.available_columns_list.setMinimumHeight(180)
-        self.selected_sort_list = QListWidget()
-        self.selected_sort_list.setMinimumHeight(180)
-
-        grid.addWidget(self.available_columns_list, 1, 0)
-        grid.addWidget(self.selected_sort_list, 1, 2)
-
-        sort_buttons_widget = QWidget()
-        sort_buttons = QVBoxLayout(sort_buttons_widget)
-        sort_buttons.setContentsMargins(0, 0, 0, 0)
-
-        add_high = QPushButton("Add high →")
-        add_low = QPushButton("Add low →")
-        move_up = QPushButton("Move up")
-        move_down = QPushButton("Move down")
-        remove = QPushButton("Remove")
-        clear = QPushButton("Clear")
-        advanced = QPushButton("Advanced settings...")
-
-        add_high.clicked.connect(lambda: self._add_sort_column("desc"))
-        add_low.clicked.connect(lambda: self._add_sort_column("asc"))
-        move_up.clicked.connect(self._move_sort_up)
-        move_down.clicked.connect(self._move_sort_down)
-        remove.clicked.connect(self._remove_sort_column)
-        clear.clicked.connect(self._clear_sort_order)
-        advanced.clicked.connect(self._open_sorting_settings_dialog)
-
-        for button in (add_high, add_low):
-            sort_buttons.addWidget(button)
-        line1 = QFrame()
-        line1.setFrameShape(QFrame.HLine)
-        sort_buttons.addWidget(line1)
-        for button in (move_up, move_down, remove, clear):
-            sort_buttons.addWidget(button)
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.HLine)
-        sort_buttons.addWidget(line2)
-        sort_buttons.addWidget(advanced)
-        sort_buttons.addStretch(1)
-
-        grid.addWidget(sort_buttons_widget, 1, 1)
-
+        # These settings are used immediately by the live contribution labels.
         self.default_mode = str(DEFAULT_SORTING_SETTINGS["default_mode"])
         self.weighting_style = str(DEFAULT_SORTING_SETTINGS["weighting_style"])
         self.soft_max_weight = float(DEFAULT_SORTING_SETTINGS["soft_max_weight"])
         self.soft_min_weight = float(DEFAULT_SORTING_SETTINGS["soft_min_weight"])
         self.keep_score_columns = bool(DEFAULT_SORTING_SETTINGS["keep_score_columns"])
+
+        self.sortable_columns: list[str] = []
+        self.sort_criteria_rows: list[dict[str, Any]] = []
+        self._sort_row_by_id: dict[int, dict[str, Any]] = {}
+        self._next_sort_row_id = 1
+        self._rebuilding_sort_rows = False
+
+        # Intuitive, immediately visible control for the top-to-bottom
+        # contribution curve used by soft weighting.
+        emphasis_widget = QWidget()
+        emphasis_layout = QHBoxLayout(emphasis_widget)
+        emphasis_layout.setContentsMargins(0, 0, 0, 0)
+        emphasis_layout.setSpacing(8)
+
+        emphasis_label = QLabel("Priority emphasis:")
+        self.priority_emphasis_spin = QDoubleSpinBox()
+        self.priority_emphasis_spin.setDecimals(2)
+        self.priority_emphasis_spin.setRange(self.soft_min_weight, 100.0)
+        self.priority_emphasis_spin.setSingleStep(0.25)
+        self.priority_emphasis_spin.setValue(self.soft_max_weight)
+        self.priority_emphasis_spin.setMaximumWidth(95)
+        self.priority_emphasis_spin.setToolTip(
+            "Controls how strongly earlier Weighted criteria outrank later ones."
+        )
+        self.priority_emphasis_spin.valueChanged.connect(
+            self._on_priority_emphasis_changed
+        )
+
+        emphasis_help = QLabel(
+            "Bigger numbers give more contribution to top priorities.\n"
+            "Smaller numbers give lower-priority criteria more influence."
+        )
+        emphasis_help.setWordWrap(True)
+
+        emphasis_layout.addWidget(emphasis_label)
+        emphasis_layout.addWidget(self.priority_emphasis_spin)
+        emphasis_layout.addWidget(emphasis_help, 1)
+
+        header_widget = QWidget()
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
+
+        drag_header = QLabel("")
+        drag_header.setFixedWidth(24)
+
+        number_header = QLabel("#")
+        number_header.setFixedWidth(28)
+        number_header.setAlignment(Qt.AlignCenter)
+
+        column_header = QLabel("Sort by")
+        direction_header = QLabel("Direction")
+        mode_header = QLabel("Priority method")
+        contribution_header = QLabel("Contribution")
+        contribution_header.setAlignment(Qt.AlignCenter)
+
+        column_header.setFixedWidth(245)
+        direction_header.setFixedWidth(130)
+        mode_header.setFixedWidth(155)
+        contribution_header.setFixedWidth(100)
+
+        header_layout.addWidget(drag_header)
+        header_layout.addWidget(number_header)
+        header_layout.addWidget(column_header)
+        header_layout.addWidget(direction_header)
+        remove_header = QLabel("")
+        remove_header.setFixedWidth(78)
+
+        header_layout.addWidget(mode_header)
+        header_layout.addWidget(contribution_header)
+        header_layout.addSpacing(4)
+        header_layout.addWidget(remove_header)
+        header_layout.addStretch(1)
+
+        self.sort_rows_list = SortCriteriaListWidget()
+        self.sort_rows_list.setObjectName("SortCriteriaList")
+        self.sort_rows_list.setSpacing(5)
+        self.sort_rows_list.orderPreviewed.connect(self._on_sort_rows_previewed)
+        self.sort_rows_list.orderCommitted.connect(self._on_sort_rows_reordered)
+        self.sort_rows_list.orderCancelled.connect(self._on_sort_rows_previewed)
+
+        controls = QHBoxLayout()
+        add_criterion_button = QPushButton("Add sorting criterion")
+        clear_criteria_button = QPushButton("Clear sorting")
+        advanced_button = QPushButton("Advanced settings...")
+
+        add_criterion_button.clicked.connect(
+            lambda _checked=False: self._add_sort_criteria_row()
+        )
+        clear_criteria_button.clicked.connect(self._clear_sort_order)
+        advanced_button.clicked.connect(self._open_sorting_settings_dialog)
+
+        controls.addWidget(add_criterion_button)
+        controls.addWidget(clear_criteria_button)
+        controls.addStretch(1)
+        controls.addWidget(advanced_button)
+
+        help_label = QLabel(
+            "Drag the gold handle to pick up a criterion; the other rows move out of the way as you hover.\n"
+            "High Priority is a strict tie-breaker. Weighted starts a new weight level. "
+            "Equal to Previous shares both the previous weight and its number."
+        )
+        help_label.setWordWrap(True)
+
+        main_layout.addWidget(emphasis_widget)
+        main_layout.addWidget(header_widget)
+        main_layout.addWidget(self.sort_rows_list)
+        main_layout.addLayout(controls)
+        main_layout.addWidget(help_label)
+
+        for _ in range(MIN_SORT_CRITERIA_ROWS):
+            self._add_sort_criteria_row(notify=False)
 
         container.addWidget(sort_frame)
 
@@ -1217,7 +1964,10 @@ class BidGUI(QMainWindow):
         saved_output_folder = output_paths.get(get_os_name(), "")
         self.output_folder_edit.setText(saved_output_folder or str(Path.cwd()))
 
-        saved_number_of_lines = self.config_data.get("number_of_lines_to_bid", DEFAULT_NUMBER_OF_LINES_TO_BID)
+        saved_number_of_lines = self.config_data.get(
+            "number_of_lines_to_bid",
+            DEFAULT_NUMBER_OF_LINES_TO_BID,
+        )
         try:
             saved_number_of_lines = int(saved_number_of_lines)
             if saved_number_of_lines <= 0:
@@ -1226,16 +1976,16 @@ class BidGUI(QMainWindow):
             saved_number_of_lines = DEFAULT_NUMBER_OF_LINES_TO_BID
         self.number_of_lines_edit.setText(str(saved_number_of_lines))
 
-        saved_sort_order = self.config_data.get("sort_order", [])
-        if isinstance(saved_sort_order, list):
-            self.sort_order = [list(item) for item in saved_sort_order if isinstance(item, list) and len(item) == 2]
-            self._refresh_selected_sort_list()
-
+        # Load weighting settings before restoring rows so percentages are
+        # calculated with the user's saved hard/soft/equal configuration.
         saved_sorting_settings = self.config_data.get("sorting_settings", {})
         if not isinstance(saved_sorting_settings, dict):
             saved_sorting_settings = {}
         merged_settings = {**DEFAULT_SORTING_SETTINGS, **saved_sorting_settings}
         self._apply_sorting_settings_to_ui(merged_settings)
+
+        saved_sort_order = self.config_data.get("sort_order", [])
+        self._set_sort_order(saved_sort_order)
 
     # -------------------------- Browse buttons --------------------------
 
@@ -1277,6 +2027,10 @@ class BidGUI(QMainWindow):
         item.setTextAlignment(Qt.AlignCenter)
         return item
 
+    def _update_date_section_counts(self) -> None:
+        """Compatibility hook retained after removing the saved-count badges."""
+        return
+
     def _append_vacation_row(self, start: str, end: str, pp_drop: bool = True) -> None:
         row = self.vacation_table.rowCount()
         self.vacation_table.insertRow(row)
@@ -1298,6 +2052,7 @@ class BidGUI(QMainWindow):
                     self._append_vacation_row(start, end, pp_drop)
         finally:
             self.vacation_table.blockSignals(False)
+        self._update_date_section_counts()
 
     def _get_vacation_ranges(self) -> list[dict[str, Any]]:
         ranges: list[dict[str, Any]] = []
@@ -1334,6 +2089,7 @@ class BidGUI(QMainWindow):
                 )
             finally:
                 self.vacation_table.blockSignals(False)
+            self._update_date_section_counts()
             self._save_vacation_ranges_to_config()
             self._schedule_preference_refresh(
                 "Vacation ranges changed. Sorting columns will refresh automatically."
@@ -1362,6 +2118,7 @@ class BidGUI(QMainWindow):
                 )
             finally:
                 self.vacation_table.blockSignals(False)
+            self._update_date_section_counts()
             self._save_vacation_ranges_to_config()
             self._schedule_preference_refresh(
                 "Vacation ranges changed. Sorting columns will refresh automatically."
@@ -1371,6 +2128,7 @@ class BidGUI(QMainWindow):
         row = self._selected_vacation_row()
         if row is not None:
             self.vacation_table.removeRow(row)
+            self._update_date_section_counts()
             self._save_vacation_ranges_to_config()
             self._schedule_preference_refresh(
                 "Vacation ranges changed. Sorting columns will refresh automatically."
@@ -1378,6 +2136,7 @@ class BidGUI(QMainWindow):
 
     def _clear_vacation_ranges(self) -> None:
         self.vacation_table.setRowCount(0)
+        self._update_date_section_counts()
         self._save_vacation_ranges_to_config()
         self._schedule_preference_refresh(
             "Vacation ranges changed. Sorting columns will refresh automatically."
@@ -1386,6 +2145,7 @@ class BidGUI(QMainWindow):
     def _on_vacation_table_item_changed(self, _item: QTableWidgetItem) -> None:
         if self._loading_saved_values:
             return
+        self._update_date_section_counts()
         self._save_vacation_ranges_to_config()
         self._schedule_preference_refresh(
             "Vacation OCV setting changed. Sorting columns will refresh automatically."
@@ -1400,11 +2160,20 @@ class BidGUI(QMainWindow):
 
     # Requested single dates and ranges ---------------------------------
 
-    def _append_requested_date_row(self, start: str, end: str = "") -> None:
+    def _append_requested_date_row(
+        self,
+        start: str,
+        end: str = "",
+        note: str = "",
+    ) -> None:
         row = self.requested_dates_table.rowCount()
         self.requested_dates_table.insertRow(row)
-        self.requested_dates_table.setItem(row, 0, QTableWidgetItem(start))
-        self.requested_dates_table.setItem(row, 1, QTableWidgetItem(end))
+        note_item = QTableWidgetItem(note)
+        note_item.setToolTip(note)
+        self.requested_dates_table.setItem(row, 0, note_item)
+        self.requested_dates_table.setItem(row, 1, QTableWidgetItem(start))
+        self.requested_dates_table.setItem(row, 2, QTableWidgetItem(end))
+        self._update_date_section_counts()
 
     def _normalize_saved_requested_date_entries(self, entries: Any) -> list[dict[str, str]]:
         normalized: list[dict[str, str]] = []
@@ -1418,37 +2187,51 @@ class BidGUI(QMainWindow):
             return normalized
 
         for entry in entries:
+            note = ""
             start = ""
             end = ""
             if isinstance(entry, str):
                 start = entry
             elif isinstance(entry, dict):
+                note = str(entry.get("note", "") or "")
                 start = str(entry.get("start", "") or "")
                 end = str(entry.get("end", "") or "")
             elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                # Backward compatibility with the old (start, end) format.
                 start = str(entry[0] or "")
                 end = str(entry[1] or "")
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 3:
+                note = str(entry[0] or "")
+                start = str(entry[1] or "")
+                end = str(entry[2] or "")
 
             if start:
-                normalized.append({"start": start, "end": end})
+                normalized.append({"note": note, "start": start, "end": end})
 
         return normalized
 
     def _set_requested_date_entries(self, entries: Any) -> None:
         self.requested_dates_table.setRowCount(0)
         for entry in self._normalize_saved_requested_date_entries(entries):
-            self._append_requested_date_row(entry["start"], entry["end"])
+            self._append_requested_date_row(
+                entry["start"],
+                entry["end"],
+                entry.get("note", ""),
+            )
+        self._update_date_section_counts()
 
     def _get_requested_date_entries(self) -> list[dict[str, str]]:
         entries: list[dict[str, str]] = []
         for row in range(self.requested_dates_table.rowCount()):
-            start_item = self.requested_dates_table.item(row, 0)
-            end_item = self.requested_dates_table.item(row, 1)
+            note_item = self.requested_dates_table.item(row, 0)
+            start_item = self.requested_dates_table.item(row, 1)
+            end_item = self.requested_dates_table.item(row, 2)
+            note = note_item.text().strip() if note_item else ""
             start = validate_required_date(start_item.text() if start_item else "", "Requested date")
             end = validate_date_or_blank(end_item.text() if end_item else "", "Requested end date") or ""
             if end and end < start:
                 raise ValueError(f"Requested range {start} to {end}: end date is before start date.")
-            entries.append({"start": start, "end": end})
+            entries.append({"note": note, "start": start, "end": end})
         return entries
 
     def _get_requested_dates_for_scoring(self) -> list[Any]:
@@ -1471,7 +2254,11 @@ class BidGUI(QMainWindow):
     def _add_requested_date_range(self) -> None:
         dialog = RequestedDateRangeDialog(self, "Add requested day or range")
         if dialog.exec() == QDialog.Accepted and dialog.result:
-            self._append_requested_date_row(dialog.result["start"], dialog.result["end"])
+            self._append_requested_date_row(
+                dialog.result["start"],
+                dialog.result["end"],
+                dialog.result.get("note", ""),
+            )
             self._save_requested_dates_to_config()
             self._schedule_preference_refresh(
                 "Requested days changed. Sorting columns will refresh automatically."
@@ -1483,12 +2270,22 @@ class BidGUI(QMainWindow):
             QMessageBox.information(self, "Edit requested day", "Select a requested day or range first.")
             return
 
-        start = self.requested_dates_table.item(row, 0).text() if self.requested_dates_table.item(row, 0) else ""
-        end = self.requested_dates_table.item(row, 1).text() if self.requested_dates_table.item(row, 1) else ""
-        dialog = RequestedDateRangeDialog(self, "Edit requested day or range", start, end)
+        note = self.requested_dates_table.item(row, 0).text() if self.requested_dates_table.item(row, 0) else ""
+        start = self.requested_dates_table.item(row, 1).text() if self.requested_dates_table.item(row, 1) else ""
+        end = self.requested_dates_table.item(row, 2).text() if self.requested_dates_table.item(row, 2) else ""
+        dialog = RequestedDateRangeDialog(
+            self,
+            "Edit requested day or range",
+            start,
+            end,
+            note,
+        )
         if dialog.exec() == QDialog.Accepted and dialog.result:
-            self.requested_dates_table.setItem(row, 0, QTableWidgetItem(dialog.result["start"]))
-            self.requested_dates_table.setItem(row, 1, QTableWidgetItem(dialog.result["end"]))
+            note_item = QTableWidgetItem(dialog.result.get("note", ""))
+            note_item.setToolTip(dialog.result.get("note", ""))
+            self.requested_dates_table.setItem(row, 0, note_item)
+            self.requested_dates_table.setItem(row, 1, QTableWidgetItem(dialog.result["start"]))
+            self.requested_dates_table.setItem(row, 2, QTableWidgetItem(dialog.result["end"]))
             self._save_requested_dates_to_config()
             self._schedule_preference_refresh(
                 "Requested days changed. Sorting columns will refresh automatically."
@@ -1498,6 +2295,7 @@ class BidGUI(QMainWindow):
         row = self._selected_requested_date_row()
         if row is not None:
             self.requested_dates_table.removeRow(row)
+            self._update_date_section_counts()
             self._save_requested_dates_to_config()
             self._schedule_preference_refresh(
                 "Requested days changed. Sorting columns will refresh automatically."
@@ -1505,6 +2303,7 @@ class BidGUI(QMainWindow):
 
     def _clear_requested_date_ranges(self) -> None:
         self.requested_dates_table.setRowCount(0)
+        self._update_date_section_counts()
         self._save_requested_dates_to_config()
         self._schedule_preference_refresh(
             "Requested days changed. Sorting columns will refresh automatically."
@@ -1532,6 +2331,7 @@ class BidGUI(QMainWindow):
 
         self.line_type_preference_list.clear()
         self.line_type_preference_list.addItems(cleaned)
+        self.line_type_preference_list.resize_to_all_items()
 
     def _get_line_type_preference_order(self) -> list[str]:
         order = [
@@ -1583,9 +2383,6 @@ class BidGUI(QMainWindow):
         hourly_rate = round(float(self.hourly_rate_edit.value()), 2)
         self.config_data["hourly_rate"] = hourly_rate
         save_config(self.config_data)
-        self._schedule_preference_refresh(
-            "Hourly pay rate changed. Pay estimates will refresh automatically."
-        )
 
     def _on_date_preferences_changed(self, status_message: str) -> None:
         if self._loading_saved_values:
@@ -1629,73 +2426,540 @@ class BidGUI(QMainWindow):
         self.pdf_status_label.setText("Preferences changed. Refreshing analyzer columns...")
         self._start_worker(self._load_worker, inputs, False)
 
-    # -------------------------- Sorting list actions --------------------------
+    # -------------------------- Sorting criteria rows --------------------------
 
-    def _add_sort_column(self, direction: str) -> None:
-        item = self.available_columns_list.currentItem()
-        if item is None:
+    @staticmethod
+    def _normalize_sort_direction(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        aliases = {
+            "desc": "high_to_low",
+            "descending": "high_to_low",
+            "high-to-low": "high_to_low",
+            "high to low": "high_to_low",
+            "high_to_low": "high_to_low",
+            "asc": "low_to_high",
+            "ascending": "low_to_high",
+            "low-to-high": "low_to_high",
+            "low to high": "low_to_high",
+            "low_to_high": "low_to_high",
+        }
+        return aliases.get(text, "high_to_low")
+
+    @staticmethod
+    def _normalize_sort_mode(value: Any, *, fallback: str = "weighted") -> str:
+        text = str(value or "").strip().lower()
+        aliases = {
+            "strict": "strict",
+            "high priority": "strict",
+            "high_priority": "strict",
+            "weighted": "weighted",
+            "weight": "weighted",
+            "equal": "equal",
+            "equal to previous": "equal",
+            "equal_to_previous": "equal",
+        }
+        normalized = aliases.get(text, fallback)
+        if normalized not in {"strict", "weighted", "equal"}:
+            return fallback
+        return normalized
+
+    def _normalize_saved_sort_order(self, sort_order: Any) -> list[list[str]]:
+        normalized: list[list[str]] = []
+        if not isinstance(sort_order, (list, tuple)):
+            return normalized
+
+        fallback_mode = self._normalize_sort_mode(
+            getattr(self, "default_mode", "weighted"),
+            fallback="weighted",
+        )
+
+        for item in sort_order:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+
+            column = str(item[0] or "").strip()
+            if not column:
+                continue
+
+            direction = self._normalize_sort_direction(item[1])
+            mode = (
+                self._normalize_sort_mode(item[2], fallback=fallback_mode)
+                if len(item) >= 3
+                else fallback_mode
+            )
+
+            # "Equal to Previous" cannot be the first actual criterion.
+            if not normalized and mode == "equal":
+                mode = "weighted"
+
+            normalized.append([column, direction, mode])
+
+        return normalized
+
+    def _add_sort_criteria_row(
+        self,
+        criterion: list[str] | tuple[str, ...] | None = None,
+        *,
+        notify: bool = True,
+    ) -> None:
+        list_item = QListWidgetItem()
+        list_item.setFlags(
+            list_item.flags()
+            | Qt.ItemIsEnabled
+            | Qt.ItemIsSelectable
+            | Qt.ItemIsDragEnabled
+            | Qt.ItemIsDropEnabled
+        )
+
+        row_id = self._next_sort_row_id
+        self._next_sort_row_id += 1
+        list_item.setData(Qt.UserRole, row_id)
+
+        row_widget = QWidget()
+        row_widget.setObjectName("SortCriterionCard")
+        row_widget.setMinimumHeight(46)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(6, 3, 6, 3)
+        row_layout.setSpacing(8)
+
+        drag_handle = SortCriteriaDragHandle(
+            self.sort_rows_list,
+            list_item,
+            row_widget,
+        )
+
+        number_label = QLabel()
+        number_label.setFixedWidth(28)
+        number_label.setAlignment(Qt.AlignCenter)
+
+        column_combo = WheelSafeComboBox()
+        column_combo.setFixedWidth(245)
+        column_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        column_combo.addItem("Select column...", "")
+        for column in self.sortable_columns:
+            column_combo.addItem(column, column)
+
+        direction_combo = WheelSafeComboBox()
+        direction_combo.setFixedWidth(130)
+        direction_combo.addItems(SORT_DIRECTION_LABEL_TO_VALUE.keys())
+
+        mode_combo = WheelSafeComboBox()
+        mode_combo.setFixedWidth(155)
+
+        contribution_label = QLabel("—")
+        contribution_label.setFixedWidth(100)
+        contribution_label.setAlignment(Qt.AlignCenter)
+        contribution_label.setToolTip(
+            "Calculated by get_sort_percent_contributions() using the current "
+            "weighting style and priority-emphasis setting."
+        )
+
+        remove_button = QPushButton("Remove")
+        remove_button.setFixedWidth(78)
+
+        row_layout.addWidget(drag_handle)
+        row_layout.addWidget(number_label)
+        row_layout.addWidget(column_combo)
+        row_layout.addWidget(direction_combo)
+        row_layout.addWidget(mode_combo)
+        row_layout.addWidget(contribution_label)
+        row_layout.addSpacing(4)
+        row_layout.addWidget(remove_button)
+        row_layout.addStretch(1)
+
+        row_data: dict[str, Any] = {
+            "row_id": row_id,
+            "item": list_item,
+            "widget": row_widget,
+            "drag_handle": drag_handle,
+            "number_label": number_label,
+            "column_combo": column_combo,
+            "direction_combo": direction_combo,
+            "mode_combo": mode_combo,
+            "contribution_label": contribution_label,
+            "remove_button": remove_button,
+        }
+
+        self._sort_row_by_id[row_id] = row_data
+        self.sort_criteria_rows.append(row_data)
+        self.sort_rows_list.addItem(list_item)
+        list_item.setSizeHint(QSize(0, 52))
+        self.sort_rows_list.setItemWidget(list_item, row_widget)
+
+        column_combo.currentIndexChanged.connect(self._on_sort_criteria_changed)
+        direction_combo.currentIndexChanged.connect(self._on_sort_criteria_changed)
+        mode_combo.currentIndexChanged.connect(self._on_sort_criteria_changed)
+        remove_button.clicked.connect(
+            lambda _checked=False, row=row_data: self._remove_sort_criteria_row(row)
+        )
+
+        self._update_sort_row_positions()
+
+        if criterion:
+            self._set_sort_row_values(row_data, criterion)
+        else:
+            self._set_sort_row_values(row_data, None)
+
+        self._update_sort_percentages()
+
+        if notify:
+            self._on_sort_criteria_changed()
+
+    def _sync_sort_criteria_rows_from_list(self) -> None:
+        ordered_rows: list[dict[str, Any]] = []
+        for index in range(self.sort_rows_list.count()):
+            item = self.sort_rows_list.item(index)
+            try:
+                row_id = int(item.data(Qt.UserRole))
+            except (TypeError, ValueError):
+                continue
+            row_data = self._sort_row_by_id.get(row_id)
+            if row_data is not None:
+                ordered_rows.append(row_data)
+        self.sort_criteria_rows = ordered_rows
+
+    def _remove_sort_criteria_row(self, row_data: dict[str, Any]) -> None:
+        self._sync_sort_criteria_rows_from_list()
+
+        if len(self.sort_criteria_rows) <= MIN_SORT_CRITERIA_ROWS:
+            self._set_sort_row_values(row_data, None)
+            self._on_sort_criteria_changed()
             return
 
-        col = item.text()
-        self.sort_order = [rule for rule in self.sort_order if rule[0] != col]
-        self.sort_order.append([col, direction])
-        self._refresh_selected_sort_list()
-        self._clear_bid_string("Sorting priority changed. Generate the bid string again.")
-
-    def _remove_sort_column(self) -> None:
-        row = self.selected_sort_list.currentRow()
-        if row < 0:
+        if row_data not in self.sort_criteria_rows:
             return
-        del self.sort_order[row]
-        self._refresh_selected_sort_list()
-        self._clear_bid_string("Sorting priority changed. Generate the bid string again.")
+
+        list_item: QListWidgetItem = row_data["item"]
+        row_index = self.sort_rows_list.row(list_item)
+        if row_index >= 0:
+            self.sort_rows_list.takeItem(row_index)
+
+        self._sort_row_by_id.pop(row_data["row_id"], None)
+        row_data["widget"].deleteLater()
+        del list_item
+
+        self._sync_sort_criteria_rows_from_list()
+        self._update_sort_row_positions()
+        self._on_sort_criteria_changed()
+
+    def _on_sort_rows_previewed(self, *_args: Any) -> None:
+        """Refresh numbering and percentages while rows visibly shift."""
+        if self._rebuilding_sort_rows:
+            return
+
+        self._sync_sort_criteria_rows_from_list()
+        self._update_sort_row_positions()
+        self._update_sort_percentages()
+
+    def _on_sort_rows_reordered(self, *_args: Any) -> None:
+        """Commit and save the order after the criterion is dropped."""
+        if self._rebuilding_sort_rows:
+            return
+
+        self._sync_sort_criteria_rows_from_list()
+        self._update_sort_row_positions()
+        self._on_sort_criteria_changed()
+
+    def _update_sort_row_positions(self) -> None:
+        self._sync_sort_criteria_rows_from_list()
+
+        displayed_number = 0
+        for index, row in enumerate(self.sort_criteria_rows):
+            row["remove_button"].setEnabled(
+                len(self.sort_criteria_rows) > MIN_SORT_CRITERIA_ROWS
+                or bool(row["column_combo"].currentData())
+            )
+
+            mode_combo: QComboBox = row["mode_combo"]
+            current_mode = self._normalize_sort_mode(
+                mode_combo.currentData() or mode_combo.currentText(),
+                fallback="weighted",
+            )
+
+            mode_combo.blockSignals(True)
+            mode_combo.clear()
+            mode_combo.addItem("High Priority", "strict")
+            mode_combo.addItem("Normal Priority", "weighted")
+            if index > 0:
+                mode_combo.addItem("Equal to Previous Priority", "equal")
+
+            if index == 0 and current_mode == "equal":
+                current_mode = "weighted"
+
+            mode_index = mode_combo.findData(current_mode)
+            mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 1)
+            mode_combo.blockSignals(False)
+
+            # Equal criteria visibly belong to the same numbered priority level.
+            if index == 0 or current_mode != "equal":
+                displayed_number += 1
+            row["number_label"].setText(f"{displayed_number}.")
+
+    def _set_sort_row_values(
+        self,
+        row_data: dict[str, Any],
+        criterion: list[str] | tuple[str, ...] | None,
+    ) -> None:
+        column_combo: QComboBox = row_data["column_combo"]
+        direction_combo: QComboBox = row_data["direction_combo"]
+        mode_combo: QComboBox = row_data["mode_combo"]
+
+        for combo in (column_combo, direction_combo, mode_combo):
+            combo.blockSignals(True)
+
+        try:
+            if not criterion:
+                column_combo.setCurrentIndex(0)
+                direction_combo.setCurrentText("High to Low")
+                default_mode = "strict" if self.sort_criteria_rows.index(row_data) == 0 else "weighted"
+                mode_index = mode_combo.findData(default_mode)
+                mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+                return
+
+            if len(criterion) < 2:
+                return
+
+            column = str(criterion[0] or "").strip()
+            if not column:
+                return
+
+            direction = self._normalize_sort_direction(criterion[1])
+            mode = (
+                self._normalize_sort_mode(
+                    criterion[2],
+                    fallback=self._normalize_sort_mode(
+                        getattr(self, "default_mode", "weighted"),
+                        fallback="weighted",
+                    ),
+                )
+                if len(criterion) >= 3
+                else self._normalize_sort_mode(
+                    getattr(self, "default_mode", "weighted"),
+                    fallback="weighted",
+                )
+            )
+
+            column_index = column_combo.findData(column)
+            if column_index < 0:
+                # Keep a saved selection visible until the DataFrame is loaded.
+                column_combo.addItem(column, column)
+                column_index = column_combo.findData(column)
+            column_combo.setCurrentIndex(column_index)
+
+            direction_label = SORT_DIRECTION_VALUE_TO_LABEL.get(direction, "High to Low")
+            direction_combo.setCurrentText(direction_label)
+
+            row_index = self.sort_criteria_rows.index(row_data)
+            if row_index == 0 and mode == "equal":
+                mode = "weighted"
+            mode_index = mode_combo.findData(mode)
+            mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 1)
+        finally:
+            for combo in (column_combo, direction_combo, mode_combo):
+                combo.blockSignals(False)
+
+    def _set_sort_order(self, sort_order: Any) -> None:
+        normalized = self._normalize_saved_sort_order(sort_order)
+
+        self._rebuilding_sort_rows = True
+        try:
+            self.sort_rows_list.clear()
+            self.sort_criteria_rows = []
+            self._sort_row_by_id.clear()
+
+            total_rows = max(MIN_SORT_CRITERIA_ROWS, len(normalized))
+            for index in range(total_rows):
+                criterion = normalized[index] if index < len(normalized) else None
+                self._add_sort_criteria_row(criterion, notify=False)
+        finally:
+            self._rebuilding_sort_rows = False
+
+        self.sort_order = normalized
+        self._update_sort_row_positions()
+        self._update_sort_percentages()
 
     def _clear_sort_order(self) -> None:
-        self.sort_order = []
-        self._refresh_selected_sort_list()
-        self._clear_bid_string("Sorting priority changed. Generate the bid string again.")
+        self._set_sort_order([])
+        self._on_sort_criteria_changed()
 
-    def _move_sort_up(self) -> None:
-        row = self.selected_sort_list.currentRow()
-        if row <= 0:
-            return
-        self.sort_order[row - 1], self.sort_order[row] = self.sort_order[row], self.sort_order[row - 1]
-        self._refresh_selected_sort_list(select_index=row - 1)
-        self._clear_bid_string("Sorting priority changed. Generate the bid string again.")
+    def _get_sort_order_from_rows(self, *, validate: bool) -> list[list[str]]:
+        self._sync_sort_criteria_rows_from_list()
+        sort_order: list[list[str]] = []
+        seen_columns: set[str] = set()
+        found_blank = False
 
-    def _move_sort_down(self) -> None:
-        row = self.selected_sort_list.currentRow()
-        if row < 0 or row >= len(self.sort_order) - 1:
+        for row_number, row in enumerate(self.sort_criteria_rows, start=1):
+            column = str(row["column_combo"].currentData() or "").strip()
+
+            if not column:
+                found_blank = True
+                continue
+
+            if validate and found_blank:
+                raise ValueError(
+                    "Sorting criteria must be filled in order. "
+                    f"Choose a column in row {row_number - 1} before using row {row_number}."
+                )
+
+            if validate and column in seen_columns:
+                raise ValueError(
+                    f'The sorting column "{column}" is selected more than once.'
+                )
+
+            direction = SORT_DIRECTION_LABEL_TO_VALUE.get(
+                row["direction_combo"].currentText(),
+                "high_to_low",
+            )
+            mode = self._normalize_sort_mode(
+                row["mode_combo"].currentData() or row["mode_combo"].currentText(),
+                fallback="weighted",
+            )
+
+            if not sort_order and mode == "equal":
+                if validate:
+                    raise ValueError(
+                        '"Equal to Previous" cannot be used for the first sorting criterion.'
+                    )
+                mode = "weighted"
+
+            sort_order.append([column, direction, mode])
+            seen_columns.add(column)
+
+        return sort_order
+
+    def _on_sort_criteria_changed(self, *_args: Any) -> None:
+        self.sort_order = self._get_sort_order_from_rows(validate=False)
+        self._update_sort_row_positions()
+        self._update_sort_percentages()
+
+        if self._loading_saved_values:
             return
-        self.sort_order[row + 1], self.sort_order[row] = self.sort_order[row], self.sort_order[row + 1]
-        self._refresh_selected_sort_list(select_index=row + 1)
-        self._clear_bid_string("Sorting priority changed. Generate the bid string again.")
+
+        self.config_data["sort_order"] = self.sort_order
+        save_config(self.config_data)
+        self._clear_bid_string(
+            "Sorting criteria changed. Generate the bid string again."
+        )
+
+    def _update_sort_percentages(self) -> None:
+        active_rows: list[dict[str, Any]] = []
+        sort_order: list[list[str]] = []
+
+        contribution_tooltip = (
+            "Calculated by get_sort_percent_contributions() using the current "
+            "weighting style and priority-emphasis setting."
+        )
+
+        for row in self.sort_criteria_rows:
+            row["contribution_label"].setText("—")
+            row["contribution_label"].setToolTip(contribution_tooltip)
+            column = str(row["column_combo"].currentData() or "").strip()
+            if not column:
+                continue
+
+            direction = SORT_DIRECTION_LABEL_TO_VALUE.get(
+                row["direction_combo"].currentText(),
+                "high_to_low",
+            )
+            mode = self._normalize_sort_mode(
+                row["mode_combo"].currentData() or row["mode_combo"].currentText(),
+                fallback="weighted",
+            )
+            if not sort_order and mode == "equal":
+                mode = "weighted"
+
+            active_rows.append(row)
+            sort_order.append([column, direction, mode])
+
+        if not sort_order:
+            return
+
+        try:
+            contributions = get_sort_percent_contributions(
+                sort_order,
+                weighting_style=self.weighting_style,
+                soft_max_weight=self.soft_max_weight,
+                soft_min_weight=self.soft_min_weight,
+                round_digits=2,
+            )
+        except Exception as exc:
+            for row in active_rows:
+                row["contribution_label"].setText("Error")
+                row["contribution_label"].setToolTip(
+                    f"Could not calculate sorting contribution: {exc}"
+                )
+            return
+
+        for row, contribution in zip(active_rows, contributions):
+            if contribution is None:
+                row["contribution_label"].setText("—")
+                continue
+
+            try:
+                numeric = float(contribution)
+            except (TypeError, ValueError):
+                row["contribution_label"].setText("—")
+                continue
+
+            if math.isnan(numeric):
+                row["contribution_label"].setText("—")
+            else:
+                row["contribution_label"].setText(f"{numeric:.2f}%")
 
     def _refresh_available_columns_list(self, columns: list[str]) -> None:
-        self.available_columns_list.clear()
-        for col in columns:
-            self.available_columns_list.addItem(str(col))
+        self.sortable_columns = [str(column) for column in columns]
 
-    def _refresh_selected_sort_list(self, select_index: int | None = None) -> None:
-        self.selected_sort_list.clear()
-        for col, direction in self.sort_order:
-            label = "high-to-low" if direction == "desc" else "low-to-high"
-            self.selected_sort_list.addItem(f"{col} ({label})")
+        for row in self.sort_criteria_rows:
+            combo: QComboBox = row["column_combo"]
+            selected = str(combo.currentData() or "").strip()
 
-        if select_index is not None and 0 <= select_index < len(self.sort_order):
-            self.selected_sort_list.setCurrentRow(select_index)
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Select column...", "")
+            for column in self.sortable_columns:
+                combo.addItem(column, column)
+
+            if selected:
+                index = combo.findData(selected)
+                if index < 0:
+                    combo.addItem(selected, selected)
+                    index = combo.findData(selected)
+                combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+
+        self._update_sort_percentages()
 
     def _clean_sort_order_for_columns(self, columns: list[str]) -> None:
-        valid_columns = set(columns)
-        old_sort_order = list(self.sort_order)
-        self.sort_order = [rule for rule in self.sort_order if len(rule) == 2 and rule[0] in valid_columns]
-        self._refresh_selected_sort_list()
+        valid_columns = {str(column) for column in columns}
+        current_order = self._get_sort_order_from_rows(validate=False)
 
-        skipped = [rule[0] for rule in old_sort_order if len(rule) == 2 and rule[0] not in valid_columns]
+        valid_order = [rule for rule in current_order if rule[0] in valid_columns]
+        skipped = [rule[0] for rule in current_order if rule[0] not in valid_columns]
+
         if skipped:
-            self._write_log("Skipped saved sorting columns not found in this DataFrame: " + ", ".join(skipped))
+            self._write_log(
+                "Skipped saved sorting columns not found in this DataFrame: "
+                + ", ".join(skipped)
+            )
+
+        self._set_sort_order(valid_order)
+        self.sort_order = valid_order
 
     # -------------------------- Sorting settings --------------------------
+
+    def _on_priority_emphasis_changed(self, value: float) -> None:
+        self.soft_max_weight = max(float(value), float(self.soft_min_weight))
+        self._update_sort_percentages()
+
+        if self._loading_saved_values:
+            return
+
+        settings = self._get_sorting_settings()
+        self.config_data["sorting_settings"] = settings
+        save_config(self.config_data)
+        self._clear_bid_string(
+            "Priority emphasis changed. Generate the bid string again."
+        )
 
     def _validate_sorting_settings_values(
         self,
@@ -1752,6 +3016,14 @@ class BidGUI(QMainWindow):
         self.soft_min_weight = float(sorting_settings["soft_min_weight"])
         self.keep_score_columns = bool(sorting_settings["keep_score_columns"])
 
+        if hasattr(self, "priority_emphasis_spin"):
+            self.priority_emphasis_spin.blockSignals(True)
+            self.priority_emphasis_spin.setMinimum(max(0.01, self.soft_min_weight))
+            self.priority_emphasis_spin.setValue(
+                max(self.soft_max_weight, self.soft_min_weight)
+            )
+            self.priority_emphasis_spin.blockSignals(False)
+
     def _save_sorting_settings(self, sorting_settings: dict[str, Any], *, show_message: bool = True) -> None:
         self._apply_sorting_settings_to_ui(sorting_settings)
         self.config_data["sorting_settings"] = sorting_settings
@@ -1762,6 +3034,7 @@ class BidGUI(QMainWindow):
             f"{sorting_settings['weighting_style']}, "
             f"soft weights {sorting_settings['soft_min_weight']}–{sorting_settings['soft_max_weight']}."
         )
+        self._update_sort_percentages()
         self._clear_bid_string("Advanced sorting settings changed. Generate the bid string again.")
         if show_message:
             QMessageBox.information(self, "Saved", "Advanced sorting settings saved.")
@@ -1801,9 +3074,9 @@ class BidGUI(QMainWindow):
         weighting_style_combo.setToolTip(weighting_tip)
 
         soft_max_entry = QLineEdit(str(current["soft_max_weight"]))
-        soft_max_entry.setToolTip("Used by the soft weighting style. This is the weight given to the first item in each weighted group. Default: 3.0.")
+        soft_max_entry.setToolTip("Priority emphasis for soft weighting. Bigger values favor earlier criteria more strongly. Default: 3.0.")
         soft_min_entry = QLineEdit(str(current["soft_min_weight"]))
-        soft_min_entry.setToolTip("Used by the soft weighting style. This is the weight given to the last item in each weighted group. Default: 1.0.")
+        soft_min_entry.setToolTip("Baseline contribution weight for the lowest-priority criterion. Default: 1.0.")
         keep_score_columns_check = QCheckBox("Keep score columns in Excel")
         keep_score_columns_check.setChecked(bool(current["keep_score_columns"]))
         keep_score_columns_check.setToolTip("When enabled, any extra score/helper columns created by weighted sorting remain in the exported Excel file.")
@@ -1822,8 +3095,8 @@ class BidGUI(QMainWindow):
 
         add_row(1, "Default mode:", default_mode_combo, default_tip)
         add_row(2, "Weighting style:", weighting_style_combo, weighting_tip)
-        add_row(3, "Soft max weight:", soft_max_entry, soft_max_entry.toolTip())
-        add_row(4, "Soft min weight:", soft_min_entry, soft_min_entry.toolTip())
+        add_row(3, "Priority emphasis:", soft_max_entry, soft_max_entry.toolTip())
+        add_row(4, "Lower-priority baseline:", soft_min_entry, soft_min_entry.toolTip())
         layout.addWidget(keep_score_columns_check, 5, 0, 1, 2)
 
         restore_defaults_button = QPushButton("Restore defaults")
@@ -1934,7 +3207,7 @@ class BidGUI(QMainWindow):
             "output_folder": output_folder,
             "output_path": output_path,
             "number_of_lines_to_bid": number_of_lines_to_bid,
-            "sort_order": self.sort_order,
+            "sort_order": self._get_sort_order_from_rows(validate=True),
             "sorting_settings": self._get_sorting_settings(),
         }
 
@@ -2689,6 +3962,7 @@ class BidGUI(QMainWindow):
 
         self._log("Creating DataFrame...")
         df = master_lines_to_dataframe(master_lines, bid_period_info)
+        
 
         if apply_sort and inputs["sort_order"]:
             sorting_settings = inputs.get("sorting_settings") or DEFAULT_SORTING_SETTINGS
@@ -2698,6 +3972,8 @@ class BidGUI(QMainWindow):
                 f"{sorting_settings['weighting_style']}, "
                 f"soft weights {sorting_settings['soft_min_weight']}–{sorting_settings['soft_max_weight']})."
             )
+            df = drop_empty_sort_columns(df,check_all_columns=True)
+            
             df = sort_dataframe_by_conditions(
                 df,
                 inputs["sort_order"],
@@ -2705,7 +3981,6 @@ class BidGUI(QMainWindow):
                 weighting_style=sorting_settings["weighting_style"],
                 soft_max_weight=sorting_settings["soft_max_weight"],
                 soft_min_weight=sorting_settings["soft_min_weight"],
-                keep_score_columns=sorting_settings["keep_score_columns"],
             )
 
         return df, new_vacation_ranges
@@ -2772,6 +4047,7 @@ class BidGUI(QMainWindow):
         training_start = payload.get("training_start")
         training_end = payload.get("training_end")
         vacation_ranges = payload.get("vacation_ranges") or []
+        requested_days_off_dates = payload.get("requested_days_off_dates") or []
 
         viewer_class = self._get_bid_spreadsheet_viewer_class()
 
@@ -2782,6 +4058,7 @@ class BidGUI(QMainWindow):
                 training_start=training_start,
                 training_end=training_end,
                 vacation_ranges=vacation_ranges,
+                requested_days_off_dates= requested_days_off_dates,
             )
         except TypeError:
             # Fallback for a QWidget-based viewer that expects parent=None and a later load_dataframe call.
@@ -2795,6 +4072,7 @@ class BidGUI(QMainWindow):
                 training_start=training_start,
                 training_end=training_end,
                 vacation_ranges=vacation_ranges,
+                requested_days_off_dates= requested_days_off_dates,
             )
 
         if isinstance(viewer_window, QWidget):
@@ -2820,6 +4098,7 @@ class BidGUI(QMainWindow):
                     "training_start": inputs["training_start"],
                     "training_end": inputs["training_end"],
                     "vacation_ranges": vacation_ranges,
+                    "requested_days_off_dates": inputs["requested_dates"],
                 },
             ))
         except Exception as exc:

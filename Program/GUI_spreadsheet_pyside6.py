@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 from Processing_fucntions import line_numbers_to_bid_string
@@ -39,9 +40,13 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -113,6 +118,38 @@ def normalize_date_ranges(ranges) -> list[tuple[date, date]]:
             start_date, end_date = end_date, start_date
 
         result.append((start_date, end_date))
+
+    return result
+
+
+def normalize_date_list(values) -> set[date]:
+    """Normalize a list/set/tuple/Series of individual date values."""
+    if values is None:
+        return set()
+
+    # Accept either one date-like value or an iterable of date-like values.
+    if isinstance(values, (str, date, datetime, pd.Timestamp)):
+        values = [values]
+
+    result: set[date] = set()
+
+    for value in values:
+        normalized = normalize_date(value)
+        if normalized is not None:
+            result.add(normalized)
+
+    return result
+
+
+def date_ranges_to_date_set(ranges: Iterable[tuple[date, date]]) -> set[date]:
+    """Expand inclusive date ranges into individual dates for quick lookup."""
+    result: set[date] = set()
+
+    for start, end in ranges:
+        current = start
+        while current <= end:
+            result.add(current)
+            current += timedelta(days=1)
 
     return result
 
@@ -273,6 +310,7 @@ class DataFrameTableModel(QAbstractTableModel):
     green_fill = QColor("#C6EFCE")
     vacation_fill = QColor("#800080")
     training_fill = QColor("#FFA500")
+    requested_days_off_fill = QColor("#FF1493")
     white = QColor("#FFFFFF")
     black = QColor("#000000")
 
@@ -284,6 +322,8 @@ class DataFrameTableModel(QAbstractTableModel):
         training_start=None,
         training_end=None,
         vacation_ranges=None,
+        requested_days_off_dates=None,
+        requested_days_off_ranges=None,
         editable: bool = False,
         copy_data: bool = True,
         theme: str = "light",
@@ -305,6 +345,9 @@ class DataFrameTableModel(QAbstractTableModel):
         self.training_start = normalize_date(training_start)
         self.training_end = normalize_date(training_end)
         self.vacation_ranges = normalize_date_ranges(vacation_ranges)
+        self.requested_days_off_ranges = normalize_date_ranges(requested_days_off_ranges)
+        self.requested_days_off_dates = normalize_date_list(requested_days_off_dates)
+        self.requested_days_off_dates.update(date_ranges_to_date_set(self.requested_days_off_ranges))
 
         self._columns = list(self._df.columns)
         self._calendar_dates_by_col = self._build_calendar_column_map(calendar_cols)
@@ -517,10 +560,85 @@ class DataFrameTableModel(QAbstractTableModel):
         return self.column_key(col) in {"linenumber", "linenumbers"}
 
     def is_extra_vacation_column(self, col: int) -> bool:
-        return self.column_key(col) in {"extravacationdays", "extravacationday"}
+        """
+        Detect vacation metric columns even after the sorter renames them.
+
+        Examples that should match:
+            "Extra Vacation Days"
+            "1. Extra Vacation Days"
+            "2) Vacation"
+        """
+        key = self.column_key(col)
+        return "vacation" in key
 
     def is_training_column(self, col: int) -> bool:
-        return self.column_key(col) == "training"
+        """
+        Detect training metric columns even after the sorter renames them.
+
+        Examples that should match:
+            "Training"
+            "1. Training"
+        """
+        return "training" in self.column_key(col)
+
+    def is_requested_days_off_column(self, col: int) -> bool:
+        """
+        Detect requested-days-off metric columns even after the sorter renames them.
+
+        Examples that should match:
+            "Requested Days Off"
+            "Requested Days Off %"
+            "1. Requested Days Off"
+            "2) Requested Dates Off"
+        """
+        key = self.column_key(col)
+        return (
+            "requested" in key
+            and (
+                "dayoff" in key
+                or "daysoff" in key
+                or "dateoff" in key
+                or "datesoff" in key
+                or "days" in key
+                or "dates" in key
+            )
+        )
+
+    def is_sorted_metric_column(self, col: int) -> bool:
+        """
+        Sorted-by columns are protected from hiding.
+
+        Your sorter renames these columns so they start with a number, for
+        example: "1. Blockiness", "2. Total DO", "3. % tickets paid".
+        """
+        if not (0 <= col < len(self._columns)):
+            return False
+
+        column_name = str(self._columns[col]).strip()
+        return bool(re.match(r"^\d+\s*[.)\-:]?\s+.+", column_name))
+
+    def is_protected_column(self, col: int) -> bool:
+        """Columns that the user should not be able to hide."""
+        return (
+            self.is_line_number_column(col)
+            or self.is_calendar_column(col)
+            or self.is_sorted_metric_column(col)
+        )
+
+    def column_display_name(self, col: int) -> str:
+        if not (0 <= col < len(self._columns)):
+            return ""
+
+        column_date = self._calendar_dates_by_col.get(col)
+        if column_date is not None:
+            return format_calendar_header(column_date)
+
+        return str(self._columns[col])
+
+    def column_config_key(self, col: int) -> str:
+        if not (0 <= col < len(self._columns)):
+            return ""
+        return str(self._columns[col])
 
     def set_theme(self, theme: str):
         self._theme_name = normalize_theme_name(theme)
@@ -574,6 +692,16 @@ class DataFrameTableModel(QAbstractTableModel):
 
         return False
 
+    def column_uses_requested_days_off_header_color(self, col: int) -> bool:
+        if self.is_requested_days_off_column(col):
+            return True
+
+        column_date = self._calendar_dates_by_col.get(col)
+        if column_date is None:
+            return False
+
+        return column_date in self.requested_days_off_dates
+
     def column_uses_vacation_header_color(self, col: int) -> bool:
         if self.is_extra_vacation_column(col):
             return True
@@ -588,6 +716,11 @@ class DataFrameTableModel(QAbstractTableModel):
         if self.column_uses_training_header_color(col):
             return self.training_fill
 
+        # Requested days off are drawn after training, so training still wins
+        # when the same date is both a training date and a requested day off.
+        if self.column_uses_requested_days_off_header_color(col):
+            return self.requested_days_off_fill
+
         if self.column_uses_vacation_header_color(col):
             return self.vacation_fill
 
@@ -597,6 +730,9 @@ class DataFrameTableModel(QAbstractTableModel):
         # Black text is more readable on the orange/yellow training header.
         if self.column_uses_training_header_color(col):
             return self.black
+
+        if self.column_uses_requested_days_off_header_color(col):
+            return self.white
 
         if self.column_uses_vacation_header_color(col):
             return self.white
@@ -619,7 +755,25 @@ class DataFrameTableModel(QAbstractTableModel):
         if self.training_end is not None and column_date == self.training_end:
             right = BorderSpec(self.training_fill, 2, Qt.DashLine)
 
-        # Vacation markers. Do not overwrite training on the same side.
+        # Requested-days-off markers. Do not overwrite training on the same side.
+        # If a requested day overlaps vacation, requested days off win visually
+        # because they are more specific user-selected days.
+        for requested_start, requested_end in self.requested_days_off_ranges:
+            if column_date == requested_start and left is None:
+                left = BorderSpec(self.requested_days_off_fill, 3, Qt.SolidLine)
+            if column_date == requested_end and right is None:
+                right = BorderSpec(self.requested_days_off_fill, 2, Qt.DashLine)
+
+        if (
+            column_date in self.requested_days_off_dates
+            and not date_in_any_range(column_date, self.requested_days_off_ranges)
+        ):
+            if left is None:
+                left = BorderSpec(self.requested_days_off_fill, 3, Qt.SolidLine)
+            if right is None:
+                right = BorderSpec(self.requested_days_off_fill, 2, Qt.DashLine)
+
+        # Vacation markers. Do not overwrite training/requested markers on the same side.
         for vacation_start, vacation_end in self.vacation_ranges:
             if column_date == vacation_start and left is None:
                 left = BorderSpec(self.vacation_fill, 3, Qt.SolidLine)
@@ -1298,6 +1452,169 @@ class ZoomableTableView(QTableView):
         painter.restore()
 
 # -----------------------------
+# Column visibility dialog
+# -----------------------------
+
+HIDDEN_COLUMNS_CONFIG_KEY = "visualizer_hidden_columns"
+
+
+class ColumnVisibilityDialog(QDialog):
+    """Small dialog for showing/hiding optional DataFrame columns."""
+
+    def __init__(
+        self,
+        model: DataFrameTableModel,
+        *,
+        hidden_column_keys: set[str],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Hide/Show Columns")
+        self.resize(440, 560)
+
+        self.model = model
+        self.list_widget = QListWidget(self)
+
+        # Do not use Qt's default alternating row colors here. Some Linux/desktop
+        # themes make the alternate color dark while leaving the text black.
+        self.list_widget.setAlternatingRowColors(False)
+        self.list_widget.setStyleSheet(
+            """
+            QListWidget {
+                background-color: #FFFFFF;
+                color: #000000;
+                border: 1px solid #B8C7D9;
+            }
+            QListWidget::item {
+                padding: 6px;
+                background-color: #FFFFFF;
+                color: #000000;
+            }
+            QListWidget::item:hover {
+                background-color: #EEF6FF;
+                color: #000000;
+            }
+            QListWidget::item:selected {
+                background-color: #D7E9FF;
+                color: #000000;
+            }
+            QListWidget::item:disabled {
+                background-color: #F2F2F2;
+                color: #777777;
+            }
+            QScrollBar:vertical {
+                background: #FFFFFF;
+                width: 16px;
+                margin: 0px;
+                border: 1px solid #D0D0D0;
+            }
+            QScrollBar::handle:vertical {
+                background: #9A9A9A;
+                border: 1px solid #A8A8A8;
+                border-radius: 6px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #F2F2F2;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+                background: none;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: #FFFFFF;
+            }
+            """
+        )
+
+        optional_count = 0
+
+        for col in range(model.columnCount()):
+            # Do not even show protected columns here. The user cannot hide them,
+            # so listing them only adds noise.
+            if model.is_protected_column(col):
+                continue
+
+            display_name = model.column_display_name(col)
+            config_key = model.column_config_key(col)
+
+            item = QListWidgetItem(display_name)
+            item.setData(Qt.UserRole, config_key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.Unchecked if config_key in hidden_column_keys else Qt.Checked
+            )
+            item.setToolTip("Checked columns are visible. Unchecked columns are hidden.")
+
+            self.list_widget.addItem(item)
+            optional_count += 1
+
+        if optional_count == 0:
+            item = QListWidgetItem("No optional columns available to hide")
+            item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+            self.list_widget.addItem(item)
+
+        description = QLabel(
+            "Check the optional columns you want to see. Line numbers, calendar "
+            "date columns, and numbered sorted-by columns are always visible and "
+            "are not listed here."
+        )
+        description.setWordWrap(True)
+
+        self.show_all_button = QPushButton("Show All Optional Columns")
+        self.show_all_button.clicked.connect(self.show_all_optional_columns)
+        self.show_all_button.setEnabled(optional_count > 0)
+
+        self.deselect_all_button = QPushButton("Deselect All")
+        self.deselect_all_button.setToolTip("Hide all optional columns listed here")
+        self.deselect_all_button.clicked.connect(self.deselect_all_optional_columns)
+        self.deselect_all_button.setEnabled(optional_count > 0)
+
+        visibility_button_layout = QHBoxLayout()
+        visibility_button_layout.addWidget(self.show_all_button)
+        visibility_button_layout.addWidget(self.deselect_all_button)
+        visibility_button_layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(description)
+        layout.addWidget(self.list_widget)
+        layout.addLayout(visibility_button_layout)
+        layout.addWidget(buttons)
+
+    def show_all_optional_columns(self):
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.flags() & Qt.ItemIsUserCheckable:
+                item.setCheckState(Qt.Checked)
+
+    def deselect_all_optional_columns(self):
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.flags() & Qt.ItemIsUserCheckable:
+                item.setCheckState(Qt.Unchecked)
+
+    def hidden_column_keys(self) -> set[str]:
+        hidden: set[str] = set()
+
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+
+            if not (item.flags() & Qt.ItemIsUserCheckable):
+                continue
+
+            if item.checkState() != Qt.Checked:
+                hidden.add(str(item.data(Qt.UserRole)))
+
+        return hidden
+
+# -----------------------------
 # Viewer widget
 # -----------------------------
 
@@ -1310,6 +1627,8 @@ class BidSpreadsheetViewer(QWidget):
         training_start=None,
         training_end=None,
         vacation_ranges=None,
+        requested_days_off_dates=None,
+        requested_days_off_ranges=None,
         calendar_col_width=32,
         calendar_row_height=40,
         header_row_height=45,
@@ -1362,6 +1681,8 @@ class BidSpreadsheetViewer(QWidget):
             training_start=training_start,
             training_end=training_end,
             vacation_ranges=vacation_ranges,
+            requested_days_off_dates=requested_days_off_dates,
+            requested_days_off_ranges=requested_days_off_ranges,
             editable=editable,
             theme=self.theme_name,
             body_font_point_size=self.scaled_body_font_point_size(),
@@ -1387,11 +1708,10 @@ class BidSpreadsheetViewer(QWidget):
         self.bid_string_preview.setPlaceholderText("Copied bid string will appear here")
         self.bid_string_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem("Light", "light")
-        self.theme_combo.addItem("Dark", "dark")
-        self.theme_combo.setCurrentIndex(0 if self.theme_name == "light" else 1)
-        self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
+        self.theme_button = QPushButton()
+        self.theme_button.setMinimumWidth(84)
+        self.theme_button.clicked.connect(self.toggle_theme)
+        self.update_theme_button()
 
         self.zoom_out_button = QPushButton("−")
         self.zoom_out_button.setToolTip("Zoom out. You can also use Ctrl+mouse wheel down.")
@@ -1405,9 +1725,13 @@ class BidSpreadsheetViewer(QWidget):
         self.zoom_in_button.setToolTip("Zoom in. You can also use Ctrl+mouse wheel up.")
         self.zoom_in_button.clicked.connect(self.zoom_in)
 
+        self.columns_button = QPushButton("Hide/Show Columns...")
+        self.columns_button.setToolTip("Show or hide optional columns")
+        self.columns_button.clicked.connect(self.open_column_visibility_dialog)
+
         self.move_up_button = QPushButton("Move Row Up")
         self.move_down_button = QPushButton("Move Row Down")
-        self.reset_button = QPushButton("Reset Display Order")
+        self.reset_button = QPushButton("Reset Order")
 
         self.move_up_button.clicked.connect(self.move_selected_rows_up)
         self.move_down_button.clicked.connect(self.move_selected_rows_down)
@@ -1419,19 +1743,28 @@ class BidSpreadsheetViewer(QWidget):
         bid_layout.addWidget(self.copy_bid_button)
         bid_layout.addWidget(QLabel("Bid string:"))
         bid_layout.addWidget(self.bid_string_preview, stretch=1)
-        bid_layout.addWidget(QLabel("Theme:"))
-        bid_layout.addWidget(self.theme_combo)
-        bid_layout.addWidget(QLabel("Zoom:"))
-        bid_layout.addWidget(self.zoom_out_button)
-        bid_layout.addWidget(self.zoom_reset_button)
-        bid_layout.addWidget(self.zoom_in_button)
+
+        # Put Reset Order where the old Theme dropdown used to be.
+        bid_layout.addWidget(self.reset_button)
+        bid_layout.addWidget(self.theme_button)
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.move_up_button)
         button_layout.addWidget(self.move_down_button)
-        button_layout.addWidget(self.reset_button)
-        button_layout.addStretch(1)
-        button_layout.addWidget(self.status_label)
+        button_layout.addSpacing(18)
+        button_layout.addWidget(self.columns_button)
+
+        # Keep the live status / column-visibility message beside the
+        # Hide/Show Columns button, not at the far right.
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        button_layout.addWidget(self.status_label, stretch=1)
+
+        # Keep zoom controls on the far right of this same row.
+        button_layout.addSpacing(24)
+        button_layout.addWidget(QLabel("Zoom:"))
+        button_layout.addWidget(self.zoom_out_button)
+        button_layout.addWidget(self.zoom_reset_button)
+        button_layout.addWidget(self.zoom_in_button)
 
         layout = QVBoxLayout(self)
         layout.addLayout(bid_layout)
@@ -1452,6 +1785,7 @@ class BidSpreadsheetViewer(QWidget):
 
         self.apply_table_theme(self.theme_name)
         self.apply_table_sizing()
+        self.apply_saved_column_visibility()
         self.update_bid_string_preview(copy_to_clipboard=False)
 
     def zoom_factor(self) -> float:
@@ -1497,9 +1831,21 @@ class BidSpreadsheetViewer(QWidget):
         """Backward-compatible helper. Prefer apply_table_theme("light")."""
         self.apply_table_theme("light")
 
-    def on_theme_changed(self):
-        theme = self.theme_combo.currentData()
-        self.apply_table_theme(theme)
+    def update_theme_button(self):
+        """Show the action the button will perform, not the current state.
+
+        Avoid emoji-only text here. Some Linux/Windows/macOS font setups do not
+        include the same moon glyphs, so plain text is more reliable.
+        """
+        if self.theme_name == "dark":
+            self.theme_button.setText("Light")
+            self.theme_button.setToolTip("Switch to light mode")
+        else:
+            self.theme_button.setText("Dark")
+            self.theme_button.setToolTip("Switch to dark mode")
+
+    def toggle_theme(self):
+        self.apply_table_theme("light" if self.theme_name == "dark" else "dark")
 
     def apply_table_theme(self, theme: str):
         """Apply a light or dark palette to the spreadsheet area with readable text."""
@@ -1544,8 +1890,69 @@ class BidSpreadsheetViewer(QWidget):
             QHeaderView::section {{
                 padding: 4px;
             }}
+
+            /* Force both spreadsheet scroll bars to stay white.
+               This avoids brown/OS-theme scrollbars on some systems. */
+            QTableView QScrollBar:horizontal,
+            QTableView QScrollBar:vertical {{
+                background: #FFFFFF;
+                border: 1px solid #D0D0D0;
+                margin: 0px;
+            }}
+
+            QTableView QScrollBar:horizontal {{
+                height: 16px;
+            }}
+
+            QTableView QScrollBar:vertical {{
+                width: 16px;
+            }}
+
+            QTableView QScrollBar::handle:horizontal,
+            QTableView QScrollBar::handle:vertical {{
+                background: #9A9A9A;
+                border: 1px solid #A8A8A8;
+                border-radius: 6px;
+            }}
+
+            QTableView QScrollBar::handle:horizontal {{
+                min-width: 32px;
+            }}
+
+            QTableView QScrollBar::handle:vertical {{
+                min-height: 32px;
+            }}
+
+            QTableView QScrollBar::handle:horizontal:hover,
+            QTableView QScrollBar::handle:vertical:hover {{
+                background: #F2F2F2;
+            }}
+
+            QTableView QScrollBar::add-line:horizontal,
+            QTableView QScrollBar::sub-line:horizontal,
+            QTableView QScrollBar::add-line:vertical,
+            QTableView QScrollBar::sub-line:vertical {{
+                width: 0px;
+                height: 0px;
+                border: none;
+                background: none;
+            }}
+
+            QTableView QScrollBar::add-page:horizontal,
+            QTableView QScrollBar::sub-page:horizontal,
+            QTableView QScrollBar::add-page:vertical,
+            QTableView QScrollBar::sub-page:vertical {{
+                background: #FFFFFF;
+            }}
+
+            QTableView QScrollBar::corner {{
+                background: #FFFFFF;
+            }}
             """
         )
+
+        if hasattr(self, "theme_button"):
+            self.update_theme_button()
 
         self.table.horizontalHeader().update()
         self.table.verticalHeader().update()
@@ -1591,6 +1998,69 @@ class BidSpreadsheetViewer(QWidget):
     def save_number_of_lines_to_bid(self, value: int):
         save_bid_config_value(self.config_path, "number_of_lines_to_bid", int(value))
         self.update_bid_string_preview(copy_to_clipboard=False)
+
+    def load_hidden_column_keys(self) -> set[str]:
+        config = load_bid_config(self.config_path)
+        value = config.get(HIDDEN_COLUMNS_CONFIG_KEY, [])
+
+        if not isinstance(value, list):
+            return set()
+
+        return {str(item) for item in value}
+
+    def save_hidden_column_keys(self, hidden_column_keys: set[str]):
+        save_bid_config_value(
+            self.config_path,
+            HIDDEN_COLUMNS_CONFIG_KEY,
+            sorted(str(item) for item in hidden_column_keys),
+        )
+
+    def apply_hidden_column_keys(self, hidden_column_keys: set[str]):
+        hidden_count = 0
+
+        for col in range(self.model.columnCount()):
+            config_key = self.model.column_config_key(col)
+
+            # Protected columns are always visible, even if an old config file
+            # accidentally says to hide them.
+            hide_column = (
+                config_key in hidden_column_keys
+                and not self.model.is_protected_column(col)
+            )
+
+            self.table.setColumnHidden(col, hide_column)
+            if hide_column:
+                hidden_count += 1
+
+        return hidden_count
+
+    def apply_saved_column_visibility(self):
+        hidden_count = self.apply_hidden_column_keys(self.load_hidden_column_keys())
+        if hidden_count:
+            self.status_label.setText(
+                f"Loaded column visibility preferences. {hidden_count} optional column(s) hidden."
+            )
+
+    def open_column_visibility_dialog(self):
+        dialog = ColumnVisibilityDialog(
+            self.model,
+            hidden_column_keys=self.load_hidden_column_keys(),
+            parent=self,
+        )
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        hidden_column_keys = dialog.hidden_column_keys()
+        hidden_count = self.apply_hidden_column_keys(hidden_column_keys)
+        self.save_hidden_column_keys(hidden_column_keys)
+
+        if hidden_count:
+            self.status_label.setText(
+                f"Column visibility saved. {hidden_count} optional column(s) hidden."
+            )
+        else:
+            self.status_label.setText("Column visibility saved. All optional columns are visible.")
 
     def selected_view_rows(self) -> list[int]:
         selected_rows = self.table.selectionModel().selectedRows()
