@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Optional
-from processing_fucntions import line_numbers_to_bid_string
+from processing_functions import line_numbers_to_bid_string
 
 import pandas as pd
 
