@@ -17,9 +17,11 @@ from PySide6.QtCore import (
     QMimeData,
     QModelIndex,
     QPoint,
+    QPropertyAnimation,
     QRect,
     Qt,
     QTimer,
+    QEasingCurve,
 )
 from PySide6.QtGui import (
     QAction,
@@ -342,6 +344,10 @@ class DataFrameTableModel(QAbstractTableModel):
         self._last_moved_view_rows: list[int] = []
         self._editable = editable
 
+        # Find/search state. This is display-only and never changes the DataFrame.
+        self._find_query = ""
+        self._current_find_cell: Optional[tuple[int, int]] = None
+
         self.training_start = normalize_date(training_start)
         self.training_end = normalize_date(training_end)
         self.vacation_ranges = normalize_date_ranges(vacation_ranges)
@@ -387,6 +393,42 @@ class DataFrameTableModel(QAbstractTableModel):
             return 0
         return len(self._columns)
 
+    def cell_display_text(self, view_row: int, col: int) -> str:
+        """Return the user-visible text for one cell in current view order."""
+        if not (0 <= view_row < self.rowCount()):
+            return ""
+        if not (0 <= col < self.columnCount()):
+            return ""
+
+        source_row = self._row_order[view_row]
+        value = self._df.iat[source_row, col]
+        if is_blank(value):
+            return ""
+        return str(value)
+
+    def cell_matches_find_query(self, view_row: int, col: int) -> bool:
+        if not self._find_query:
+            return False
+        return self._find_query in self.cell_display_text(view_row, col).lower()
+
+    def set_find_state(
+        self,
+        query: str,
+        current_cell: Optional[tuple[int, int]] = None,
+    ):
+        """Highlight cells matching the find query without modifying the DataFrame."""
+        self._find_query = str(query or "").lower()
+        self._current_find_cell = current_cell
+
+        if self.rowCount() and self.columnCount():
+            top_left = self.index(0, 0)
+            bottom_right = self.index(self.rowCount() - 1, self.columnCount() - 1)
+            self.dataChanged.emit(
+                top_left,
+                bottom_right,
+                [Qt.BackgroundRole, Qt.ForegroundRole],
+            )
+
     def data(self, index: QModelIndex, role=Qt.DisplayRole):
         if not index.isValid():
             return None
@@ -403,6 +445,12 @@ class DataFrameTableModel(QAbstractTableModel):
             return str(value)
 
         if role == Qt.BackgroundRole:
+            # Find highlighting wins over normal calendar coloring.
+            if self.cell_matches_find_query(view_row, col):
+                if self._current_find_cell == (view_row, col):
+                    return QBrush(QColor("#FFA500"))  # current match: highlighter orange
+                return QBrush(QColor("#FFFF00"))      # other matches: highlighter yellow
+
             # Match the Excel export: non-empty calendar cells get a green fill.
             # Dark mode uses a darker green so the text stays readable.
             if column_date is not None and not is_blank(value):
@@ -410,6 +458,9 @@ class DataFrameTableModel(QAbstractTableModel):
             return None
 
         if role == Qt.ForegroundRole:
+            # Keep search highlights readable in light or dark mode.
+            if self.cell_matches_find_query(view_row, col):
+                return QBrush(QColor("#000000"))
             return QBrush(self._theme.text)
 
         if role == Qt.FontRole:
@@ -639,6 +690,107 @@ class DataFrameTableModel(QAbstractTableModel):
         if not (0 <= col < len(self._columns)):
             return ""
         return str(self._columns[col])
+
+    def calendar_column_indices(self) -> list[int]:
+        """Return the DataFrame columns that make up the calendar section."""
+        return sorted(self._calendar_dates_by_col)
+
+    def line_types_for_view_row(self, view_row: int) -> set[str]:
+        """Return line types for the row as currently displayed in the table."""
+        if not (0 <= view_row < self.rowCount()):
+            return set()
+
+        source_row = self._row_order[view_row]
+        return self.line_types_for_source_row(source_row)
+
+    def line_types_for_source_row(self, source_row: int) -> set[str]:
+        """
+        Determine which line types appear in one original DataFrame row.
+
+        Only calendar columns are inspected. This keeps metric columns such as
+        Training, Blockiness, or Requested Days Off from accidentally affecting
+        the line-type filter.
+        """
+        if not (0 <= source_row < len(self._df)):
+            return set()
+
+        special_line_types: set[str] = set()
+        has_any_calendar_content = False
+
+        for col in self.calendar_column_indices():
+            value = self._df.iat[source_row, col]
+
+            if is_blank(value):
+                continue
+
+            has_any_calendar_content = True
+
+            # Treat Trips as the fallback row type only.
+            # If a row contains a special type like SBG plus ordinary trip text
+            # elsewhere, the row should still be found when the user shows SBG
+            # only. This fixes the confusing "select only SBG shows nothing" case.
+            for line_type in self.calendar_cell_line_types(value):
+                if line_type != "Trips":
+                    special_line_types.add(line_type)
+
+        if special_line_types:
+            return special_line_types
+
+        if has_any_calendar_content:
+            return {"Trips"}
+
+        return set()
+
+    def calendar_cell_line_types(self, value) -> set[str]:
+        """
+        Determine line type(s) from one calendar cell.
+
+        Rules:
+            - Empty calendar cells add no type.
+            - VTO/RB/RA/SB/SA/VOR are detected as standalone codes.
+            - SBA/SBG are detected with optional numbers and destination text,
+              e.g. SBA@SDF, SBA4@SDF, SBG@DFW, SBG3@ONT.
+            - Any other non-empty calendar text is treated as Trips.
+        """
+        if is_blank(value):
+            return set()
+
+        text = str(value).upper().strip()
+        if not text:
+            return set()
+
+        found: set[str] = set()
+
+        # SBA/SBG first so they do not get confused with SB/SA.
+        # Be intentionally flexible because the calendar may contain formats like:
+        #   SBA@SDF, SBA4@SDF, SBG@DFW, SBG3@ONT, SBG3@[DFW16], {1964 SBA@SDF}
+        # The key signal is SBA/SBG + optional number, followed by @, punctuation,
+        # whitespace, or the end of the string.
+        if re.search(r"(?<![A-Z0-9])SBA\d*(?=@|[^A-Z0-9]|$)", text):
+            found.add("SBA")
+
+        if re.search(r"(?<![A-Z0-9])SBG\d*(?=@|[^A-Z0-9]|$)", text):
+            found.add("SBG")
+
+        for code in ("VTO", "RB", "RA", "SB", "SA", "VOR"):
+            if re.search(rf"(?<![A-Z0-9]){code}(?![A-Z0-9])", text):
+                found.add(code)
+
+        if not found:
+            found.add("Trips")
+
+        return found
+
+    def line_type_counts(self) -> dict[str, int]:
+        """Return how many rows contain each line type."""
+        counts = {line_type: 0 for line_type in LINE_TYPE_ORDER}
+
+        for source_row in range(len(self._df)):
+            for line_type in self.line_types_for_source_row(source_row):
+                if line_type in counts:
+                    counts[line_type] += 1
+
+        return counts
 
     def set_theme(self, theme: str):
         self._theme_name = normalize_theme_name(theme)
@@ -1013,6 +1165,18 @@ class ZoomableTableView(QTableView):
         self.setAutoScroll(True)
         self.setAutoScrollMargin(45)
 
+        # Row-step scrolling is intentionally used here instead of animated
+        # pixel scrolling. On very wide/custom-painted tables it tends to be
+        # more predictable across Linux, Windows, and macOS.
+        self.setVerticalScrollMode(QAbstractItemView.ScrollPerItem)
+        self.setHorizontalScrollMode(QAbstractItemView.ScrollPerItem)
+        self.verticalScrollBar().setSingleStep(1)
+        self.horizontalScrollBar().setSingleStep(1)
+
+        # Used for horizontal side-wheel support. A normal vertical wheel event
+        # is left to QTableView so it jumps cleanly by rows.
+        self._horizontal_wheel_columns_per_notch = 3
+
     def set_drop_indicator_color(self, color: QColor):
         self._drop_indicator_color = QColor(color)
         self._drop_indicator_fill = QColor(color)
@@ -1031,6 +1195,37 @@ class ZoomableTableView(QTableView):
                 elif delta < 0:
                     viewer.zoom_out()
 
+                event.accept()
+                return
+
+        # Preserve horizontal side-wheel behavior. Shift + vertical wheel also
+        # scrolls horizontally. Normal vertical wheel is handled by QTableView
+        # so it uses row-step scrolling again.
+        pixel_delta = event.pixelDelta()
+        angle_delta = event.angleDelta()
+
+        use_horizontal = False
+
+        if event.modifiers() & Qt.ShiftModifier:
+            use_horizontal = True
+        elif not pixel_delta.isNull() and abs(pixel_delta.x()) > abs(pixel_delta.y()):
+            use_horizontal = True
+        elif not angle_delta.isNull() and angle_delta.x() != 0 and abs(angle_delta.x()) >= abs(angle_delta.y()):
+            use_horizontal = True
+
+        if use_horizontal:
+            scroll_bar = self.horizontalScrollBar()
+
+            if not pixel_delta.isNull():
+                delta = pixel_delta.x() if pixel_delta.x() else pixel_delta.y()
+                scroll_bar.setValue(scroll_bar.value() - delta)
+                event.accept()
+                return
+
+            if not angle_delta.isNull():
+                delta = angle_delta.x() if angle_delta.x() else angle_delta.y()
+                steps = round((delta / 120.0) * self._horizontal_wheel_columns_per_notch)
+                scroll_bar.setValue(scroll_bar.value() - steps)
                 event.accept()
                 return
 
@@ -1456,6 +1651,47 @@ class ZoomableTableView(QTableView):
 # -----------------------------
 
 HIDDEN_COLUMNS_CONFIG_KEY = "visualizer_hidden_columns"
+HIDDEN_LINE_TYPES_CONFIG_KEY = "visualizer_hidden_line_types"
+
+LINE_TYPE_ORDER = ("Trips", "VTO", "RB", "RA", "SB", "SA", "VOR", "SBG", "SBA")
+LINE_TYPE_LABELS = {
+    "Trips": "Trips / normal flying",
+    "VTO": "VTO",
+    "RB": "RB",
+    "RA": "RA",
+    "SB": "SB",
+    "SA": "SA",
+    "VOR": "VOR",
+    "SBG": "SBG",
+    "SBA": "SBA",
+}
+
+
+def normalize_line_type_name(value) -> Optional[str]:
+    """Return the canonical line-type name used by the visualizer."""
+    text = str(value or "").strip().upper()
+
+    for line_type in LINE_TYPE_ORDER:
+        if text == line_type.upper():
+            return line_type
+
+    # Accept the longer user-facing label if it ever gets saved/pasted.
+    if text in {"TRIP", "TRIPS", "NORMAL FLYING", "TRIPS / NORMAL FLYING"}:
+        return "Trips"
+
+    return None
+
+
+def normalize_line_type_set(values) -> set[str]:
+    if not isinstance(values, (list, tuple, set)):
+        return set()
+
+    result: set[str] = set()
+    for value in values:
+        normalized = normalize_line_type_name(value)
+        if normalized is not None:
+            result.add(normalized)
+    return result
 
 
 class ColumnVisibilityDialog(QDialog):
@@ -1509,7 +1745,7 @@ class ColumnVisibilityDialog(QDialog):
                 border: 1px solid #D0D0D0;
             }
             QScrollBar::handle:vertical {
-                background: #9A9A9A;
+                background: #FFFFFF;
                 border: 1px solid #A8A8A8;
                 border-radius: 6px;
                 min-height: 28px;
@@ -1614,6 +1850,142 @@ class ColumnVisibilityDialog(QDialog):
 
         return hidden
 
+
+class LineTypeVisibilityDialog(QDialog):
+    """Dialog for showing/hiding rows by line type."""
+
+    def __init__(
+        self,
+        model: DataFrameTableModel,
+        *,
+        hidden_line_types: set[str],
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Hide/Show Line Types")
+        self.resize(420, 430)
+
+        self.model = model
+        self.list_widget = QListWidget(self)
+        self.list_widget.setAlternatingRowColors(False)
+        self.list_widget.setStyleSheet(
+            """
+            QListWidget {
+                background-color: #FFFFFF;
+                color: #000000;
+                border: 1px solid #B8C7D9;
+            }
+            QListWidget::item {
+                padding: 6px;
+                background-color: #FFFFFF;
+                color: #000000;
+            }
+            QListWidget::item:hover {
+                background-color: #EEF6FF;
+                color: #000000;
+            }
+            QListWidget::item:selected {
+                background-color: #D7E9FF;
+                color: #000000;
+            }
+            QScrollBar:vertical {
+                background: #FFFFFF;
+                width: 16px;
+                margin: 0px;
+                border: 1px solid #D0D0D0;
+            }
+            QScrollBar::handle:vertical {
+                background: #D9D9D9;
+                border: 1px solid #B8B8B8;
+                border-radius: 6px;
+                min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #CFCFCF;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0px;
+                border: none;
+                background: none;
+            }
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {
+                background: #FFFFFF;
+            }
+            """
+        )
+
+        counts = model.line_type_counts()
+
+        for line_type in LINE_TYPE_ORDER:
+            count = counts.get(line_type, 0)
+            label = f"{LINE_TYPE_LABELS[line_type]} ({count} row{'s' if count != 1 else ''})"
+
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, line_type)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked if line_type in hidden_line_types else Qt.Checked)
+            item.setToolTip("Checked line types are visible. Unchecked line types are hidden from the table and bid string.")
+            self.list_widget.addItem(item)
+
+        description = QLabel(
+            "Check the line types you want to see. If a row contains any unchecked "
+            "line type in its calendar cells, that row is hidden from the table and "
+            "excluded from the bid string. The DataFrame itself is not modified."
+        )
+        description.setWordWrap(True)
+
+        self.show_all_button = QPushButton("Show All Line Types")
+        self.show_all_button.clicked.connect(self.show_all_line_types)
+
+        self.deselect_all_button = QPushButton("Deselect All")
+        self.deselect_all_button.setToolTip("Hide all rows containing any listed line type")
+        self.deselect_all_button.clicked.connect(self.deselect_all_line_types)
+
+        visibility_button_layout = QHBoxLayout()
+        visibility_button_layout.addWidget(self.show_all_button)
+        visibility_button_layout.addWidget(self.deselect_all_button)
+        visibility_button_layout.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(description)
+        layout.addWidget(self.list_widget)
+        layout.addLayout(visibility_button_layout)
+        layout.addWidget(buttons)
+
+    def show_all_line_types(self):
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.flags() & Qt.ItemIsUserCheckable:
+                item.setCheckState(Qt.Checked)
+
+    def deselect_all_line_types(self):
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.flags() & Qt.ItemIsUserCheckable:
+                item.setCheckState(Qt.Unchecked)
+
+    def hidden_line_types(self) -> set[str]:
+        hidden: set[str] = set()
+
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+
+            if not (item.flags() & Qt.ItemIsUserCheckable):
+                continue
+
+            if item.checkState() != Qt.Checked:
+                line_type = normalize_line_type_name(item.data(Qt.UserRole))
+                if line_type is not None:
+                    hidden.add(line_type)
+
+        return hidden
+
 # -----------------------------
 # Viewer widget
 # -----------------------------
@@ -1654,6 +2026,9 @@ class BidSpreadsheetViewer(QWidget):
         self.theme_name = normalize_theme_name(theme)
         self.base_body_font_point_size = int(body_font_point_size)
         self.zoom_percent = max(60, min(200, int(zoom_percent)))
+
+        self._find_matches: list[tuple[int, int]] = []
+        self._find_match_index = -1
 
         self.table = ZoomableTableView(self)
         self.table.setHorizontalHeader(ColorHeaderView(Qt.Horizontal, self.table))
@@ -1729,6 +2104,28 @@ class BidSpreadsheetViewer(QWidget):
         self.columns_button.setToolTip("Show or hide optional columns")
         self.columns_button.clicked.connect(self.open_column_visibility_dialog)
 
+        self.line_types_button = QPushButton("Hide/Show Line Types...")
+        self.line_types_button.setToolTip("Show or hide rows by trip/reserve type")
+        self.line_types_button.clicked.connect(self.open_line_type_visibility_dialog)
+
+        self.find_input = QLineEdit()
+        self.find_input.setPlaceholderText("Find...")
+        self.find_input.setClearButtonEnabled(True)
+        self.find_input.setMaximumWidth(190)
+        self.find_input.textChanged.connect(self.on_find_text_changed)
+        self.find_input.returnPressed.connect(self.find_next)
+
+        self.find_previous_button = QPushButton("Previous")
+        self.find_previous_button.setToolTip("Find previous match")
+        self.find_previous_button.clicked.connect(self.find_previous)
+
+        self.find_next_button = QPushButton("Next")
+        self.find_next_button.setToolTip("Find next match")
+        self.find_next_button.clicked.connect(self.find_next)
+
+        self.find_count_label = QLabel("")
+        self.find_count_label.setMinimumWidth(70)
+
         self.move_up_button = QPushButton("Move Row Up")
         self.move_down_button = QPushButton("Move Row Down")
         self.reset_button = QPushButton("Reset Order")
@@ -1753,9 +2150,16 @@ class BidSpreadsheetViewer(QWidget):
         button_layout.addWidget(self.move_down_button)
         button_layout.addSpacing(18)
         button_layout.addWidget(self.columns_button)
+        button_layout.addWidget(self.line_types_button)
+        button_layout.addSpacing(18)
+        button_layout.addWidget(QLabel("Find:"))
+        button_layout.addWidget(self.find_input)
+        button_layout.addWidget(self.find_previous_button)
+        button_layout.addWidget(self.find_next_button)
+        button_layout.addWidget(self.find_count_label)
 
         # Keep the live status / column-visibility message beside the
-        # Hide/Show Columns button, not at the far right.
+        # Hide/Show buttons, not at the far right.
         self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         button_layout.addWidget(self.status_label, stretch=1)
 
@@ -1778,15 +2182,143 @@ class BidSpreadsheetViewer(QWidget):
         QShortcut(QKeySequence("Ctrl+="), self, activated=self.zoom_in)
         QShortcut(QKeySequence("Ctrl+-"), self, activated=self.zoom_out)
         QShortcut(QKeySequence("Ctrl+0"), self, activated=self.reset_zoom)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.focus_find_box)
+        QShortcut(QKeySequence("F3"), self, activated=self.find_next)
+        QShortcut(QKeySequence("Shift+F3"), self, activated=self.find_previous)
+        QShortcut(QKeySequence("Escape"), self.find_input, activated=self.clear_find)
 
-        self.model.layoutChanged.connect(
-            lambda: self.update_bid_string_preview(copy_to_clipboard=False)
-        )
+        self.model.layoutChanged.connect(self.on_model_layout_changed)
 
         self.apply_table_theme(self.theme_name)
         self.apply_table_sizing()
         self.apply_saved_column_visibility()
+        self.apply_saved_line_type_visibility()
         self.update_bid_string_preview(copy_to_clipboard=False)
+
+    def focus_find_box(self):
+        self.find_input.setFocus()
+        self.find_input.selectAll()
+
+    def clear_find(self):
+        self.find_input.clear()
+        self._find_matches = []
+        self._find_match_index = -1
+        self.find_count_label.setText("")
+        self.model.set_find_state("", None)
+
+    def on_find_text_changed(self, _text: str):
+        self.refresh_find_matches(select_first=False)
+
+    def refresh_find_matches(self, *, select_first: bool):
+        """Find text in the currently visible spreadsheet cells."""
+        query = self.find_input.text().strip()
+
+        self._find_matches = []
+        self._find_match_index = -1
+
+        if not query:
+            self.find_count_label.setText("")
+            self.model.set_find_state("", None)
+            return
+
+        query_lower = query.lower()
+
+        for view_row in range(self.model.rowCount()):
+            if self.table.isRowHidden(view_row):
+                continue
+
+            for col in range(self.model.columnCount()):
+                if self.table.isColumnHidden(col):
+                    continue
+
+                text = self.model.cell_display_text(view_row, col)
+                if query_lower in text.lower():
+                    self._find_matches.append((view_row, col))
+
+        if not self._find_matches:
+            self.find_count_label.setText("0 matches")
+            self.model.set_find_state(query, None)
+            return
+
+        if select_first:
+            self._find_match_index = 0
+            self.go_to_current_find_match()
+        else:
+            self.find_count_label.setText(f"{len(self._find_matches)} match{'es' if len(self._find_matches) != 1 else ''}")
+            self.model.set_find_state(query, None)
+
+    def find_next(self):
+        query = self.find_input.text().strip()
+        if not query:
+            self.focus_find_box()
+            return
+
+        # Rebuild every time so hidden rows/columns and row moves are respected.
+        current_cell = None
+        if 0 <= self._find_match_index < len(self._find_matches):
+            current_cell = self._find_matches[self._find_match_index]
+
+        self.refresh_find_matches(select_first=False)
+
+        if not self._find_matches:
+            self.status_label.setText(f'No matches found for "{query}".')
+            return
+
+        if current_cell in self._find_matches:
+            self._find_match_index = self._find_matches.index(current_cell)
+
+        self._find_match_index = (self._find_match_index + 1) % len(self._find_matches)
+        self.go_to_current_find_match()
+
+    def find_previous(self):
+        query = self.find_input.text().strip()
+        if not query:
+            self.focus_find_box()
+            return
+
+        current_cell = None
+        if 0 <= self._find_match_index < len(self._find_matches):
+            current_cell = self._find_matches[self._find_match_index]
+
+        self.refresh_find_matches(select_first=False)
+
+        if not self._find_matches:
+            self.status_label.setText(f'No matches found for "{query}".')
+            return
+
+        if current_cell in self._find_matches:
+            self._find_match_index = self._find_matches.index(current_cell)
+        elif self._find_match_index < 0:
+            self._find_match_index = 0
+
+        self._find_match_index = (self._find_match_index - 1) % len(self._find_matches)
+        self.go_to_current_find_match()
+
+    def go_to_current_find_match(self):
+        if not (0 <= self._find_match_index < len(self._find_matches)):
+            return
+
+        view_row, col = self._find_matches[self._find_match_index]
+        index = self.model.index(view_row, col)
+
+        self.model.set_find_state(self.find_input.text().strip(), (view_row, col))
+        self.table.scrollTo(index, QAbstractItemView.PositionAtCenter)
+
+        # Keep the found cell as the current index, but do not select the full
+        # row. A full-row selection paints over the yellow find highlight.
+        selection_model = self.table.selectionModel()
+        if selection_model is not None:
+            selection_model.setCurrentIndex(index, QItemSelectionModel.NoUpdate)
+            selection_model.clearSelection()
+        else:
+            self.table.setCurrentIndex(index)
+
+        self.find_count_label.setText(
+            f"{self._find_match_index + 1} of {len(self._find_matches)}"
+        )
+        self.status_label.setText(
+            f'Found "{self.find_input.text().strip()}" at row {view_row + 1}, column {self.model.column_display_name(col)}.'
+        )
 
     def zoom_factor(self) -> float:
         return self.zoom_percent / 100.0
@@ -1891,8 +2423,8 @@ class BidSpreadsheetViewer(QWidget):
                 padding: 4px;
             }}
 
-            /* Force both spreadsheet scroll bars to stay white.
-               This avoids brown/OS-theme scrollbars on some systems. */
+            /* Force spreadsheet scrollbars to avoid brown/OS-theme colors.
+               Track/background stays white; draggable handle is light gray. */
             QTableView QScrollBar:horizontal,
             QTableView QScrollBar:vertical {{
                 background: #FFFFFF;
@@ -1910,8 +2442,8 @@ class BidSpreadsheetViewer(QWidget):
 
             QTableView QScrollBar::handle:horizontal,
             QTableView QScrollBar::handle:vertical {{
-                background: #9A9A9A;
-                border: 1px solid #A8A8A8;
+                background: #D9D9D9;
+                border: 1px solid #B8B8B8;
                 border-radius: 6px;
             }}
 
@@ -1925,7 +2457,7 @@ class BidSpreadsheetViewer(QWidget):
 
             QTableView QScrollBar::handle:horizontal:hover,
             QTableView QScrollBar::handle:vertical:hover {{
-                background: #F2F2F2;
+                background: #CFCFCF;
             }}
 
             QTableView QScrollBar::add-line:horizontal,
@@ -2032,6 +2564,9 @@ class BidSpreadsheetViewer(QWidget):
             if hide_column:
                 hidden_count += 1
 
+        if hasattr(self, "find_input") and self.find_input.text().strip():
+            self.refresh_find_matches(select_first=False)
+
         return hidden_count
 
     def apply_saved_column_visibility(self):
@@ -2061,6 +2596,82 @@ class BidSpreadsheetViewer(QWidget):
             )
         else:
             self.status_label.setText("Column visibility saved. All optional columns are visible.")
+
+    def load_hidden_line_types(self) -> set[str]:
+        config = load_bid_config(self.config_path)
+        value = config.get(HIDDEN_LINE_TYPES_CONFIG_KEY, [])
+        return normalize_line_type_set(value)
+
+    def save_hidden_line_types(self, hidden_line_types: set[str]):
+        save_bid_config_value(
+            self.config_path,
+            HIDDEN_LINE_TYPES_CONFIG_KEY,
+            [line_type for line_type in LINE_TYPE_ORDER if line_type in hidden_line_types],
+        )
+
+    def apply_hidden_line_types(self, hidden_line_types: set[str]) -> int:
+        """
+        Hide rows that contain any disabled line type.
+
+        This only changes QTableView row visibility. The model DataFrame and the
+        original DataFrame remain untouched.
+        """
+        hidden_line_types = normalize_line_type_set(hidden_line_types)
+        hidden_row_count = 0
+
+        for view_row in range(self.model.rowCount()):
+            row_line_types = self.model.line_types_for_view_row(view_row)
+            hide_row = bool(row_line_types & hidden_line_types)
+            self.table.setRowHidden(view_row, hide_row)
+            if hide_row:
+                hidden_row_count += 1
+
+        if hasattr(self, "find_input") and self.find_input.text().strip():
+            self.refresh_find_matches(select_first=False)
+
+        return hidden_row_count
+
+    def apply_saved_line_type_visibility(self):
+        hidden_line_types = self.load_hidden_line_types()
+        hidden_row_count = self.apply_hidden_line_types(hidden_line_types)
+
+        if hidden_line_types:
+            hidden_labels = ", ".join(
+                line_type for line_type in LINE_TYPE_ORDER if line_type in hidden_line_types
+            )
+            self.status_label.setText(
+                f"Loaded line-type filters: hiding {hidden_labels}. {hidden_row_count} row(s) hidden."
+            )
+
+    def open_line_type_visibility_dialog(self):
+        dialog = LineTypeVisibilityDialog(
+            self.model,
+            hidden_line_types=self.load_hidden_line_types(),
+            parent=self,
+        )
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        hidden_line_types = dialog.hidden_line_types()
+        hidden_row_count = self.apply_hidden_line_types(hidden_line_types)
+        self.save_hidden_line_types(hidden_line_types)
+        self.update_bid_string_preview(copy_to_clipboard=False)
+
+        if hidden_line_types:
+            hidden_labels = ", ".join(
+                line_type for line_type in LINE_TYPE_ORDER if line_type in hidden_line_types
+            )
+            self.status_label.setText(
+                f"Line-type filters saved: hiding {hidden_labels}. {hidden_row_count} row(s) hidden."
+            )
+        else:
+            self.status_label.setText("Line-type filters saved. All line types are visible.")
+
+    def on_model_layout_changed(self):
+        """Reapply row filters after manual row reordering changes view positions."""
+        self.apply_hidden_line_types(self.load_hidden_line_types())
+        self.update_bid_string_preview(copy_to_clipboard=False)
 
     def selected_view_rows(self) -> list[int]:
         selected_rows = self.table.selectionModel().selectedRows()
@@ -2110,7 +2721,7 @@ class BidSpreadsheetViewer(QWidget):
         self.update_bid_string_preview(copy_to_clipboard=False)
 
     def update_bid_string_preview(self, *, copy_to_clipboard: bool) -> str:
-        ordered_df = self.get_view_dataframe(reset_index=True)
+        ordered_df = self.get_visible_view_dataframe(reset_index=True)
         number_of_lines = self.number_of_lines_spinbox.value()
 
         bid_string = self.bid_string_function(
@@ -2140,6 +2751,25 @@ class BidSpreadsheetViewer(QWidget):
         """Use this when you want the DataFrame in the manually arranged display order."""
         return self.model.get_view_dataframe(reset_index=reset_index)
 
+    def get_visible_view_dataframe(self, *, reset_index: bool = False) -> pd.DataFrame:
+        """
+        Return only rows currently visible in the table, in manual display order.
+
+        Hidden rows caused by line-type filters are excluded. Hidden columns are
+        not dropped because column visibility is only a display preference.
+        """
+        ordered_df = self.model.get_view_dataframe(reset_index=False)
+        visible_positions = [
+            view_row
+            for view_row in range(self.model.rowCount())
+            if not self.table.isRowHidden(view_row)
+        ]
+
+        result = ordered_df.iloc[visible_positions].copy()
+        if reset_index:
+            result = result.reset_index(drop=True)
+        return result
+
     def get_original_dataframe(self) -> pd.DataFrame:
         """Returns the exact original DataFrame object passed into the viewer."""
         return self.model.get_original_dataframe()
@@ -2166,6 +2796,9 @@ class BidSpreadsheetWindow(QMainWindow):
     def get_view_dataframe(self, *, reset_index: bool = False) -> pd.DataFrame:
         return self.viewer.get_view_dataframe(reset_index=reset_index)
 
+    def get_visible_view_dataframe(self, *, reset_index: bool = False) -> pd.DataFrame:
+        return self.viewer.get_visible_view_dataframe(reset_index=reset_index)
+
 
 # -----------------------------
 # Small test/demo
@@ -2181,7 +2814,7 @@ if __name__ == "__main__":
             "Line Number": [3, 5, 1, 7, 8, 9, 10, 19],
             "Extra Vacation Days": [0, 1, 0, 2, 0, 0, 0, 1],
             **{
-                d.date(): ["TRIP 101", "", "VTO", "TRIP 205", "", "TRIP 301", "", "TRIP 401"]
+                d.date(): ["TRIP 101", "RB", "VTO", "TRIP 205", "SA", "SBG3@ONT", "SBA@SDF", "VOR"]
                 for d in bid_dates
             },
             "Training": [80, 20, 0, 100, 50, 40, 60, 10],
