@@ -1,0 +1,43 @@
+[build-system]
+requires = [
+    "setuptools>=69",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "bid-analyzer"
+version = "0.1.0"
+description = "UPS bid analysis and sorting application"
+requires-python = ">=3.11"
+
+dependencies = [
+    "PySide6",
+    "pandas",
+    "pdfplumber",
+    "openpyxl",
+]
+
+
+[project.gui-scripts]
+bid-analyzer = "bid_analyzer.app:main"
+
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bid_analyzer*"]
+
+
+[tool.setuptools.package-data]
+"bid_analyzer.resources" = [
+    "*.csv",
+    "*.ico",
+    "*.png",
+    "*.icns",
+]
