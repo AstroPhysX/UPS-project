@@ -29,7 +29,6 @@ from __future__ import annotations
 import ctypes
 import json
 import math
-import multiprocessing
 import os
 import platform
 import queue
@@ -177,32 +176,6 @@ UPS_FIELD_BG = "#FFF8DC"
 # ---------------------------------------------------------------------------
 # PyInstaller / auto-py-to-exe resource helpers
 # ---------------------------------------------------------------------------
-
-def configure_windows_background_processes() -> None:
-    """
-    Prevent short-lived console windows when background process workers start
-    on Windows.
-
-    When running from source, multiprocessing normally launches ``python.exe``,
-    which can briefly create a console window. Using the sibling ``pythonw.exe``
-    keeps those workers windowless. Frozen/windowed builds already provide their
-    own executable, so their multiprocessing executable is left unchanged.
-    """
-    if platform.system() != "Windows":
-        return
-
-    try:
-        multiprocessing.freeze_support()
-
-        if not getattr(sys, "frozen", False):
-            pythonw_path = Path(sys.executable).with_name("pythonw.exe")
-            if pythonw_path.exists():
-                multiprocessing.set_executable(str(pythonw_path))
-    except Exception:
-        # This is a visual Windows-only improvement. It must never prevent the
-        # application from starting if a Python installation has no pythonw.exe.
-        pass
-
 
 def set_windows_app_id(app_id: str = "UPS.BidAnalyzer.App") -> None:
     """Help Windows use the app icon in the taskbar instead of the default icon."""
@@ -1255,7 +1228,6 @@ class LineTypeCriteriaListWidget(SortCriteriaListWidget):
 
 class BidGUI(QMainWindow):
     def __init__(self) -> None:
-        configure_windows_background_processes()
         set_windows_app_id()
         super().__init__()
 
@@ -3122,7 +3094,9 @@ class BidGUI(QMainWindow):
             return
 
         self.preference_refresh_pending = False
-        self.pdf_status_label.setText("Preferences changed. Refreshing analyzer columns...")
+        self.pdf_status_label.setText(
+            "Preferences changed. Refreshing analyzer columns."
+        )
         self._start_worker(self._load_worker, inputs, False)
 
     # -------------------------- Sorting criteria rows --------------------------
@@ -4539,7 +4513,6 @@ class BidGUI(QMainWindow):
             self.message_queue.put(("error", exc))
 
 if __name__ == "__main__":
-    configure_windows_background_processes()
     app = QApplication(sys.argv)
     window = BidGUI()
     window.show()

@@ -22,12 +22,14 @@ from PySide6.QtCore import (
     QRect,
     Qt,
     QTimer,
+    QUrl,
     QEasingCurve,
 )
 from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
+    QDesktopServices,
     QDrag,
     QFont,
     QFontMetrics,
@@ -56,8 +58,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QStyle,
     QStyledItemDelegate,
     QStyleOptionHeader,
+    QStyleOptionViewItem,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -1055,33 +1059,82 @@ class DataFrameTableModel(QAbstractTableModel):
 # -----------------------------
 
 class CalendarBorderDelegate(QStyledItemDelegate):
-    """Draws thick/dashed vertical date markers on top of normal table cells."""
+    """
+    Paint calendar markers while preserving the spreadsheet's data colors.
+
+    Selected rows use only a light-blue outline. Qt's normal solid selection
+    fill is deliberately suppressed because it would cover the calendar and
+    metric colors that carry meaning in this visualizer.
+    """
+
+    selection_outline = QColor("#8EC8FF")
 
     def paint(self, painter: QPainter, option, index: QModelIndex):
-        super().paint(painter, option, index)
+        is_selected = bool(option.state & QStyle.State_Selected)
+
+        # Paint the normal model-provided background and text, but remove Qt's
+        # default selection fill and focus rectangle first.
+        paint_option = QStyleOptionViewItem(option)
+        paint_option.state &= ~QStyle.State_Selected
+        paint_option.state &= ~QStyle.State_HasFocus
+        super().paint(painter, paint_option, index)
 
         model = index.model()
-        if not hasattr(model, "border_specs_for_column"):
-            return
-
-        left_spec, right_spec = model.border_specs_for_column(index.column())
-        if left_spec is None and right_spec is None:
-            return
-
         rect = option.rect.adjusted(0, 0, -1, -1)
 
-        painter.save()
+        # Draw the existing training/vacation/requested-day calendar borders.
+        if hasattr(model, "border_specs_for_column"):
+            left_spec, right_spec = model.border_specs_for_column(index.column())
 
-        if left_spec is not None:
-            pen = QPen(left_spec.color, left_spec.width)
-            pen.setStyle(left_spec.style)
-            painter.setPen(pen)
+            if left_spec is not None or right_spec is not None:
+                painter.save()
+
+                if left_spec is not None:
+                    pen = QPen(left_spec.color, left_spec.width)
+                    pen.setStyle(left_spec.style)
+                    painter.setPen(pen)
+                    painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
+
+                if right_spec is not None:
+                    pen = QPen(right_spec.color, right_spec.width)
+                    pen.setStyle(right_spec.style)
+                    painter.setPen(pen)
+                    painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
+
+                painter.restore()
+
+        if is_selected:
+            self._paint_selection_outline(painter, rect, index)
+
+    def _paint_selection_outline(self, painter: QPainter, rect: QRect, index: QModelIndex):
+        """Draw one continuous outline around the selected visible row."""
+        model = index.model()
+        first_visible_col = 0
+        last_visible_col = model.columnCount() - 1
+
+        view = self.parent()
+        if isinstance(view, QTableView):
+            visible_columns = [
+                col
+                for col in range(model.columnCount())
+                if not view.isColumnHidden(col)
+            ]
+            if visible_columns:
+                first_visible_col = visible_columns[0]
+                last_visible_col = visible_columns[-1]
+
+        painter.save()
+        painter.setPen(QPen(self.selection_outline, 2, Qt.SolidLine))
+
+        # Each selected cell contributes the top and bottom portion, creating a
+        # continuous row outline without drawing a box around every cell.
+        painter.drawLine(rect.left(), rect.top(), rect.right(), rect.top())
+        painter.drawLine(rect.left(), rect.bottom(), rect.right(), rect.bottom())
+
+        if index.column() == first_visible_col:
             painter.drawLine(rect.left(), rect.top(), rect.left(), rect.bottom())
 
-        if right_spec is not None:
-            pen = QPen(right_spec.color, right_spec.width)
-            pen.setStyle(right_spec.style)
-            painter.setPen(pen)
+        if index.column() == last_visible_col:
             painter.drawLine(rect.right(), rect.top(), rect.right(), rect.bottom())
 
         painter.restore()
@@ -1476,6 +1529,7 @@ class ZoomableTableView(QTableView):
                 )
 
     def _select_rows_moved_by_drop(self):
+        """Keep the moved rows selected using the outline-only selection style."""
         model = self.model()
         if model is None or not hasattr(model, "take_last_moved_view_rows"):
             return
@@ -1485,6 +1539,8 @@ class ZoomableTableView(QTableView):
 
         if moved_rows and hasattr(viewer, "select_rows"):
             viewer.select_rows(moved_rows)
+        elif moved_rows:
+            self.scrollTo(model.index(moved_rows[0], 0))
 
     def _selected_drag_rows(self) -> list[int]:
         selection_model = self.selectionModel()
@@ -1994,6 +2050,89 @@ class LineTypeVisibilityDialog(QDialog):
         return hidden
 
 # -----------------------------
+# Export-complete dialog
+# -----------------------------
+
+class ExportCompleteDialog(QDialog):
+    """Confirm an Excel export and offer the three useful next actions."""
+
+    def __init__(
+        self,
+        parent: QWidget,
+        output_path: Path,
+        open_file_callback: Callable[[Path], None],
+        open_folder_callback: Callable[[Path], None],
+    ):
+        super().__init__(parent)
+        self.output_path = Path(output_path)
+        self.open_file_callback = open_file_callback
+        self.open_folder_callback = open_folder_callback
+
+        self.setWindowTitle("Excel Export Complete")
+        self.setModal(True)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setMinimumWidth(680)
+
+        title = QLabel("Excel file saved successfully.")
+        title_font = QFont(title.font())
+        title_font.setBold(True)
+        title_font.setPointSize(max(11, title_font.pointSize() + 1))
+        title.setFont(title_font)
+
+        description = QLabel("The current spreadsheet view was exported to:")
+
+        path_entry = QLineEdit(str(self.output_path))
+        path_entry.setReadOnly(True)
+        path_entry.setCursorPosition(0)
+        path_entry.setToolTip(str(self.output_path))
+
+        open_file_button = QPushButton("Open Excel File")
+        open_file_button.setDefault(True)
+        open_file_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #198754;
+                color: #FFFFFF;
+                border: 1px solid #146C43;
+                border-radius: 5px;
+                padding: 7px 14px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: #157347; }
+            QPushButton:pressed { background-color: #0F5132; }
+            """
+        )
+
+        open_folder_button = QPushButton("Open File Location")
+        close_button = QPushButton("Close")
+
+        open_file_button.clicked.connect(self._open_file)
+        open_folder_button.clicked.connect(self._open_folder)
+        close_button.clicked.connect(self.accept)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(open_file_button)
+        buttons.addWidget(open_folder_button)
+        buttons.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(title)
+        layout.addWidget(description)
+        layout.addWidget(path_entry)
+        layout.addSpacing(8)
+        layout.addLayout(buttons)
+
+    def _open_file(self):
+        self.open_file_callback(self.output_path)
+        self.accept()
+
+    def _open_folder(self):
+        self.open_folder_callback(self.output_path)
+        self.accept()
+
+
+# -----------------------------
 # Viewer widget
 # -----------------------------
 
@@ -2083,6 +2222,28 @@ class BidSpreadsheetViewer(QWidget):
         self.export_excel_button.setToolTip(
             "Export the current row order and only the rows/columns presently visible"
         )
+        self.export_excel_button.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #198754;
+                color: #FFFFFF;
+                border: 1px solid #146C43;
+                border-radius: 5px;
+                padding: 6px 14px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #157347;
+            }
+            QPushButton:pressed {
+                background-color: #0F5132;
+            }
+            QPushButton:disabled {
+                background-color: #7FAF91;
+                color: #E8E8E8;
+            }
+            """
+        )
         self.export_excel_button.clicked.connect(self.export_current_view_to_excel)
 
         self.number_of_lines_spinbox = QSpinBox()
@@ -2151,13 +2312,16 @@ class BidSpreadsheetViewer(QWidget):
         bid_layout.addWidget(QLabel("Lines to bid:"))
         bid_layout.addWidget(self.number_of_lines_spinbox)
         bid_layout.addWidget(self.copy_bid_button)
-        bid_layout.addWidget(self.export_excel_button)
         bid_layout.addWidget(QLabel("Bid string:"))
         bid_layout.addWidget(self.bid_string_preview, stretch=1)
 
-        # Put Reset Order where the old Theme dropdown used to be.
+        # Keep the less frequently used controls together on the right.
         bid_layout.addWidget(self.reset_button)
         bid_layout.addWidget(self.theme_button)
+
+        # Export is intentionally the green, far-right action button.
+        bid_layout.addSpacing(12)
+        bid_layout.addWidget(self.export_excel_button)
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.move_up_button)
@@ -2191,6 +2355,7 @@ class BidSpreadsheetViewer(QWidget):
 
         QShortcut(QKeySequence("Alt+Up"), self, activated=self.move_selected_rows_up)
         QShortcut(QKeySequence("Alt+Down"), self, activated=self.move_selected_rows_down)
+        QShortcut(QKeySequence("Esc"), self, activated=self.clear_table_selection)
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self.copy_bid_string)
         QShortcut(QKeySequence("Ctrl++"), self, activated=self.zoom_in)
         QShortcut(QKeySequence("Ctrl+="), self, activated=self.zoom_in)
@@ -2428,10 +2593,6 @@ class BidSpreadsheetViewer(QWidget):
                 alternate-background-color: {theme_data.alternate_background.name()};
                 color: {theme_data.text.name()};
                 gridline-color: {theme_data.grid.name()};
-            }}
-            QTableView::item:selected {{
-                background-color: {theme_data.selection_background.name()};
-                color: {theme_data.selection_text.name()};
             }}
             QHeaderView::section {{
                 padding: 4px;
@@ -2715,6 +2876,22 @@ class BidSpreadsheetViewer(QWidget):
         selection_model.select(selection, QItemSelectionModel.Select | QItemSelectionModel.Rows)
         self.table.scrollTo(self.model.index(rows[0], 0))
 
+    def clear_table_selection(self):
+        """Clear both the selected row and Qt's current-cell focus marker."""
+        selection_model = self.table.selectionModel()
+        if selection_model is not None:
+            selection_model.clearSelection()
+            selection_model.setCurrentIndex(QModelIndex(), QItemSelectionModel.NoUpdate)
+
+        self.table.clearSelection()
+        self.table.setCurrentIndex(QModelIndex())
+        self.table.viewport().update()
+
+    def _scroll_to_first_row(self, rows: Iterable[int]):
+        rows = sorted(set(rows))
+        if rows:
+            self.table.scrollTo(self.model.index(rows[0], 0))
+
     def move_selected_rows_up(self):
         rows = self.selected_view_rows()
         new_rows = self.model.move_rows_up(rows)
@@ -2840,6 +3017,24 @@ class BidSpreadsheetViewer(QWidget):
 
         return base_folder / "Master Lines.xlsx"
 
+    def _open_local_path(self, path: Path, description: str):
+        """Open a local file or folder with the operating system's default app."""
+        resolved_path = Path(path).expanduser().resolve()
+        opened = QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved_path)))
+
+        if not opened:
+            QMessageBox.warning(
+                self,
+                f"Could not open {description}",
+                f"The {description} could not be opened automatically:\n{resolved_path}",
+            )
+
+    def open_exported_excel_file(self, output_path: Path):
+        self._open_local_path(Path(output_path), "Excel file")
+
+    def open_exported_excel_folder(self, output_path: Path):
+        self._open_local_path(Path(output_path).parent, "file location")
+
     def export_current_view_to_excel(self):
         """Export exactly the rows and columns currently visible in the viewer."""
         default_path = self.default_excel_export_path()
@@ -2891,11 +3086,13 @@ class BidSpreadsheetViewer(QWidget):
             f"Exported {len(export_df)} visible row(s) and "
             f"{len(export_df.columns)} visible column(s) to Excel."
         )
-        QMessageBox.information(
+        resolved_output_path = Path(output_path).expanduser().resolve()
+        ExportCompleteDialog(
             self,
-            "Excel Export Complete",
-            f"The current spreadsheet view was exported to:\n{output_path}",
-        )
+            resolved_output_path,
+            self.open_exported_excel_file,
+            self.open_exported_excel_folder,
+        ).exec()
 
     def get_original_dataframe(self) -> pd.DataFrame:
         """Returns the exact original DataFrame object passed into the viewer."""

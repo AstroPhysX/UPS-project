@@ -1,0 +1,14 @@
+Create a python environment:
+python -m venv /path/to/new/virtual/environment
+
+Activate that environment:
+- Linux
+   source venv/bin/activate
+- windows
+   .\venv\Scripts\Activate.ps1
+
+Then once the environment is activated run:
+python -m pip install -e .
+
+To run the program use:
+python -m bid_analyzer
