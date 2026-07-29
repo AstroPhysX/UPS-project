@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 from bid_analyzer.core.processing_functions import line_numbers_to_bid_string
+from bid_analyzer.core.export_to_excel import export_master_lines_to_excel_table
 
 import pandas as pd
 
@@ -44,6 +45,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -181,6 +183,11 @@ def excel_width_to_pixels(width: int | float) -> int:
     This keeps your existing Excel numbers useful in the GUI.
     """
     return int((float(width) * 7) + 12)
+
+
+def pixels_to_excel_width(pixels: int | float) -> float:
+    """Approximate inverse of excel_width_to_pixels()."""
+    return max(2.0, (float(pixels) - 12.0) / 7.0)
 
 
 def contiguous_ranges(rows: Iterable[int]) -> list[tuple[int, int]]:
@@ -2072,6 +2079,12 @@ class BidSpreadsheetViewer(QWidget):
         self.copy_bid_button = QPushButton("Copy Bid String")
         self.copy_bid_button.clicked.connect(self.copy_bid_string)
 
+        self.export_excel_button = QPushButton("Export Current View")
+        self.export_excel_button.setToolTip(
+            "Export the current row order and only the rows/columns presently visible"
+        )
+        self.export_excel_button.clicked.connect(self.export_current_view_to_excel)
+
         self.number_of_lines_spinbox = QSpinBox()
         self.number_of_lines_spinbox.setMinimum(1)
         self.number_of_lines_spinbox.setMaximum(9999)
@@ -2138,6 +2151,7 @@ class BidSpreadsheetViewer(QWidget):
         bid_layout.addWidget(QLabel("Lines to bid:"))
         bid_layout.addWidget(self.number_of_lines_spinbox)
         bid_layout.addWidget(self.copy_bid_button)
+        bid_layout.addWidget(self.export_excel_button)
         bid_layout.addWidget(QLabel("Bid string:"))
         bid_layout.addWidget(self.bid_string_preview, stretch=1)
 
@@ -2756,7 +2770,8 @@ class BidSpreadsheetViewer(QWidget):
         Return only rows currently visible in the table, in manual display order.
 
         Hidden rows caused by line-type filters are excluded. Hidden columns are
-        not dropped because column visibility is only a display preference.
+        intentionally retained because this method is also used to build the bid
+        string and older callers may expect every DataFrame column.
         """
         ordered_df = self.model.get_view_dataframe(reset_index=False)
         visible_positions = [
@@ -2769,6 +2784,118 @@ class BidSpreadsheetViewer(QWidget):
         if reset_index:
             result = result.reset_index(drop=True)
         return result
+
+    def visible_column_indices(self) -> list[int]:
+        """Return model-column positions currently visible in the QTableView."""
+        return [
+            col
+            for col in range(self.model.columnCount())
+            if not self.table.isColumnHidden(col)
+        ]
+
+    def get_export_dataframe(self, *, reset_index: bool = True) -> pd.DataFrame:
+        """
+        Build an exact export snapshot of the current spreadsheet view.
+
+        The result preserves the manually arranged row order and removes both:
+          - rows hidden by the line-type filter;
+          - columns hidden through Hide/Show Columns.
+
+        Search highlighting, selected cells, and scroll position are temporary UI
+        state and are intentionally not written into Excel.
+        """
+        visible_rows_df = self.get_visible_view_dataframe(reset_index=False)
+        visible_columns = self.visible_column_indices()
+        result = visible_rows_df.iloc[:, visible_columns].copy()
+
+        if reset_index:
+            result = result.reset_index(drop=True)
+
+        return result
+
+    def get_export_column_widths(self) -> list[float]:
+        """Return current visible column widths in approximate Excel units."""
+        zoom = self.zoom_factor() or 1.0
+        widths: list[float] = []
+
+        for col in self.visible_column_indices():
+            unzoomed_pixels = self.table.columnWidth(col) / zoom
+            widths.append(round(pixels_to_excel_width(unzoomed_pixels), 2))
+
+        return widths
+
+    def default_excel_export_path(self) -> Path:
+        config = load_bid_config(self.config_path)
+        saved = config.get("last_excel_export_path")
+
+        if saved:
+            path = Path(str(saved))
+            if path.suffix.lower() != ".xlsx":
+                path = path.with_suffix(".xlsx")
+            return path
+
+        base_folder = self.config_path.parent
+        if str(base_folder) in {"", "."}:
+            base_folder = Path.cwd()
+
+        return base_folder / "Master Lines.xlsx"
+
+    def export_current_view_to_excel(self):
+        """Export exactly the rows and columns currently visible in the viewer."""
+        default_path = self.default_excel_export_path()
+
+        output_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Current Spreadsheet View",
+            str(default_path),
+            "Excel Workbook (*.xlsx)",
+        )
+
+        if not output_path:
+            return
+
+        if not output_path.lower().endswith(".xlsx"):
+            output_path += ".xlsx"
+
+        try:
+            export_df = self.get_export_dataframe(reset_index=True)
+
+            export_master_lines_to_excel_table(
+                export_df,
+                output_path,
+                calendar_cols=[
+                    column
+                    for column in export_df.columns
+                    if normalize_date(column) is not None
+                ],
+                training_start=self.model.training_start,
+                training_end=self.model.training_end,
+                vacation_ranges=self.model.vacation_ranges,
+                requested_days_off_dates=self.model.requested_days_off_dates,
+                requested_days_off_ranges=self.model.requested_days_off_ranges,
+                theme=self.theme_name,
+                calendar_col_width=self.calendar_col_width,
+                calendar_row_height=self.calendar_row_height,
+                header_row_height=self.header_row_height,
+                non_calendar_max_width=self.non_calendar_max_width,
+                body_font_size=self.base_body_font_point_size,
+                column_widths=self.get_export_column_widths(),
+                sheet_zoom=self.zoom_percent,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not export Excel file", str(exc))
+            return
+
+        save_bid_config_value(self.config_path, "last_excel_export_path", output_path)
+        self.status_label.setText(
+            f"Exported {len(export_df)} visible row(s) and "
+            f"{len(export_df.columns)} visible column(s) to Excel."
+        )
+        QMessageBox.information(
+            self,
+            "Excel Export Complete",
+            f"The current spreadsheet view was exported to:\n{output_path}",
+        )
 
     def get_original_dataframe(self) -> pd.DataFrame:
         """Returns the exact original DataFrame object passed into the viewer."""
@@ -2789,6 +2916,13 @@ class BidSpreadsheetWindow(QMainWindow):
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
 
+        export_action = QAction("Export Current View to Excel...", self)
+        export_action.setShortcut(QKeySequence("Ctrl+Shift+E"))
+        export_action.triggered.connect(self.viewer.export_current_view_to_excel)
+        file_menu.addAction(export_action)
+
+        file_menu.addSeparator()
+
         close_action = QAction("Close", self)
         close_action.triggered.connect(self.close)
         file_menu.addAction(close_action)
@@ -2798,6 +2932,12 @@ class BidSpreadsheetWindow(QMainWindow):
 
     def get_visible_view_dataframe(self, *, reset_index: bool = False) -> pd.DataFrame:
         return self.viewer.get_visible_view_dataframe(reset_index=reset_index)
+
+    def get_export_dataframe(self, *, reset_index: bool = True) -> pd.DataFrame:
+        return self.viewer.get_export_dataframe(reset_index=reset_index)
+
+    def export_current_view_to_excel(self):
+        return self.viewer.export_current_view_to_excel()
 
 
 # -----------------------------

@@ -494,7 +494,18 @@ class AnalysisPipeline:
         pf.add_line_type_preference_scores(
             master_lines,
             inputs["line_type_preference_order"],
-            power_law_coeff=3,
+            power_law_coeff=float(
+                inputs.get("line_type_priority_emphasis", 3.0)
+            ),
+            top_score=float(
+                inputs.get("line_type_top_score", 100.0)
+            ),
+            bottom_score=float(
+                inputs.get("line_type_bottom_score", 10.0)
+            ),
+            disabled_score=float(
+                inputs.get("line_type_disabled_score", 0.0)
+            ),
         )
 
         self._log("Adding estimated pay...")

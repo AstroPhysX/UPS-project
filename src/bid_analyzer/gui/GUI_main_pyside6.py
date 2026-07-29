@@ -29,6 +29,7 @@ from __future__ import annotations
 import ctypes
 import json
 import math
+import multiprocessing
 import os
 import platform
 import queue
@@ -68,9 +69,12 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -108,7 +112,25 @@ LINE_TYPE_CODES = [
     "VOR",
 ]
 
+# User-facing descriptions. The short codes above remain the values saved to
+# bid_config.json and passed into processing_functions.
+LINE_TYPE_DISPLAY_LABELS = {
+    "TRIPS": "TRIPS",
+    "VTO": "VTO (Rebuilt Trips)",
+    "RA": "RA (Reserve 00–12)",
+    "RB": "RB (Reserve 12–24)",
+    "SA": "SA (Standby 00–12)",
+    "SB": "SB (Standby 12–24)",
+    "SBA": "SBA (Standby Airport on-base)",
+    "SBG": "SBG (Standby Airport off-base)",
+    "VOR": "VOR (Rebuilt Reserves)",
+}
+
 DEFAULT_LINE_TYPE_PREFERENCE_ORDER = list(LINE_TYPE_CODES)
+DEFAULT_LINE_TYPE_PRIORITY_EMPHASIS = 3.0
+DEFAULT_LINE_TYPE_TOP_SCORE = 100.0
+DEFAULT_LINE_TYPE_BOTTOM_SCORE = 5.0
+DEFAULT_LINE_TYPE_DISABLED_SCORE = 0.0
 
 MIN_SORT_CRITERIA_ROWS = 3
 
@@ -155,6 +177,32 @@ UPS_FIELD_BG = "#FFF8DC"
 # ---------------------------------------------------------------------------
 # PyInstaller / auto-py-to-exe resource helpers
 # ---------------------------------------------------------------------------
+
+def configure_windows_background_processes() -> None:
+    """
+    Prevent short-lived console windows when background process workers start
+    on Windows.
+
+    When running from source, multiprocessing normally launches ``python.exe``,
+    which can briefly create a console window. Using the sibling ``pythonw.exe``
+    keeps those workers windowless. Frozen/windowed builds already provide their
+    own executable, so their multiprocessing executable is left unchanged.
+    """
+    if platform.system() != "Windows":
+        return
+
+    try:
+        multiprocessing.freeze_support()
+
+        if not getattr(sys, "frozen", False):
+            pythonw_path = Path(sys.executable).with_name("pythonw.exe")
+            if pythonw_path.exists():
+                multiprocessing.set_executable(str(pythonw_path))
+    except Exception:
+        # This is a visual Windows-only improvement. It must never prevent the
+        # application from starting if a Python installation has no pythonw.exe.
+        pass
+
 
 def set_windows_app_id(app_id: str = "UPS.BidAnalyzer.App") -> None:
     """Help Windows use the app icon in the taskbar instead of the default icon."""
@@ -695,8 +743,6 @@ class NoInternalScrollListWidget(QListWidget):
     """Compact list that shows every item and lets the page handle scrolling."""
 
     def wheelEvent(self, event: Any) -> None:
-        # Do not scroll the line-type list internally. Let the outer page receive
-        # the wheel event instead.
         event.ignore()
 
     def resize_to_all_items(self) -> None:
@@ -713,6 +759,64 @@ class NoInternalScrollListWidget(QListWidget):
         content_height = row_height * count + spacing * max(0, count - 1)
         frame_height = self.frameWidth() * 2
         self.setFixedHeight(content_height + frame_height + 6)
+
+
+class FlatReorderTreeWidget(QTreeWidget):
+    """A flat tree whose rows can be reordered but never nested as children."""
+
+    orderChanged = Signal()
+
+    def dropEvent(self, event: Any) -> None:
+        source_item = self.currentItem()
+        if source_item is None:
+            event.ignore()
+            return
+
+        source_index = self.indexOfTopLevelItem(source_item)
+        if source_index < 0:
+            event.ignore()
+            return
+
+        point = event.position().toPoint()
+        target_item = self.itemAt(point)
+
+        if target_item is None:
+            destination = self.topLevelItemCount()
+        else:
+            destination = self.indexOfTopLevelItem(target_item)
+            if destination < 0:
+                event.ignore()
+                return
+            if point.y() > self.visualItemRect(target_item).center().y():
+                destination += 1
+
+        # QTreeWidget does not reliably preserve item widgets when an item is
+        # removed and reinserted. Keep them explicitly so the Priority method
+        # combo box moves with the line-type row.
+        cell_widgets = [
+            self.itemWidget(source_item, column)
+            for column in range(self.columnCount())
+        ]
+
+        moved_item = self.takeTopLevelItem(source_index)
+        if moved_item is None:
+            event.ignore()
+            return
+
+        if source_index < destination:
+            destination -= 1
+        destination = max(0, min(destination, self.topLevelItemCount()))
+        self.insertTopLevelItem(destination, moved_item)
+
+        for column, widget in enumerate(cell_widgets):
+            if widget is not None:
+                self.setItemWidget(moved_item, column, widget)
+
+        self.setCurrentItem(moved_item)
+
+        event.setDropAction(Qt.MoveAction)
+        event.accept()
+        self.orderChanged.emit()
 
 
 SORT_ROW_MIME_TYPE = "application/x-ups-sort-criterion-row"
@@ -1134,12 +1238,24 @@ class SortCriteriaDragHandle(QWidget):
         super().mouseReleaseEvent(event)
 
 
+class LineTypeCriteriaListWidget(SortCriteriaListWidget):
+    """Sorting-style card container used by the nested line-type sub-sort."""
+
+    def _create_placeholder(self, source_widget: QWidget) -> QFrame:
+        placeholder = super()._create_placeholder(source_widget)
+        label = placeholder.findChild(QLabel)
+        if label is not None:
+            label.setText("Release to place line type")
+        return placeholder
+
+
 # ---------------------------------------------------------------------------
 # Main GUI
 # ---------------------------------------------------------------------------
 
 class BidGUI(QMainWindow):
     def __init__(self) -> None:
+        configure_windows_background_processes()
         set_windows_app_id()
         super().__init__()
 
@@ -1248,7 +1364,7 @@ class BidGUI(QMainWindow):
                 font-size: 11pt;
                 font-weight: bold;
             }}
-            QLineEdit, QDoubleSpinBox, QTextEdit, QListWidget, QTableWidget, QComboBox {{
+            QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QListWidget, QTableWidget, QComboBox {{
                 background: white;
                 color: black;
                 selection-background-color: {UPS_BLUE};
@@ -1312,6 +1428,44 @@ class BidGUI(QMainWindow):
             QWidget#SortCriteriaList {{
                 background: transparent;
                 border: none;
+            }}
+            QFrame#LineTypeNestedGuide {{
+                background-color: {UPS_GOLD};
+                border: none;
+                border-radius: 1px;
+            }}
+            QFrame#LineTypeScoringPanel {{
+                background: transparent;
+                border: none;
+            }}
+            QLabel#LineTypeScoringTitle {{
+                color: #FFB500;
+                font-size: 11pt;
+                font-weight: bold;
+            }}
+            QLabel#LineTypeScoringStatus {{
+                color: #F0E3D5;
+                font-style: italic;
+            }}
+            QLabel#LineTypeScoringHint {{
+                color: #E7D8CA;
+                background-color: #4B2618;
+                border: 1px dashed #8A5A3D;
+                border-radius: 6px;
+                padding: 7px 10px;
+            }}
+            QLabel#LineTypeValueLabel {{
+                color: {UPS_GOLD};
+                background: transparent;
+                border: none;
+                padding: 3px 7px;
+                font-weight: bold;
+                font-size: 10.5pt;
+            }}
+            QLabel#LineTypeSubsortHeader {{
+                color: {UPS_TEXT};
+                font-size: 10.5pt;
+                font-weight: bold;
             }}
             QWidget#SortCriterionCard {{
                 background-color: {UPS_BROWN_2};
@@ -1440,7 +1594,6 @@ class BidGUI(QMainWindow):
         self._build_preferences_section(container)
         self._build_sorting_section(container)
         self._build_bid_string_section(container)
-        self._build_output_section(container)
         self._build_action_section(container)
         self._build_status_section(container)
 
@@ -1632,10 +1785,6 @@ class BidGUI(QMainWindow):
         training_layout.addWidget(self.training_end_entry)
         training_layout.addStretch(1)
 
-        self.bid_edge_combo = QComboBox()
-        self.bid_edge_combo.addItems(["none", "start", "end", "both"])
-        self.bid_edge_combo.currentTextChanged.connect(lambda _text: self._on_bid_edge_changed())
-
         self.hourly_rate_edit = QDoubleSpinBox()
         self.hourly_rate_edit.setPrefix("$")
         self.hourly_rate_edit.setDecimals(2)
@@ -1647,52 +1796,14 @@ class BidGUI(QMainWindow):
 
         left_grid.addWidget(QLabel("Training dates:"), 0, 0)
         left_grid.addWidget(training_row, 0, 1)
-        left_grid.addWidget(QLabel("Bid edge days off:"), 1, 0)
-        left_grid.addWidget(self.bid_edge_combo, 1, 1, alignment=Qt.AlignLeft)
-        left_grid.addWidget(QLabel("Hourly pay rate:"), 2, 0)
-        left_grid.addWidget(self.hourly_rate_edit, 2, 1, alignment=Qt.AlignLeft)
-        left_grid.setRowStretch(3, 1)
+        left_grid.addWidget(QLabel("Hourly pay rate:"), 1, 0)
+        left_grid.addWidget(self.hourly_rate_edit, 1, 1, alignment=Qt.AlignLeft)
+        left_grid.setRowStretch(2, 1)
 
-        right_preferences = QWidget()
-        right_grid = QGridLayout(right_preferences)
-        right_grid.setContentsMargins(0, 0, 0, 0)
-        right_grid.setHorizontalSpacing(10)
-
-        self.line_type_preference_list = NoInternalScrollListWidget()
-        self.line_type_preference_list.setObjectName("LineTypePreferenceList")
-        self.line_type_preference_list.setSpacing(1)
-        self.line_type_preference_list.setMinimumWidth(145)
-        self.line_type_preference_list.setMaximumWidth(180)
-        self.line_type_preference_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.line_type_preference_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.line_type_preference_list.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.line_type_preference_list.setDragEnabled(True)
-        self.line_type_preference_list.viewport().setAcceptDrops(True)
-        self.line_type_preference_list.setDropIndicatorShown(True)
-        self.line_type_preference_list.setDragDropMode(QAbstractItemView.InternalMove)
-        self.line_type_preference_list.setDefaultDropAction(Qt.MoveAction)
-        self.line_type_preference_list.setDragDropOverwriteMode(False)
-        self.line_type_preference_list.model().rowsMoved.connect(
-            lambda *_args: self._line_type_preference_changed()
-        )
-
-        line_type_controls = QVBoxLayout()
-        reset_type_order = QPushButton("Reset order")
-        reset_type_order.clicked.connect(self._reset_line_type_preference_order)
-        line_type_controls.addWidget(reset_type_order)
-        line_type_controls.addStretch(1)
-
-        line_type_help = QLabel("Drag items to reorder.\nTop = most preferred.")
-        line_type_help.setWordWrap(True)
-        line_type_help.setMaximumWidth(170)
-
-        right_grid.addWidget(QLabel("Line-type preference order:"), 0, 0, alignment=Qt.AlignTop)
-        right_grid.addWidget(self.line_type_preference_list, 0, 1, 2, 1)
-        right_grid.addLayout(line_type_controls, 0, 2, 2, 1)
-        right_grid.addWidget(line_type_help, 1, 0, alignment=Qt.AlignTop)
-
+        # Line-type scoring is configured contextually inside the Sorting
+        # section, where it is only shown when that score is actually selected.
         lower_layout.addWidget(left_preferences, 1)
-        lower_layout.addWidget(right_preferences, 1)
+        lower_layout.addStretch(1)
         main_layout.addWidget(lower_area)
 
         container.addWidget(prefs_frame)
@@ -1755,18 +1866,23 @@ class BidGUI(QMainWindow):
         drag_header.setFixedWidth(24)
 
         number_header = QLabel("#")
+        number_header.setObjectName("LineTypeSubsortHeader")
         number_header.setFixedWidth(28)
         number_header.setAlignment(Qt.AlignCenter)
 
         column_header = QLabel("Sort by")
+        column_header.setObjectName("LineTypeSubsortHeader")
         direction_header = QLabel("Direction")
+        direction_header.setObjectName("LineTypeSubsortHeader")
         mode_header = QLabel("Priority method")
+        mode_header.setObjectName("LineTypeSubsortHeader")
         contribution_header = QLabel("Contribution")
+        contribution_header.setObjectName("LineTypeSubsortHeader")
         contribution_header.setAlignment(Qt.AlignCenter)
 
         column_header.setFixedWidth(245)
         direction_header.setFixedWidth(130)
-        mode_header.setFixedWidth(155)
+        mode_header.setFixedWidth(225)
         contribution_header.setFixedWidth(100)
 
         header_layout.addWidget(drag_header)
@@ -1789,6 +1905,148 @@ class BidGUI(QMainWindow):
         self.sort_rows_list.orderCommitted.connect(self._on_sort_rows_reordered)
         self.sort_rows_list.orderCancelled.connect(self._on_sort_rows_previewed)
 
+        # Contextual Line Type sub-sort. It is hidden unless an active sorting
+        # criterion selects the line-type preference score. The editor sits
+        # below the sorting action buttons and uses the same visual language as
+        # the main sorting rows, while remaining slightly indented.
+        self.line_type_scoring_hint = QLabel(
+            "Select Line Type Preference in a Sort by row to open its sub-sort."
+        )
+        self.line_type_scoring_hint.setObjectName("LineTypeScoringHint")
+        self.line_type_scoring_hint.setWordWrap(True)
+
+        self.line_type_scoring_panel = QFrame()
+        self.line_type_scoring_panel.setObjectName("LineTypeScoringPanel")
+        line_type_panel_layout = QVBoxLayout(self.line_type_scoring_panel)
+        line_type_panel_layout.setContentsMargins(0, 2, 0, 0)
+        line_type_panel_layout.setSpacing(7)
+
+        line_type_title_row = QHBoxLayout()
+        line_type_title_area = QVBoxLayout()
+        line_type_title_area.setSpacing(1)
+        line_type_title = QLabel("Line Type preference sub-sort")
+        line_type_title.setObjectName("LineTypeScoringTitle")
+        self.line_type_scoring_status = QLabel()
+        self.line_type_scoring_status.setObjectName("LineTypeScoringStatus")
+        self.line_type_scoring_status.setWordWrap(True)
+        line_type_title_area.addWidget(line_type_title)
+        line_type_title_area.addWidget(self.line_type_scoring_status)
+        line_type_title_row.addLayout(line_type_title_area, 1)
+
+
+        line_type_emphasis_widget = QWidget()
+        line_type_emphasis_layout = QHBoxLayout(line_type_emphasis_widget)
+        line_type_emphasis_layout.setContentsMargins(0, 0, 0, 0)
+        line_type_emphasis_layout.setSpacing(8)
+        line_type_emphasis_label = QLabel("Preference emphasis:")
+        self.line_type_priority_emphasis_spin = QDoubleSpinBox()
+        self.line_type_priority_emphasis_spin.setDecimals(2)
+        self.line_type_priority_emphasis_spin.setRange(0.05, 100.0)
+        self.line_type_priority_emphasis_spin.setSingleStep(0.25)
+        self.line_type_priority_emphasis_spin.setValue(
+            DEFAULT_LINE_TYPE_PRIORITY_EMPHASIS
+        )
+        self.line_type_priority_emphasis_spin.setMaximumWidth(95)
+        self.line_type_priority_emphasis_spin.setToolTip(
+            "Bigger values separate the highest line-type preferences more strongly."
+        )
+        self.line_type_priority_emphasis_spin.valueChanged.connect(
+            self._on_line_type_priority_emphasis_changed
+        )
+        line_type_emphasis_help = QLabel(
+            "Bigger numbers favor the highest line types more strongly.\n"
+            "Smaller numbers keep lower line types closer to the top."
+        )
+        line_type_emphasis_help.setWordWrap(True)
+        line_type_emphasis_layout.addWidget(line_type_emphasis_label)
+        line_type_emphasis_layout.addWidget(self.line_type_priority_emphasis_spin)
+        line_type_emphasis_layout.addWidget(line_type_emphasis_help, 1)
+
+        line_type_header_widget = QWidget()
+        line_type_header_layout = QHBoxLayout(line_type_header_widget)
+        line_type_header_layout.setContentsMargins(0, 0, 0, 0)
+        line_type_header_layout.setSpacing(8)
+
+        line_type_drag_header = QLabel("")
+        line_type_drag_header.setFixedWidth(24)
+        line_type_number_header = QLabel("#")
+        line_type_number_header.setObjectName("LineTypeSubsortHeader")
+        line_type_number_header.setFixedWidth(28)
+        line_type_number_header.setAlignment(Qt.AlignCenter)
+        line_type_on_header = QLabel("On / Off")
+        line_type_on_header.setObjectName("LineTypeSubsortHeader")
+        line_type_on_header.setFixedWidth(76)
+        line_type_on_header.setAlignment(Qt.AlignCenter)
+        line_type_name_header = QLabel("Line type")
+        line_type_name_header.setObjectName("LineTypeSubsortHeader")
+        line_type_name_header.setFixedWidth(320)
+        line_type_equal_header = QLabel("Same as previous")
+        line_type_equal_header.setObjectName("LineTypeSubsortHeader")
+        line_type_equal_header.setFixedWidth(160)
+        line_type_equal_header.setAlignment(Qt.AlignCenter)
+        line_type_score_header = QLabel("Score")
+        line_type_score_header.setObjectName("LineTypeSubsortHeader")
+        line_type_score_header.setFixedWidth(100)
+        line_type_score_header.setAlignment(Qt.AlignCenter)
+
+        line_type_header_layout.addWidget(line_type_drag_header)
+        line_type_header_layout.addWidget(line_type_number_header)
+        line_type_header_layout.addWidget(line_type_on_header)
+        line_type_header_layout.addWidget(line_type_name_header)
+        line_type_header_layout.addWidget(line_type_equal_header)
+        line_type_header_layout.addWidget(line_type_score_header)
+        line_type_header_layout.addStretch(1)
+
+        self.line_type_rows_list = LineTypeCriteriaListWidget()
+        self.line_type_rows_list.setObjectName("SortCriteriaList")
+        self.line_type_rows_list.setSpacing(5)
+        self.line_type_rows_list.orderPreviewed.connect(
+            self._on_line_type_preferences_previewed
+        )
+        self.line_type_rows_list.orderCommitted.connect(
+            self._on_line_type_preferences_reordered
+        )
+        self.line_type_rows_list.orderCancelled.connect(
+            self._on_line_type_preferences_previewed
+        )
+
+        self.line_type_preference_rows: list[dict[str, Any]] = []
+        self._line_type_row_by_id: dict[int, dict[str, Any]] = {}
+        self._next_line_type_row_id = 1
+        self._updating_line_type_rows = False
+
+        line_type_controls = QHBoxLayout()
+        reset_line_types_button = QPushButton("Reset line types")
+        reset_line_types_button.clicked.connect(self._reset_line_type_preferences)
+        line_type_controls.addWidget(reset_line_types_button)
+        line_type_controls.addStretch(1)
+
+        line_type_panel_layout.addLayout(line_type_title_row)
+        line_type_panel_layout.addWidget(line_type_emphasis_widget)
+        line_type_panel_layout.addWidget(line_type_header_widget)
+        line_type_panel_layout.addWidget(self.line_type_rows_list)
+        line_type_panel_layout.addLayout(line_type_controls)
+
+        # Indented nested container with a gold guide line. This gives the
+        # visual hierarchy of a sub-sort without inserting a large editor into
+        # a draggable parent row.
+        self.line_type_scoring_container = QWidget()
+        nested_layout = QHBoxLayout(self.line_type_scoring_container)
+        nested_layout.setContentsMargins(34, 2, 0, 0)
+        nested_layout.setSpacing(8)
+        nested_guide = QFrame()
+        nested_guide.setObjectName("LineTypeNestedGuide")
+        nested_guide.setFixedWidth(3)
+        nested_guide.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        nested_content = QWidget()
+        nested_content_layout = QVBoxLayout(nested_content)
+        nested_content_layout.setContentsMargins(0, 0, 0, 0)
+        nested_content_layout.setSpacing(6)
+        nested_content_layout.addWidget(self.line_type_scoring_hint)
+        nested_content_layout.addWidget(self.line_type_scoring_panel)
+        nested_layout.addWidget(nested_guide)
+        nested_layout.addWidget(nested_content, 1)
+
         controls = QHBoxLayout()
         add_criterion_button = QPushButton("Add sorting criterion")
         clear_criteria_button = QPushButton("Clear sorting")
@@ -1807,8 +2065,8 @@ class BidGUI(QMainWindow):
 
         help_label = QLabel(
             "Drag the gold handle to pick up a criterion; the other rows move out of the way as you hover.\n"
-            "High Priority is a strict tie-breaker. Weighted starts a new weight level. "
-            "Equal to Previous shares both the previous weight and its number."
+            "High Priority is a strict tie-breaker. Normal Priority starts a new weight level. "
+            "Equal to Previous Priority shares both the previous weight and its number."
         )
         help_label.setWordWrap(True)
 
@@ -1816,11 +2074,15 @@ class BidGUI(QMainWindow):
         main_layout.addWidget(header_widget)
         main_layout.addWidget(self.sort_rows_list)
         main_layout.addLayout(controls)
+        main_layout.addWidget(self.line_type_scoring_container)
         main_layout.addWidget(help_label)
+
+        self._set_line_type_preferences(DEFAULT_LINE_TYPE_PREFERENCE_ORDER)
 
         for _ in range(MIN_SORT_CRITERIA_ROWS):
             self._add_sort_criteria_row(notify=False)
 
+        self._update_line_type_scoring_panel_visibility()
         container.addWidget(sort_frame)
 
     def _build_output_section(self, container: QVBoxLayout) -> None:
@@ -1856,9 +2118,13 @@ class BidGUI(QMainWindow):
 
         number_row = QHBoxLayout()
         number_row.addWidget(QLabel("Number of lines you would like to bid:"))
-        self.number_of_lines_edit = QLineEdit(str(DEFAULT_NUMBER_OF_LINES_TO_BID))
+        self.number_of_lines_edit = QSpinBox()
+        self.number_of_lines_edit.setRange(1, 9999)
+        self.number_of_lines_edit.setValue(DEFAULT_NUMBER_OF_LINES_TO_BID)
         self.number_of_lines_edit.setMaximumWidth(90)
-        self.number_of_lines_edit.textChanged.connect(lambda _text: self._mark_bid_string_stale())
+        self.number_of_lines_edit.valueChanged.connect(
+            lambda _value: self._mark_bid_string_stale()
+        )
         number_row.addWidget(self.number_of_lines_edit)
         number_row.addStretch(1)
         layout.addLayout(number_row)
@@ -1932,21 +2198,33 @@ class BidGUI(QMainWindow):
             saved_hourly_rate = DEFAULT_HOURLY_RATE
         self.hourly_rate_edit.setValue(saved_hourly_rate)
 
-        saved_preference_order = self.config_data.get(
-            "line_type_preference_order",
-            DEFAULT_LINE_TYPE_PREFERENCE_ORDER,
+        saved_line_type_emphasis = self.config_data.get(
+            "line_type_priority_emphasis",
+            DEFAULT_LINE_TYPE_PRIORITY_EMPHASIS,
         )
-        self._set_line_type_preference_order(saved_preference_order)
+        try:
+            saved_line_type_emphasis = float(saved_line_type_emphasis)
+            if saved_line_type_emphasis <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            saved_line_type_emphasis = DEFAULT_LINE_TYPE_PRIORITY_EMPHASIS
 
-        bid_edge = self.config_data.get("bid_edge") or "none"
-        index = self.bid_edge_combo.findText(bid_edge)
-        self.bid_edge_combo.blockSignals(True)
-        self.bid_edge_combo.setCurrentIndex(index if index >= 0 else 0)
-        self.bid_edge_combo.blockSignals(False)
+        self.line_type_priority_emphasis_spin.blockSignals(True)
+        self.line_type_priority_emphasis_spin.setValue(saved_line_type_emphasis)
+        self.line_type_priority_emphasis_spin.blockSignals(False)
 
-        output_paths = self.config_data.get("output_paths", {})
-        saved_output_folder = output_paths.get(get_os_name(), "")
-        self.output_folder_edit.setText(saved_output_folder or str(Path.cwd()))
+        saved_line_type_preferences = self.config_data.get(
+            "line_type_preferences"
+        )
+        if saved_line_type_preferences is None:
+            saved_line_type_preferences = self.config_data.get(
+                "line_type_preference_order",
+                DEFAULT_LINE_TYPE_PREFERENCE_ORDER,
+            )
+        self._set_line_type_preferences(saved_line_type_preferences)
+
+        # Bid-edge scoring is always enabled for both the start and end.
+        self.config_data["bid_edge"] = "both"
 
         saved_number_of_lines = self.config_data.get(
             "number_of_lines_to_bid",
@@ -1958,7 +2236,7 @@ class BidGUI(QMainWindow):
                 saved_number_of_lines = DEFAULT_NUMBER_OF_LINES_TO_BID
         except (TypeError, ValueError):
             saved_number_of_lines = DEFAULT_NUMBER_OF_LINES_TO_BID
-        self.number_of_lines_edit.setText(str(saved_number_of_lines))
+        self.number_of_lines_edit.setValue(saved_number_of_lines)
 
         # Load weighting settings before restoring rows so percentages are
         # calculated with the user's saved hard/soft/equal configuration.
@@ -2305,64 +2583,496 @@ class BidGUI(QMainWindow):
         except Exception:
             pass
 
-    # Line-type preference order ----------------------------------------
+    # Contextual line-type scoring --------------------------------------
 
-    def _set_line_type_preference_order(self, order: Any) -> None:
-        cleaned: list[str] = []
-        if isinstance(order, (list, tuple)):
-            for value in order:
-                code = str(value).strip().upper()
-                if code in LINE_TYPE_CODES and code not in cleaned:
-                    cleaned.append(code)
+    @staticmethod
+    def _normalize_line_type_code(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip().upper()
+        aliases = {
+            "TRIP": "TRIPS",
+            "TRIPS": "TRIPS",
+            "FLY": "TRIPS",
+            "FLYING": "TRIPS",
+        }
+        text = aliases.get(text, text)
+        return text if text in LINE_TYPE_CODES else None
+
+    def _normalize_saved_line_type_preferences(self, saved: Any) -> list[dict[str, Any]]:
+        """Normalize new row dictionaries and the old flat/grouped formats."""
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        is_new_format = isinstance(saved, list) and any(
+            isinstance(item, dict) for item in saved
+        )
+
+        if is_new_format:
+            for entry in saved:
+                if not isinstance(entry, dict):
+                    continue
+                code = self._normalize_line_type_code(
+                    entry.get("type") or entry.get("line_type")
+                )
+                if code is None or code in seen:
+                    continue
+                rows.append({
+                    "type": code,
+                    "enabled": bool(entry.get("enabled", True)),
+                    "equal": bool(
+                        entry.get("equal", False)
+                        or str(entry.get("mode", "")).lower() == "equal"
+                    ),
+                })
+                seen.add(code)
+        else:
+            values = saved if isinstance(saved, (list, tuple)) else []
+            for entry in values:
+                if isinstance(entry, (list, tuple, set)) and not isinstance(entry, str):
+                    group = list(entry)
+                else:
+                    group = [entry]
+
+                for group_index, value in enumerate(group):
+                    code = self._normalize_line_type_code(value)
+                    if code is None or code in seen:
+                        continue
+                    rows.append({
+                        "type": code,
+                        "enabled": True,
+                        "equal": group_index > 0,
+                    })
+                    seen.add(code)
+
+        # The old GUI always treated omitted legacy entries as still enabled.
+        # New saved dictionaries intentionally treat missing rows as disabled.
         for code in LINE_TYPE_CODES:
-            if code not in cleaned:
-                cleaned.append(code)
+            if code not in seen:
+                rows.append({
+                    "type": code,
+                    "enabled": not is_new_format,
+                    "equal": False,
+                })
 
-        self.line_type_preference_list.clear()
-        self.line_type_preference_list.addItems(cleaned)
-        self.line_type_preference_list.resize_to_all_items()
+        return rows
 
-    def _get_line_type_preference_order(self) -> list[str]:
-        order = [
-            self.line_type_preference_list.item(row).text().strip().upper()
-            for row in range(self.line_type_preference_list.count())
-        ]
-        if len(order) != len(LINE_TYPE_CODES) or set(order) != set(LINE_TYPE_CODES):
-            raise ValueError(
-                "Line-type preference order must contain TRIPS, VTO, RA, RB, "
-                "SA, SB, SBA, SBG, and VOR exactly once."
+    def _sync_line_type_rows_from_list(self) -> None:
+        ordered_rows: list[dict[str, Any]] = []
+        for index in range(self.line_type_rows_list.count()):
+            item = self.line_type_rows_list.item(index)
+            if item is None:
+                continue
+            try:
+                row_id = int(item.data(Qt.UserRole))
+            except (TypeError, ValueError):
+                continue
+            row = self._line_type_row_by_id.get(row_id)
+            if row is not None:
+                ordered_rows.append(row)
+        self.line_type_preference_rows = ordered_rows
+
+    @staticmethod
+    def _make_centered_checkbox_column(
+        checkbox: QCheckBox,
+        width: int,
+    ) -> QWidget:
+        container = QWidget()
+        container.setFixedWidth(width)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch(1)
+        layout.addWidget(checkbox)
+        layout.addStretch(1)
+        return container
+
+    def _add_line_type_preference_row(self, row: dict[str, Any]) -> None:
+        code = self._normalize_line_type_code(row.get("type"))
+        if code is None:
+            return
+
+        list_item = QListWidgetItem()
+        list_item.setFlags(
+            list_item.flags()
+            | Qt.ItemIsEnabled
+            | Qt.ItemIsSelectable
+            | Qt.ItemIsDragEnabled
+            | Qt.ItemIsDropEnabled
+        )
+
+        row_id = self._next_line_type_row_id
+        self._next_line_type_row_id += 1
+        list_item.setData(Qt.UserRole, row_id)
+
+        row_widget = QWidget()
+        row_widget.setObjectName("SortCriterionCard")
+        row_widget.setMinimumHeight(46)
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(6, 3, 6, 3)
+        row_layout.setSpacing(8)
+
+        drag_handle = SortCriteriaDragHandle(
+            self.line_type_rows_list,
+            list_item,
+            row_widget,
+        )
+        drag_handle.setToolTip("Drag to reorder this line type.")
+
+        number_label = QLabel("—")
+        number_label.setFixedWidth(28)
+        number_label.setAlignment(Qt.AlignCenter)
+
+        enabled_checkbox = QCheckBox()
+        enabled_checkbox.setChecked(bool(row.get("enabled", True)))
+        enabled_checkbox.setToolTip("Include this line type in preference scoring.")
+        enabled_column = self._make_centered_checkbox_column(
+            enabled_checkbox,
+            76,
+        )
+
+        display_label = LINE_TYPE_DISPLAY_LABELS.get(code, code)
+        line_type_field = QLabel(display_label)
+        line_type_field.setObjectName("LineTypeValueLabel")
+        line_type_field.setFixedWidth(320)
+        line_type_field.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        line_type_field.setToolTip(
+            f"Internal line-type code: {code}. This description is display-only."
+        )
+
+        equal_checkbox = QCheckBox()
+        equal_checkbox.setChecked(bool(row.get("equal", False)))
+        equal_checkbox.setToolTip(
+            "Give this line type the same priority number and score as the "
+            "previous enabled line type."
+        )
+        equal_column = self._make_centered_checkbox_column(
+            equal_checkbox,
+            160,
+        )
+
+        score_label = QLabel("—")
+        score_label.setFixedWidth(100)
+        score_label.setAlignment(Qt.AlignCenter)
+
+        row_layout.addWidget(drag_handle)
+        row_layout.addWidget(number_label)
+        row_layout.addWidget(enabled_column)
+        row_layout.addWidget(line_type_field)
+        row_layout.addWidget(equal_column)
+        row_layout.addWidget(score_label)
+        row_layout.addStretch(1)
+
+        row_data: dict[str, Any] = {
+            "row_id": row_id,
+            "item": list_item,
+            "widget": row_widget,
+            "drag_handle": drag_handle,
+            "number_label": number_label,
+            "enabled_checkbox": enabled_checkbox,
+            "line_type_field": line_type_field,
+            "equal_checkbox": equal_checkbox,
+            "score_label": score_label,
+            "type": code,
+        }
+
+        self._line_type_row_by_id[row_id] = row_data
+        self.line_type_preference_rows.append(row_data)
+        self.line_type_rows_list.addItem(list_item)
+        list_item.setSizeHint(QSize(0, 52))
+        self.line_type_rows_list.setItemWidget(list_item, row_widget)
+
+        enabled_checkbox.toggled.connect(
+            lambda _checked, current=row_data:
+            self._on_line_type_row_option_changed(current)
+        )
+        equal_checkbox.toggled.connect(
+            lambda _checked, current=row_data:
+            self._on_line_type_row_option_changed(current)
+        )
+
+    def _set_line_type_preferences(self, saved: Any) -> None:
+        rows = self._normalize_saved_line_type_preferences(saved)
+        self._updating_line_type_rows = True
+        try:
+            self.line_type_rows_list.clear()
+            self.line_type_preference_rows = []
+            self._line_type_row_by_id.clear()
+            for row in rows:
+                self._add_line_type_preference_row(row)
+        finally:
+            self._updating_line_type_rows = False
+
+        self._update_line_type_preference_preview()
+
+    def _get_line_type_preference_rows(self) -> list[dict[str, Any]]:
+        self._sync_line_type_rows_from_list()
+        rows: list[dict[str, Any]] = []
+        for row in self.line_type_preference_rows:
+            code = self._normalize_line_type_code(row.get("type"))
+            if code is None:
+                continue
+            rows.append({
+                "type": code,
+                "enabled": row["enabled_checkbox"].isChecked(),
+                "equal": row["equal_checkbox"].isChecked(),
+            })
+        return rows
+
+    def _get_grouped_line_type_preference_order(self) -> list[Any]:
+        grouped: list[Any] = []
+        for row in self._get_line_type_preference_rows():
+            if not row["enabled"]:
+                continue
+
+            code = row["type"]
+            if row["equal"] and grouped:
+                previous = grouped[-1]
+                if isinstance(previous, tuple):
+                    grouped[-1] = (*previous, code)
+                elif isinstance(previous, list):
+                    grouped[-1] = tuple([*previous, code])
+                else:
+                    grouped[-1] = (previous, code)
+            else:
+                grouped.append(code)
+        return grouped
+
+    @staticmethod
+    def _fallback_line_type_score_map(
+        preference_order: list[Any],
+        *,
+        power_law_coeff: float,
+    ) -> dict[str, float]:
+        levels: list[list[str]] = []
+        seen: set[str] = set()
+        for entry in preference_order:
+            values = list(entry) if isinstance(entry, (list, tuple, set)) and not isinstance(entry, str) else [entry]
+            level: list[str] = []
+            for value in values:
+                code = str(value).strip().upper()
+                if code in LINE_TYPE_CODES and code not in seen:
+                    level.append(code)
+                    seen.add(code)
+            if level:
+                levels.append(level)
+
+        result = {code: DEFAULT_LINE_TYPE_DISABLED_SCORE for code in LINE_TYPE_CODES}
+        if not levels:
+            return result
+
+        if len(levels) == 1:
+            scores = [DEFAULT_LINE_TYPE_TOP_SCORE]
+        else:
+            max_index = len(levels) - 1
+            scores = []
+            for index in range(len(levels)):
+                rank_position = 1 - index / max_index
+                curved_position = rank_position ** power_law_coeff
+                score = DEFAULT_LINE_TYPE_BOTTOM_SCORE + (
+                    DEFAULT_LINE_TYPE_TOP_SCORE - DEFAULT_LINE_TYPE_BOTTOM_SCORE
+                ) * curved_position
+                scores.append(score)
+
+        for level, score in zip(levels, scores):
+            for code in level:
+                result[code] = round(float(score), 1)
+        return result
+
+    def _update_line_type_preference_preview(self) -> None:
+        if self._updating_line_type_rows:
+            return
+
+        self._updating_line_type_rows = True
+        try:
+            self._sync_line_type_rows_from_list()
+            enabled_rows = [
+                row for row in self.line_type_preference_rows
+                if row["enabled_checkbox"].isChecked()
+            ]
+
+            # The scoring function needs at least one enabled line type.
+            if not enabled_rows and self.line_type_preference_rows:
+                first_row = self.line_type_preference_rows[0]
+                first_row["enabled_checkbox"].blockSignals(True)
+                first_row["enabled_checkbox"].setChecked(True)
+                first_row["enabled_checkbox"].blockSignals(False)
+                enabled_rows = [first_row]
+
+            enabled_seen = False
+            for row in self.line_type_preference_rows:
+                enabled = row["enabled_checkbox"].isChecked()
+                equal_checkbox: QCheckBox = row["equal_checkbox"]
+
+                if not enabled:
+                    if equal_checkbox.isChecked():
+                        equal_checkbox.blockSignals(True)
+                        equal_checkbox.setChecked(False)
+                        equal_checkbox.blockSignals(False)
+                    equal_checkbox.setEnabled(False)
+                    continue
+
+                if not enabled_seen:
+                    if equal_checkbox.isChecked():
+                        equal_checkbox.blockSignals(True)
+                        equal_checkbox.setChecked(False)
+                        equal_checkbox.blockSignals(False)
+                    equal_checkbox.setEnabled(False)
+                    enabled_seen = True
+                else:
+                    equal_checkbox.setEnabled(True)
+
+            preference_order = self._get_grouped_line_type_preference_order()
+            emphasis = float(self.line_type_priority_emphasis_spin.value())
+            score_builder = getattr(
+                pf,
+                "build_line_type_preference_score_map",
+                None,
             )
-        return order
 
-    def _move_line_type_preference_up(self) -> None:
-        row = self.line_type_preference_list.currentRow()
-        if row <= 0:
+            if callable(score_builder) and preference_order:
+                score_map = score_builder(
+                    preference_order,
+                    all_line_types=LINE_TYPE_CODES,
+                    top_score=DEFAULT_LINE_TYPE_TOP_SCORE,
+                    bottom_score=DEFAULT_LINE_TYPE_BOTTOM_SCORE,
+                    disabled_score=DEFAULT_LINE_TYPE_DISABLED_SCORE,
+                    power_law_coeff=emphasis,
+                    round_digits=1,
+                )
+            else:
+                score_map = self._fallback_line_type_score_map(
+                    preference_order,
+                    power_law_coeff=emphasis,
+                )
+
+            enabled_seen = False
+            priority_number = 0
+            for row in self.line_type_preference_rows:
+                code = row["type"]
+                enabled = row["enabled_checkbox"].isChecked()
+                equal = row["equal_checkbox"].isChecked()
+
+                if not enabled:
+                    row["number_label"].setText("—")
+                    row["score_label"].setText("Off / 0")
+                    continue
+
+                if not enabled_seen or not equal:
+                    priority_number += 1
+                row["number_label"].setText(f"{priority_number}.")
+                row["score_label"].setText(
+                    f"{float(score_map.get(code, 0)):.1f}"
+                )
+                enabled_seen = True
+        finally:
+            self._updating_line_type_rows = False
+
+    def _on_line_type_row_option_changed(
+        self,
+        _row: dict[str, Any],
+    ) -> None:
+        if self._updating_line_type_rows:
             return
-        item = self.line_type_preference_list.takeItem(row)
-        self.line_type_preference_list.insertItem(row - 1, item)
-        self.line_type_preference_list.setCurrentRow(row - 1)
-        self._line_type_preference_changed()
-
-    def _move_line_type_preference_down(self) -> None:
-        row = self.line_type_preference_list.currentRow()
-        if row < 0 or row >= self.line_type_preference_list.count() - 1:
+        self._update_line_type_preference_preview()
+        self._save_line_type_preferences_to_config()
+        if self._loading_saved_values:
             return
-        item = self.line_type_preference_list.takeItem(row)
-        self.line_type_preference_list.insertItem(row + 1, item)
-        self.line_type_preference_list.setCurrentRow(row + 1)
-        self._line_type_preference_changed()
+        self._schedule_preference_refresh(
+            "Line-type scoring changed. Analyzer values will refresh automatically."
+        )
 
-    def _reset_line_type_preference_order(self) -> None:
-        self._set_line_type_preference_order(DEFAULT_LINE_TYPE_PREFERENCE_ORDER)
-        self.line_type_preference_list.setCurrentRow(0)
-        self._line_type_preference_changed()
+    def _on_line_type_preferences_previewed(self, *_args: Any) -> None:
+        if self._updating_line_type_rows:
+            return
+        self._sync_line_type_rows_from_list()
+        self._update_line_type_preference_preview()
 
-    def _line_type_preference_changed(self) -> None:
-        self.config_data["line_type_preference_order"] = self._get_line_type_preference_order()
+    def _save_line_type_preferences_to_config(self) -> None:
+        rows = self._get_line_type_preference_rows()
+        grouped_order = self._get_grouped_line_type_preference_order()
+        self.config_data["line_type_preferences"] = rows
+        self.config_data["line_type_preference_order"] = grouped_order
+        self.config_data["line_type_priority_emphasis"] = round(
+            float(self.line_type_priority_emphasis_spin.value()),
+            2,
+        )
         save_config(self.config_data)
+
+    def _on_line_type_preferences_reordered(self, *_args: Any) -> None:
+        if self._updating_line_type_rows:
+            return
+        self._sync_line_type_rows_from_list()
+        self._update_line_type_preference_preview()
+        self._save_line_type_preferences_to_config()
+        if self._loading_saved_values:
+            return
         self._schedule_preference_refresh(
             "Line-type preference order changed. Analyzer values will refresh automatically."
         )
+
+    def _on_line_type_priority_emphasis_changed(self, _value: float) -> None:
+        if not hasattr(self, "line_type_rows_list"):
+            return
+        self._update_line_type_preference_preview()
+        self._save_line_type_preferences_to_config()
+        if self._loading_saved_values:
+            return
+        self._schedule_preference_refresh(
+            "Line-type preference emphasis changed. Analyzer values will refresh automatically."
+        )
+
+    def _reset_line_type_preferences(self) -> None:
+        self.line_type_priority_emphasis_spin.blockSignals(True)
+        self.line_type_priority_emphasis_spin.setValue(
+            DEFAULT_LINE_TYPE_PRIORITY_EMPHASIS
+        )
+        self.line_type_priority_emphasis_spin.blockSignals(False)
+        self._set_line_type_preferences(DEFAULT_LINE_TYPE_PREFERENCE_ORDER)
+        self._save_line_type_preferences_to_config()
+        if not self._loading_saved_values:
+            self._schedule_preference_refresh(
+                "Line-type scoring reset. Analyzer values will refresh automatically."
+            )
+
+    @staticmethod
+    def _is_line_type_preference_sort_column(column: Any) -> bool:
+        text = re.sub(r"[^a-z0-9]+", " ", str(column or "").lower()).strip()
+        compact = text.replace(" ", "")
+        if compact in {
+            "linetype",
+            "linetypepreference",
+            "linetypepreferencescore",
+            "linetypepreferencescores",
+        }:
+            return True
+        words = set(text.split())
+        return "line" in words and "type" in words and (
+            "preference" in words or "score" in words
+        )
+
+    def _line_type_sort_positions(self) -> list[int]:
+        positions: list[int] = []
+        for index, row in enumerate(self.sort_criteria_rows, start=1):
+            column = str(row["column_combo"].currentData() or "").strip()
+            if column and self._is_line_type_preference_sort_column(column):
+                positions.append(index)
+        return positions
+
+    def _update_line_type_scoring_panel_visibility(self) -> None:
+        if not hasattr(self, "line_type_scoring_panel"):
+            return
+
+        positions = self._line_type_sort_positions()
+        active = bool(positions)
+        self.line_type_scoring_panel.setVisible(active)
+        self.line_type_scoring_hint.setVisible(not active)
+
+        if active:
+            position_text = ", ".join(str(position) for position in positions)
+            noun = "criterion" if len(positions) == 1 else "criteria"
+            self.line_type_scoring_status.setText(
+                f"Sub-sort for sorting {noun} {position_text}. These settings build "
+                "the Line Type Preference score used by that parent criterion."
+            )
 
     # Preference persistence and automatic column refresh ---------------
 
@@ -2533,7 +3243,7 @@ class BidGUI(QMainWindow):
         direction_combo.addItems(SORT_DIRECTION_LABEL_TO_VALUE.keys())
 
         mode_combo = WheelSafeComboBox()
-        mode_combo.setFixedWidth(155)
+        mode_combo.setFixedWidth(225)
 
         contribution_label = QLabel("—")
         contribution_label.setFixedWidth(100)
@@ -2639,6 +3349,7 @@ class BidGUI(QMainWindow):
         self._sync_sort_criteria_rows_from_list()
         self._update_sort_row_positions()
         self._update_sort_percentages()
+        self._update_line_type_scoring_panel_visibility()
 
     def _on_sort_rows_reordered(self, *_args: Any) -> None:
         """Commit and save the order after the criterion is dropped."""
@@ -2700,7 +3411,7 @@ class BidGUI(QMainWindow):
             if not criterion:
                 column_combo.setCurrentIndex(0)
                 direction_combo.setCurrentText("High to Low")
-                default_mode = "strict" if self.sort_criteria_rows.index(row_data) == 0 else "weighted"
+                default_mode = "weighted"
                 mode_index = mode_combo.findData(default_mode)
                 mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
                 return
@@ -2766,6 +3477,7 @@ class BidGUI(QMainWindow):
         self.sort_order = normalized
         self._update_sort_row_positions()
         self._update_sort_percentages()
+        self._update_line_type_scoring_panel_visibility()
 
     def _clear_sort_order(self) -> None:
         self._set_sort_order([])
@@ -2820,6 +3532,7 @@ class BidGUI(QMainWindow):
         self.sort_order = self._get_sort_order_from_rows(validate=False)
         self._update_sort_row_positions()
         self._update_sort_percentages()
+        self._update_line_type_scoring_panel_visibility()
 
         if self._loading_saved_values:
             return
@@ -2917,6 +3630,7 @@ class BidGUI(QMainWindow):
             combo.blockSignals(False)
 
         self._update_sort_percentages()
+        self._update_line_type_scoring_panel_visibility()
 
     def _clean_sort_order_for_columns(self, columns: list[str]) -> None:
         valid_columns = {str(column) for column in columns}
@@ -3162,25 +3876,19 @@ class BidGUI(QMainWindow):
             raise ValueError("Training end date is before training start date.")
 
         hourly_rate = round(float(self.hourly_rate_edit.value()), 2)
-        line_type_preference_order = self._get_line_type_preference_order()
-
-        bid_edge = self.bid_edge_combo.currentText().strip().lower() or "none"
-        if bid_edge not in {"none", "start", "end", "both"}:
-            raise ValueError("Bid edge preference must be none, start, end, or both.")
-
-        output_folder = Path(self.output_folder_edit.text().strip().strip('"').strip("'")).expanduser()
-        if not output_folder.exists():
-            output_folder.mkdir(parents=True, exist_ok=True)
-        if not output_folder.is_dir():
-            raise ValueError("Output folder is not a folder.")
-
-        output_filename = clean_filename(self.output_filename_edit.text())
-        output_path = output_folder / f"{output_filename}.xlsx"
-
-        number_of_lines_to_bid = validate_positive_int(
-            self.number_of_lines_edit.text(),
-            "Number of lines to bid",
+        line_type_preferences = self._get_line_type_preference_rows()
+        line_type_preference_order = self._get_grouped_line_type_preference_order()
+        if not line_type_preference_order:
+            raise ValueError("Enable at least one line type for line-type scoring.")
+        line_type_priority_emphasis = round(
+            float(self.line_type_priority_emphasis_spin.value()),
+            2,
         )
+
+        # Bid-edge scoring is intentionally fixed to both sides of the bid.
+        bid_edge = "both"
+
+        number_of_lines_to_bid = int(self.number_of_lines_edit.value())
 
         return {
             "trips_pdf_path": trips_pdf_path,
@@ -3191,10 +3899,13 @@ class BidGUI(QMainWindow):
             "training_start": training_start,
             "training_end": training_end,
             "hourly_rate": hourly_rate,
+            "line_type_preferences": line_type_preferences,
             "line_type_preference_order": line_type_preference_order,
+            "line_type_priority_emphasis": line_type_priority_emphasis,
+            "line_type_top_score": DEFAULT_LINE_TYPE_TOP_SCORE,
+            "line_type_bottom_score": DEFAULT_LINE_TYPE_BOTTOM_SCORE,
+            "line_type_disabled_score": DEFAULT_LINE_TYPE_DISABLED_SCORE,
             "bid_edge": bid_edge,
-            "output_folder": output_folder,
-            "output_path": output_path,
             "number_of_lines_to_bid": number_of_lines_to_bid,
             "sort_order": self._get_sort_order_from_rows(validate=True),
             "sorting_settings": self._get_sorting_settings(),
@@ -3207,8 +3918,7 @@ class BidGUI(QMainWindow):
 
         If they match:
             - stores the bid period string
-            - sets the Excel filename to that bid period
-            - updates inputs["output_path"] so export uses the new filename
+            - uses that value as the default Excel filename during export
 
         If they do not match:
             - shows a popup
@@ -3254,13 +3964,13 @@ class BidGUI(QMainWindow):
             self.cached_bid_period = bid_period
 
         output_filename = clean_filename(bid_period)
-        self.output_filename_edit.setText(output_filename)
-
         inputs["bid_period"] = bid_period
-        inputs["output_path"] = Path(inputs["output_folder"]) / f"{output_filename}.xlsx"
 
         self.pdf_status_label.setText(f"Bid period verified: {bid_period}")
-        self._write_log(f"Bid period verified: {bid_period}. Excel filename set to {output_filename}.xlsx")
+        self._write_log(
+            f"Bid period verified: {bid_period}. "
+            f"Default Excel filename: {output_filename}.xlsx"
+        )
 
         return True
 
@@ -3271,13 +3981,20 @@ class BidGUI(QMainWindow):
         self.config_data["training_start"] = inputs["training_start"]
         self.config_data["training_end"] = inputs["training_end"]
         self.config_data["hourly_rate"] = inputs["hourly_rate"]
+        self.config_data["line_type_preferences"] = inputs["line_type_preferences"]
         self.config_data["line_type_preference_order"] = inputs["line_type_preference_order"]
-        self.config_data["bid_edge"] = inputs["bid_edge"]
+        self.config_data["line_type_priority_emphasis"] = inputs[
+            "line_type_priority_emphasis"
+        ]
+        self.config_data["bid_edge"] = "both"
         self.config_data["sort_order"] = inputs["sort_order"]
         self.config_data["sorting_settings"] = inputs["sorting_settings"]
         self.config_data["number_of_lines_to_bid"] = inputs["number_of_lines_to_bid"]
-        output_paths = self.config_data.setdefault("output_paths", {})
-        output_paths[get_os_name()] = str(inputs["output_folder"])
+        output_path = inputs.get("output_path")
+        if output_path:
+            output_paths = self.config_data.setdefault("output_paths", {})
+            output_paths[get_os_name()] = str(Path(output_path).parent)
+
         save_config(self.config_data)
 
     # -------------------------- Worker control --------------------------
@@ -3564,13 +4281,8 @@ class BidGUI(QMainWindow):
     # -------------------------- Analysis actions --------------------------
 
     def _on_bid_edge_changed(self) -> None:
-        if self._loading_saved_values:
-            return
-        self.config_data["bid_edge"] = self.bid_edge_combo.currentText().strip().lower() or "none"
-        save_config(self.config_data)
-        self._schedule_preference_refresh(
-            "Bid edge preference changed. Sorting columns will refresh automatically."
-        )
+        """Compatibility hook; bid-edge scoring is always set to both."""
+        self.config_data["bid_edge"] = "both"
 
     def load_pdfs(self) -> None:
         try:
@@ -3597,6 +4309,32 @@ class BidGUI(QMainWindow):
             if not self._check_matching_bid_period_or_warn(inputs):
                 return
 
+            default_filename = f"{clean_filename(inputs['bid_period'])}.xlsx"
+            saved_output_folder = (
+                self.config_data.get("output_paths", {}).get(get_os_name(), "")
+            )
+            initial_folder = (
+                Path(saved_output_folder).expanduser()
+                if saved_output_folder
+                else Path.home()
+            )
+            if not initial_folder.exists():
+                initial_folder = Path.home()
+
+            selected_path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                "Save bid analysis Excel file",
+                str(initial_folder / default_filename),
+                "Excel workbook (*.xlsx)",
+            )
+            if not selected_path:
+                return
+
+            output_path = Path(selected_path).expanduser()
+            if output_path.suffix.lower() != ".xlsx":
+                output_path = output_path.with_suffix(".xlsx")
+
+            inputs["output_path"] = output_path
             self._save_inputs_to_config(inputs)
 
         except Exception as exc:
@@ -3605,8 +4343,12 @@ class BidGUI(QMainWindow):
 
         current_key = (inputs["trips_pdf_path"], inputs["lines_pdf_path"])
         if not self.analysis_pipeline.has_cached_pdf_data_for(*current_key):
-            self.pdf_status_label.setText("PDFs not loaded for these paths. Loading first, then exporting...")
-            self._reset_trip_progress("Trips extraction progress: waiting to start...")
+            self.pdf_status_label.setText(
+                "PDFs not loaded for these paths. Loading first, then exporting..."
+            )
+            self._reset_trip_progress(
+                "Trips extraction progress: waiting to start..."
+            )
 
         self._start_worker(self._export_worker, inputs)
 
@@ -3765,6 +4507,7 @@ class BidGUI(QMainWindow):
                 training_start=inputs["training_start"],
                 training_end=inputs["training_end"],
                 vacation_ranges=new_vacation_ranges,
+                requested_days_off_dates=inputs["requested_dates"],
             )
 
             self.message_queue.put((
@@ -3795,10 +4538,9 @@ class BidGUI(QMainWindow):
         except Exception as exc:
             self.message_queue.put(("error", exc))
 
-"""
 if __name__ == "__main__":
+    configure_windows_background_processes()
     app = QApplication(sys.argv)
     window = BidGUI()
     window.show()
     sys.exit(app.exec())
-"""

@@ -1798,6 +1798,147 @@ def add_requested_days_off_scores(
         line_data[score_key] = round(final_score)
 
 #line type preference--------------------------------------------------------------------------------------------------------------------------------------
+LINE_TYPE_CODES = (
+    "TRIPS",
+    "VTO",
+    "RA",
+    "RB",
+    "SA",
+    "SB",
+    "SBA",
+    "SBG",
+    "VOR",
+)
+
+def normalize_line_type(value):
+    """Return the canonical line-type name used by preference scoring."""
+    if value is None:
+        return None
+
+    text = str(value).strip().upper()
+    if not text:
+        return None
+
+    aliases = {
+        "TRIP": "TRIPS",
+        "TRIPS": "TRIPS",
+        "FLY": "TRIPS",
+        "FLYING": "TRIPS",
+        "VTO": "VTO",
+        "RB": "RB",
+        "RA": "RA",
+        "SB": "SB",
+        "SA": "SA",
+        "VOR": "VOR",
+        "SBA": "SBA",
+        "SBG": "SBG",
+    }
+
+    if text in aliases:
+        return aliases[text]
+
+    match = re.fullmatch(r"(SBA|SBG)\d*", text)
+    if match:
+        return match.group(1)
+
+    return text
+
+
+def build_line_type_preference_score_map(
+    preference_order,
+    *,
+    all_line_types=LINE_TYPE_CODES,
+    top_score=100,
+    bottom_score=10,
+    disabled_score=0,
+    power_law_coeff=1.0,
+    round_digits=1,
+):
+    """
+    Build the score assigned to each line type.
+
+    Flat order (backward compatible):
+        ["TRIPS", "VTO", "RB", "RA"]
+
+    Equal-priority groups:
+        [
+            "TRIPS",
+            ("VTO", "RB"),
+            "RA",
+        ]
+
+    Any line type omitted from preference_order is disabled and receives
+    disabled_score.
+
+    The power-law curve is applied to priority LEVELS, not individual types.
+    Therefore every type in an equal-priority group receives the same score.
+    """
+    if power_law_coeff <= 0:
+        raise ValueError("power_law_coeff must be greater than 0.")
+
+    try:
+        top_score = float(top_score)
+        bottom_score = float(bottom_score)
+        disabled_score = float(disabled_score)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "top_score, bottom_score, and disabled_score must be numeric."
+        ) from exc
+
+    priority_levels = []
+    seen = set()
+
+    for entry in preference_order or []:
+        if isinstance(entry, (list, tuple, set)) and not isinstance(entry, str):
+            raw_level = list(entry)
+        else:
+            raw_level = [entry]
+
+        level = []
+        for item in raw_level:
+            normalized = normalize_line_type(item)
+            if normalized and normalized not in seen:
+                level.append(normalized)
+                seen.add(normalized)
+
+        if level:
+            priority_levels.append(level)
+
+    if not priority_levels:
+        raise ValueError(
+            "preference_order must contain at least one enabled line type."
+        )
+
+    score_map = {}
+    for item in all_line_types:
+        normalized = normalize_line_type(item)
+        if normalized is not None:
+            score_map[normalized] = disabled_score
+
+    if len(priority_levels) == 1:
+        level_scores = [top_score]
+    else:
+        max_index = len(priority_levels) - 1
+        level_scores = []
+
+        for index in range(len(priority_levels)):
+            rank_position = 1.0 - (index / max_index)
+            curved_position = rank_position ** float(power_law_coeff)
+            score = bottom_score + (
+                top_score - bottom_score
+            ) * curved_position
+            level_scores.append(score)
+
+    for level, score in zip(priority_levels, level_scores):
+        for line_type in level:
+            score_map[line_type] = score
+
+    return {
+        line_type: round(float(score), round_digits)
+        for line_type, score in score_map.items()
+    }
+
+
 def add_line_type_preference_scores(
     master_lines,
     preference_order,
@@ -1808,115 +1949,40 @@ def add_line_type_preference_scores(
     scoring_percentages_key="line_type_power_adjusted_percentage",
     preference_score_map_key="line_type_preference_score_map",
     clear_existing_details=True,
+    all_line_types=LINE_TYPE_CODES,
     top_score=100,
-    bottom_score=0,
+    bottom_score=10,
+    disabled_score=0,
     power_law_coeff=1.0,
     unknown_score=None,
     overlay_types=("VTO", "VOR"),
     round_digits=1,
 ):
     """
-    Adds a line-type preference score to each line.
+    Add a line-type preference score to every line.
 
-    Default behavior:
-        Only saves:
-            line_data["line_type_preference_score"]
+    preference_order accepts both the old flat format and equal-priority groups:
 
-    If save_details=True, also saves:
-        line_data["line_type_counts"]
-        line_data["line_type_power_adjusted_percentage"]
-        line_data["line_type_preference_score_map"]
+        ["TRIPS", "VTO", "RB", "RA"]
 
-    Scoring philosophy:
+        [
+            "TRIPS",
+            ("VTO", "RB"),
+            "RA",
+        ]
 
-        1. Pure Trips:
-            {"TRIPS": 10}
+    Types omitted from preference_order are disabled and receive
+    disabled_score. With the GUI defaults:
 
-            Scoring percentage:
-                TRIPS = 100%
+        highest enabled type = 100
+        lowest enabled priority level = 10
+        disabled type = 0
 
-        2. Trips mixed with VTO:
-            {"TRIPS": 10, "VTO": 28}
-
-            Actual counts do NOT matter for the VTO amount.
-
-            Scoring percentage:
-                TRIPS = 50%
-                VTO   = 50%
-
-            So if:
-                TRIPS = 100
-                VTO   = 80
-
-            Final score:
-                90
-
-        3. Trips mixed with VOR:
-            Same behavior as VTO.
-
-        4. Trips mixed with RA/RB/SA/SB/SBA/SBG:
-            Uses actual percentages.
-
-        5. DH/BUS:
-            Counts as TRIPS by default.
-
-            Exception:
-                If a trip starts with DH/BUS, ends with DH/BUS,
-                and every non-DH/BUS day inside is the same SBA/SBG type,
-                the whole trip counts as SBA/SBG.
-
-                Example:
-                    DH + SBG + SBG + SBG + DH
-
-                Counts as:
-                    SBG = total_days_gone
-
-    power_law_coeff:
-        Controls the power-law falloff of the preference order.
-
-        1.0 = linear
-        >1.0 = lower preferences fall off faster
-        <1.0 = lower preferences stay closer to the top
+    Pure lines receive that type's score. Mixed lines receive a weighted
+    average based on the existing counting and VTO/VOR overlay rules.
     """
-
     if power_law_coeff <= 0:
         raise ValueError("power_law_coeff must be greater than 0.")
-
-    def normalize_line_type(value):
-        if value is None:
-            return None
-
-        text = str(value).strip().upper()
-
-        if not text:
-            return None
-
-        aliases = {
-            "TRIP": "TRIPS",
-            "TRIPS": "TRIPS",
-            "FLY": "TRIPS",
-            "FLYING": "TRIPS",
-
-            "VTO": "VTO",
-            "RB": "RB",
-            "RA": "RA",
-            "SB": "SB",
-            "SA": "SA",
-            "VOR": "VOR",
-
-            "SBA": "SBA",
-            "SBG": "SBG",
-        }
-
-        if text in aliases:
-            return aliases[text]
-
-        match = re.fullmatch(r"(SBA|SBG)\d*", text)
-
-        if match:
-            return match.group(1)
-
-        return text
 
     def route_flags_have_dh_or_bus(route_flags):
         if not route_flags:
@@ -1925,13 +1991,10 @@ def add_line_type_preference_scores(
         if isinstance(route_flags, str):
             route_flags = [route_flags]
 
-        for flag in route_flags:
-            flag_text = str(flag).upper()
-
-            if "DH" in flag_text or "BUS" in flag_text:
-                return True
-
-        return False
+        return any(
+            "DH" in str(flag).upper() or "BUS" in str(flag).upper()
+            for flag in route_flags
+        )
 
     def safe_int(value, default=0):
         try:
@@ -1952,26 +2015,18 @@ def add_line_type_preference_scores(
 
     def detect_sba_sbg_sandwich_trip(flights):
         """
-        Detects:
+        Detect DH/BUS + SBA/SBG + ... + DH/BUS.
 
-            DH/BUS + SBA/SBG days + DH/BUS
-
-        If all non-DH/BUS rows are the same SBA/SBG type,
-        then the entire trip counts as that SBA/SBG type.
+        When all non-DH/BUS rows are the same SBA/SBG type, the complete trip
+        counts as that type.
         """
-
         if not flights:
             return None
 
-        starts_with_dh_or_bus = route_flags_have_dh_or_bus(
-            flights[0].get("route_flags")
-        )
+        if not route_flags_have_dh_or_bus(flights[0].get("route_flags")):
+            return None
 
-        ends_with_dh_or_bus = route_flags_have_dh_or_bus(
-            flights[-1].get("route_flags")
-        )
-
-        if not starts_with_dh_or_bus or not ends_with_dh_or_bus:
+        if not route_flags_have_dh_or_bus(flights[-1].get("route_flags")):
             return None
 
         coded_types = set()
@@ -1996,75 +2051,44 @@ def add_line_type_preference_scores(
 
         return None
 
-    # ------------------------------------------------------------
-    # Normalize overlay types
-    # ------------------------------------------------------------
-
-    overlay_types = {
-        normalize_line_type(item)
-        for item in overlay_types
-        if normalize_line_type(item) is not None
-    }
-
-    # ------------------------------------------------------------
-    # Build power-law preference score map
-    # ------------------------------------------------------------
-
-    normalized_order = []
-
-    for item in preference_order:
+    normalized_overlay_types = set()
+    for item in overlay_types:
         normalized = normalize_line_type(item)
+        if normalized is not None:
+            normalized_overlay_types.add(normalized)
 
-        if normalized and normalized not in normalized_order:
-            normalized_order.append(normalized)
-
-    if not normalized_order:
-        raise ValueError("preference_order must contain at least one valid line type.")
-
-    if len(normalized_order) == 1:
-        preference_score_map = {
-            normalized_order[0]: float(top_score)
-        }
-    else:
-        max_index = len(normalized_order) - 1
-        preference_score_map = {}
-
-        for index, line_type in enumerate(normalized_order):
-            rank_position = 1 - (index / max_index)
-            curved_position = rank_position ** power_law_coeff
-
-            score = bottom_score + (top_score - bottom_score) * curved_position
-            preference_score_map[line_type] = score
+    preference_score_map = build_line_type_preference_score_map(
+        preference_order,
+        all_line_types=all_line_types,
+        top_score=top_score,
+        bottom_score=bottom_score,
+        disabled_score=disabled_score,
+        power_law_coeff=power_law_coeff,
+        round_digits=round_digits,
+    )
 
     if unknown_score is None:
-        unknown_score = bottom_score
+        unknown_score = disabled_score
 
-    # ------------------------------------------------------------
-    # Score each line
-    # ------------------------------------------------------------
+    for _line_number, line_data in master_lines.items():
+        if clear_existing_details:
+            line_data.pop(counts_key, None)
+            line_data.pop(scoring_percentages_key, None)
+            line_data.pop(preference_score_map_key, None)
 
-    for line_number, line_data in master_lines.items():
         counts = Counter()
 
         for pp in line_data.get("PPs", []):
             for assignment in pp.get("assignments", []):
-
-                # ------------------------------------------------
-                # Non-trip assignment:
-                # VTO / RB / RA / SB / SA / VOR
-                # ------------------------------------------------
+                # Non-trip assignments: VTO / RB / RA / SB / SA / VOR.
                 if "flights" not in assignment:
-                    code = assignment.get("code")
-
-                    if code:
-                        normalized_code = normalize_line_type(code)
+                    normalized_code = normalize_line_type(
+                        assignment.get("code")
+                    )
+                    if normalized_code:
                         counts[normalized_code] += 1
-
                     continue
 
-                # ------------------------------------------------
-                # Trip assignment
-                # ------------------------------------------------
                 flights = assignment.get("flights") or []
 
                 total_trip_days = safe_int(
@@ -2088,7 +2112,9 @@ def add_line_type_preference_scores(
                 coded_days = {}
 
                 for index, flight in enumerate(flights):
-                    flight_code = normalize_line_type(flight.get("code"))
+                    flight_code = normalize_line_type(
+                        flight.get("code")
+                    )
 
                     if flight_code in {"SBA", "SBG"}:
                         date_key = get_flight_date_key(flight, index)
@@ -2097,105 +2123,74 @@ def add_line_type_preference_scores(
                 for coded_type in coded_days.values():
                     counts[coded_type] += 1
 
-                normal_trip_days = max(total_trip_days - len(coded_days), 0)
+                normal_trip_days = max(
+                    total_trip_days - len(coded_days),
+                    0,
+                )
 
                 if normal_trip_days > 0:
                     counts["TRIPS"] += normal_trip_days
 
-        # --------------------------------------------------------
-        # Build scoring percentages
-        # --------------------------------------------------------
-
         present_overlay_types = {
             line_type
             for line_type, count in counts.items()
-            if count > 0 and line_type in overlay_types
+            if count > 0 and line_type in normalized_overlay_types
         }
 
         non_overlay_counts = Counter({
             line_type: count
             for line_type, count in counts.items()
-            if count > 0 and line_type not in overlay_types
+            if count > 0 and line_type not in normalized_overlay_types
         })
 
         scoring_weights = {}
 
         if present_overlay_types and non_overlay_counts:
-            # VTO/VOR mixed with something else:
-            #
-            # Overlay group gets 50%.
-            # Non-overlay group gets 50%.
-            #
-            # Example:
-            #   TRIPS 10, VTO 28
-            #
-            # Becomes:
-            #   TRIPS 50%
-            #   VTO   50%
-
             overlay_share = 0.5
             non_overlay_share = 0.5
 
-            # Split overlay share equally among present overlay types.
-            # Usually this is just VTO or VOR.
-            overlay_each = overlay_share / len(present_overlay_types)
-
+            overlay_each = overlay_share / len(
+                present_overlay_types
+            )
             for overlay_type in present_overlay_types:
                 scoring_weights[overlay_type] = overlay_each
 
-            # Split non-overlay share by actual non-overlay percentages.
             non_overlay_total = sum(non_overlay_counts.values())
-
             for line_type, count in non_overlay_counts.items():
                 scoring_weights[line_type] = (
                     non_overlay_share * count / non_overlay_total
                 )
-
         else:
-            # No VTO/VOR overlay issue.
-            # Use actual percentages.
             total_counted = sum(counts.values())
-
             if total_counted > 0:
                 for line_type, count in counts.items():
-                    scoring_weights[line_type] = count / total_counted
+                    scoring_weights[line_type] = (
+                        count / total_counted
+                    )
 
-        # --------------------------------------------------------
-        # Calculate final score
-        # --------------------------------------------------------
+        final_score = 0.0
+        for line_type, weight in scoring_weights.items():
+            line_type_score = preference_score_map.get(
+                line_type,
+                unknown_score,
+            )
+            final_score += float(line_type_score) * weight
 
-        if not scoring_weights:
-            final_score = 0
-            scoring_percentages = {}
-        else:
-            final_score = 0
-
-            for line_type, weight in scoring_weights.items():
-                line_type_score = preference_score_map.get(
-                    line_type,
-                    unknown_score,
-                )
-
-                final_score += line_type_score * weight
-
-            scoring_percentages = {
-                line_type: round(weight * 100, round_digits)
-                for line_type, weight in scoring_weights.items()
-            }
-
-        # --------------------------------------------------------
-        # Save result
-        # --------------------------------------------------------
+        scoring_percentages = {
+            line_type: round(weight * 100, round_digits)
+            for line_type, weight in scoring_weights.items()
+        }
 
         line_data[score_key] = round(final_score, round_digits)
 
         if save_details:
             line_data[counts_key] = dict(counts)
             line_data[scoring_percentages_key] = scoring_percentages
-            line_data[preference_score_map_key] = {
-                key: round(value, round_digits)
-                for key, value in preference_score_map.items()
-            }
+            line_data[preference_score_map_key] = dict(
+                preference_score_map
+            )
+
+    return master_lines
         
 #% international flights and continents--------------------------------------------------------------------------------------------------------------------------------------
 #Run this before creating_master_line
