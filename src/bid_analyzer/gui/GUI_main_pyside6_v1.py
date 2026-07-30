@@ -36,7 +36,6 @@ import re
 import subprocess
 import sys
 import threading
-import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -80,64 +79,11 @@ from PySide6.QtWidgets import (
 )
 
 from bid_analyzer.core.pdf_extractors import matching_bid_period
-from bid_analyzer.core.master_to_pandas import (
-    drop_empty_sort_columns,
-    get_sort_percent_contributions,
-    sort_dataframe_by_conditions,
-)
+from bid_analyzer.core.master_to_pandas import get_sort_percent_contributions
 from bid_analyzer.pipeline.analysis_pipeline import AnalysisPipeline
 from bid_analyzer.core.export_to_excel import export_master_lines_to_excel_table
 from bid_analyzer.core import processing_functions as pf
 from bid_analyzer.resource_paths import resource_path
-
-
-# ---------------------------------------------------------------------------
-# Requested-days compatibility fix
-# ---------------------------------------------------------------------------
-
-def _install_requested_days_dataframe_fix() -> None:
-    """
-    Keep the requested-days score while removing its nested detail payload.
-
-    A multi-day requested range stores a list of several dates inside
-    ``requested_days_off_details``.  Some DataFrame conversion code tests those
-    list-like values with ``if value`` / ``pd.isna(value)``, which produces the
-    NumPy error: "The truth value of an array with more than one element is
-    ambiguous."  The GUI and exported spreadsheet use only the numeric score,
-    so the detail payload is removed before DataFrame conversion.
-    """
-    original = getattr(pf, "add_requested_days_off_scores", None)
-    if original is None or getattr(original, "_ups_gui_dataframe_safe", False):
-        return
-
-    def dataframe_safe_requested_days(
-        master_lines: Any,
-        bid_period_info: Any,
-        requested_dates: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        details_key = kwargs.get("details_key", "requested_days_off_details")
-        result = original(
-            master_lines,
-            bid_period_info,
-            requested_dates,
-            *args,
-            **kwargs,
-        )
-
-        if details_key and isinstance(master_lines, dict):
-            for line_data in master_lines.values():
-                if isinstance(line_data, dict):
-                    line_data.pop(details_key, None)
-
-        return result
-
-    dataframe_safe_requested_days._ups_gui_dataframe_safe = True  # type: ignore[attr-defined]
-    pf.add_requested_days_off_scores = dataframe_safe_requested_days
-
-
-_install_requested_days_dataframe_fix()
 
 
 CONFIG_PATH = Path("bid_config.json")
@@ -471,10 +417,7 @@ class DateEntry(QWidget):
         super().__init__(parent)
         self.line_edit = QLineEdit(self)
         self.line_edit.setPlaceholderText("YYYY-MM-DD")
-        self.line_edit.setMinimumWidth(max(150, width * 10))
-        self.line_edit.setMaximumWidth(max(175, width * 12))
-        self.line_edit.setMinimumHeight(34)
-        self.line_edit.setStyleSheet("font-size: 11pt; padding: 3px 6px;")
+        self.line_edit.setMaximumWidth(width * 10)
 
         self.button = QPushButton(self)
         self.button.setIcon(make_calendar_icon())
@@ -762,18 +705,10 @@ def get_sortable_columns_from_df(df: pd.DataFrame, include_text_columns: bool = 
 # ---------------------------------------------------------------------------
 
 class WheelSafeComboBox(QComboBox):
-    """Combo box that ignores mouse-wheel changes."""
+    """Combo box that ignores mouse-wheel changes unless its popup is open."""
 
     def wheelEvent(self, event: Any) -> None:
         # Page scrolling should never accidentally change a sorting selection.
-        event.ignore()
-
-
-class WheelSafeDoubleSpinBox(QDoubleSpinBox):
-    """Double spin box whose value can only change by typing or its arrows."""
-
-    def wheelEvent(self, event: Any) -> None:
-        # Prevent accidental value changes while scrolling the main page.
         event.ignore()
 
 
@@ -1310,12 +1245,6 @@ class BidGUI(QMainWindow):
             trip_progress_callback=self._queue_trip_progress,
         )
 
-        # ``analysis_df`` is the current unsorted analysis result.  Keeping
-        # it separate lets sort changes, bid-string generation, visualizer
-        # opening, and export reuse the existing scores instead of rebuilding
-        # master_lines every time.
-        self.analysis_df: pd.DataFrame | None = None
-        self.analysis_vacation_ranges: Any = None
         self.preview_df: pd.DataFrame | None = None
         self.cached_bid_period_key: tuple[str, str] | None = None
         self.cached_bid_period: str | None = None
@@ -1326,10 +1255,6 @@ class BidGUI(QMainWindow):
 
         self._loading_saved_values = True
         self.preference_refresh_pending = False
-        self.bid_regeneration_pending = False
-        self.bid_regeneration_copy_after = False
-        self._last_trip_progress_percent = -1
-        self._bid_state_revision = 0
 
         self._setup_style()
         self._build_ui()
@@ -1338,18 +1263,12 @@ class BidGUI(QMainWindow):
         self.preference_refresh_timer.setSingleShot(True)
         self.preference_refresh_timer.timeout.connect(self._refresh_after_preference_change)
 
-        self.bid_regeneration_timer = QTimer(self)
-        self.bid_regeneration_timer.setSingleShot(True)
-        self.bid_regeneration_timer.timeout.connect(
-            self._regenerate_bid_string_after_change
-        )
-
         self._load_saved_values()
         self._loading_saved_values = False
 
         self.queue_timer = QTimer(self)
         self.queue_timer.timeout.connect(self._poll_queue)
-        self.queue_timer.start(50)
+        self.queue_timer.start(100)
 
     # -------------------------- UI construction --------------------------
 
@@ -1476,8 +1395,7 @@ class BidGUI(QMainWindow):
                 gridline-color: #E5E5E5;
             }}
             QTableWidget#PreferenceDateTable::item {{
-                padding: 7px;
-                font-size: 11pt;
+                padding: 4px;
             }}
             QWidget#SortCriteriaList {{
                 background: transparent;
@@ -1742,8 +1660,7 @@ class BidGUI(QMainWindow):
         self.vacation_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.vacation_table.setAlternatingRowColors(True)
         self.vacation_table.setShowGrid(False)
-        self.vacation_table.verticalHeader().setDefaultSectionSize(36)
-        self.vacation_table.setMinimumHeight(145)
+        self.vacation_table.setMinimumHeight(125)
         self.vacation_table.itemChanged.connect(self._on_vacation_table_item_changed)
 
         vacation_card_layout.addLayout(vacation_header)
@@ -1797,8 +1714,7 @@ class BidGUI(QMainWindow):
         self.requested_dates_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.requested_dates_table.setAlternatingRowColors(True)
         self.requested_dates_table.setShowGrid(False)
-        self.requested_dates_table.verticalHeader().setDefaultSectionSize(36)
-        self.requested_dates_table.setMinimumHeight(145)
+        self.requested_dates_table.setMinimumHeight(125)
 
         requested_card_layout.addLayout(requested_header)
         requested_card_layout.addWidget(self.requested_dates_table)
@@ -1841,7 +1757,7 @@ class BidGUI(QMainWindow):
         training_layout.addWidget(self.training_end_entry)
         training_layout.addStretch(1)
 
-        self.hourly_rate_edit = WheelSafeDoubleSpinBox()
+        self.hourly_rate_edit = QDoubleSpinBox()
         self.hourly_rate_edit.setPrefix("$")
         self.hourly_rate_edit.setDecimals(2)
         self.hourly_rate_edit.setRange(0.01, 10000.00)
@@ -1890,7 +1806,7 @@ class BidGUI(QMainWindow):
         emphasis_layout.setSpacing(8)
 
         emphasis_label = QLabel("Priority emphasis:")
-        self.priority_emphasis_spin = WheelSafeDoubleSpinBox()
+        self.priority_emphasis_spin = QDoubleSpinBox()
         self.priority_emphasis_spin.setDecimals(2)
         self.priority_emphasis_spin.setRange(self.soft_min_weight, 100.0)
         self.priority_emphasis_spin.setSingleStep(0.25)
@@ -1995,7 +1911,7 @@ class BidGUI(QMainWindow):
         line_type_emphasis_layout.setContentsMargins(0, 0, 0, 0)
         line_type_emphasis_layout.setSpacing(8)
         line_type_emphasis_label = QLabel("Preference emphasis:")
-        self.line_type_priority_emphasis_spin = WheelSafeDoubleSpinBox()
+        self.line_type_priority_emphasis_spin = QDoubleSpinBox()
         self.line_type_priority_emphasis_spin.setDecimals(2)
         self.line_type_priority_emphasis_spin.setRange(0.05, 100.0)
         self.line_type_priority_emphasis_spin.setSingleStep(0.25)
@@ -2179,9 +2095,7 @@ class BidGUI(QMainWindow):
         self.number_of_lines_edit.setValue(DEFAULT_NUMBER_OF_LINES_TO_BID)
         self.number_of_lines_edit.setMaximumWidth(90)
         self.number_of_lines_edit.valueChanged.connect(
-            lambda _value: self._schedule_bid_string_regeneration(
-                "Number of bid lines changed. Updating bid string..."
-            )
+            lambda _value: self._mark_bid_string_stale()
         )
         number_row.addWidget(self.number_of_lines_edit)
         number_row.addStretch(1)
@@ -2334,11 +2248,7 @@ class BidGUI(QMainWindow):
             self.pdf_status_label.setText(
                 "PDF paths changed. Click Load PDFs again."
             )
-            self.analysis_df = None
-            self.analysis_vacation_ranges = None
             self.preview_df = None
-            self.bid_regeneration_timer.stop()
-            self.bid_regeneration_pending = False
             self.cached_bid_period_key = None
             self.cached_bid_period = None
             self._refresh_available_columns_list([])
@@ -3144,9 +3054,6 @@ class BidGUI(QMainWindow):
         hourly_rate = round(float(self.hourly_rate_edit.value()), 2)
         self.config_data["hourly_rate"] = hourly_rate
         save_config(self.config_data)
-        self._schedule_preference_refresh(
-            "Hourly pay rate changed. Updating analyzer and bid string..."
-        )
 
     def _on_date_preferences_changed(self, status_message: str) -> None:
         if self._loading_saved_values:
@@ -3156,16 +3063,9 @@ class BidGUI(QMainWindow):
     def _schedule_preference_refresh(self, status_message: str) -> None:
         if self._loading_saved_values:
             return
-
-        # Underlying score values changed, so cancel any lightweight sort-only
-        # regeneration and rebuild the analysis once from the cached PDFs.
-        self._bid_state_revision += 1
-        self.bid_regeneration_timer.stop()
-        self.bid_regeneration_pending = False
-        self.bid_regeneration_copy_after = False
         self._clear_bid_string(status_message)
         self.preference_refresh_pending = True
-        self.preference_refresh_timer.start(450)
+        self.preference_refresh_timer.start(500)
 
     def _refresh_after_preference_change(self) -> None:
         if not self.preference_refresh_pending:
@@ -3195,9 +3095,9 @@ class BidGUI(QMainWindow):
 
         self.preference_refresh_pending = False
         self.pdf_status_label.setText(
-            "Preferences changed. Refreshing analyzer and bid string."
+            "Preferences changed. Refreshing analyzer columns."
         )
-        self._start_worker(self._load_worker, inputs, False, True)
+        self._start_worker(self._load_worker, inputs, False)
 
     # -------------------------- Sorting criteria rows --------------------------
 
@@ -3613,8 +3513,8 @@ class BidGUI(QMainWindow):
 
         self.config_data["sort_order"] = self.sort_order
         save_config(self.config_data)
-        self._schedule_bid_string_regeneration(
-            "Sorting criteria changed. Updating bid string..."
+        self._clear_bid_string(
+            "Sorting criteria changed. Generate the bid string again."
         )
 
     def _update_sort_percentages(self) -> None:
@@ -3734,8 +3634,8 @@ class BidGUI(QMainWindow):
         settings = self._get_sorting_settings()
         self.config_data["sorting_settings"] = settings
         save_config(self.config_data)
-        self._schedule_bid_string_regeneration(
-            "Priority emphasis changed. Updating bid string..."
+        self._clear_bid_string(
+            "Priority emphasis changed. Generate the bid string again."
         )
 
     def _validate_sorting_settings_values(
@@ -3812,9 +3712,7 @@ class BidGUI(QMainWindow):
             f"soft weights {sorting_settings['soft_min_weight']}–{sorting_settings['soft_max_weight']}."
         )
         self._update_sort_percentages()
-        self._schedule_bid_string_regeneration(
-            "Advanced sorting settings changed. Updating bid string..."
-        )
+        self._clear_bid_string("Advanced sorting settings changed. Generate the bid string again.")
         if show_message:
             QMessageBox.information(self, "Saved", "Advanced sorting settings saved.")
 
@@ -4081,23 +3979,6 @@ class BidGUI(QMainWindow):
         self.trip_progress_text_label.setText(message)
 
     def _queue_trip_progress(self, progress_data: dict[str, Any]) -> None:
-        # Most large PDFs report progress more frequently than the screen can
-        # repaint. Queue at most one event per visible percentage while still
-        # always forwarding completion/cached events.
-        try:
-            current = int(progress_data.get("current") or 0)
-            total = int(progress_data.get("total") or 0)
-            status = str(progress_data.get("status") or "").lower()
-            percent = int((current / total) * 100) if total > 0 else 0
-        except (TypeError, ValueError, ZeroDivisionError):
-            status = ""
-            percent = 0
-
-        if status not in {"done", "cached", "starting"}:
-            if percent == self._last_trip_progress_percent:
-                return
-            self._last_trip_progress_percent = percent
-
         self.message_queue.put(("trip_progress", progress_data))
 
     def _handle_trip_progress(self, progress_data: dict[str, Any]) -> None:
@@ -4142,9 +4023,7 @@ class BidGUI(QMainWindow):
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
             if self.preference_refresh_pending:
-                QTimer.singleShot(120, self._refresh_after_preference_change)
-            elif self.bid_regeneration_pending:
-                QTimer.singleShot(120, self._regenerate_bid_string_after_change)
+                QTimer.singleShot(150, self._refresh_after_preference_change)
 
     def _log(self, message: str) -> None:
         self.message_queue.put(("log", message))
@@ -4153,71 +4032,52 @@ class BidGUI(QMainWindow):
         self.log_text.append(str(message))
 
     def _poll_queue(self) -> None:
-        # Bound each polling pass so a burst of PDF progress messages cannot
-        # monopolize the GUI thread. Only the newest progress update in this
-        # pass is painted.
-        deadline = time.monotonic() + 0.012
-        processed = 0
-        latest_trip_progress: dict[str, Any] | None = None
-
-        while processed < 80 and time.monotonic() < deadline:
-            try:
+        try:
+            while True:
                 event, payload = self.message_queue.get_nowait()
-            except queue.Empty:
-                break
 
-            processed += 1
-            if event == "trip_progress":
-                if isinstance(payload, dict):
-                    latest_trip_progress = payload
-                continue
-
-            if event == "log":
-                self._write_log(str(payload))
-            elif event == "error":
-                self._set_busy(False)
-                self.pdf_status_label.setText("Error. See status box below.")
-                self._write_log(f"ERROR: {payload}")
-                QMessageBox.critical(self, "Error", str(payload))
-            elif event == "loaded":
-                self._handle_loaded_payload(payload)
-            elif event == "bid_string_ready":
-                self._handle_bid_string_ready_payload(payload)
-            elif event == "visualizer_ready":
-                self._set_busy(False)
-                if isinstance(payload, dict):
-                    self.preview_df = payload.get("df")
-                try:
-                    self._open_visualizer_from_payload(payload)
-                except Exception as exc:
-                    self.pdf_status_label.setText("Visualizer error. See status box below.")
-                    self._write_log(f"ERROR opening visualizer: {exc}")
-                    QMessageBox.critical(self, "Visualizer error", str(exc))
-            elif event == "exported":
-                self._handle_exported_payload(payload)
-
-        if latest_trip_progress is not None:
-            self._handle_trip_progress(latest_trip_progress)
+                if event == "log":
+                    self._write_log(str(payload))
+                elif event == "trip_progress":
+                    if isinstance(payload, dict):
+                        self._handle_trip_progress(payload)
+                elif event == "error":
+                    self._set_busy(False)
+                    self.pdf_status_label.setText("Error. See status box below.")
+                    self._write_log(f"ERROR: {payload}")
+                    QMessageBox.critical(self, "Error", str(payload))
+                elif event == "loaded":
+                    self._handle_loaded_payload(payload)
+                elif event == "bid_string_ready":
+                    self._handle_bid_string_ready_payload(payload)
+                elif event == "visualizer_ready":
+                    self._set_busy(False)
+                    if isinstance(payload, dict):
+                        self.preview_df = payload.get("df")
+                    try:
+                        self._open_visualizer_from_payload(payload)
+                    except Exception as exc:
+                        self.pdf_status_label.setText("Visualizer error. See status box below.")
+                        self._write_log(f"ERROR opening visualizer: {exc}")
+                        QMessageBox.critical(self, "Visualizer error", str(exc))
+                elif event == "exported":
+                    self._handle_exported_payload(payload)
+        except queue.Empty:
+            pass
 
     def _handle_loaded_payload(self, payload: Any) -> None:
         self._set_busy(False)
         if isinstance(payload, dict):
             df = payload["df"]
-            vacation_ranges = payload.get("vacation_ranges")
             show_ready_message = payload.get("show_ready_message", True)
-            auto_regenerate = payload.get("auto_regenerate", True)
             status_text = payload.get("status_text") or "PDFs loaded. Sorting columns are ready."
             log_text = payload.get("log_text") or "Loaded PDFs"
         else:
             df = payload
-            vacation_ranges = None
             show_ready_message = True
-            auto_regenerate = True
             status_text = "PDFs loaded. Sorting columns are ready."
             log_text = "Loaded PDFs"
 
-        self.analysis_df = df
-        self.analysis_vacation_ranges = vacation_ranges
         self.preview_df = df
         columns = get_sortable_columns_from_df(df)
         self._refresh_available_columns_list(columns)
@@ -4226,33 +4086,14 @@ class BidGUI(QMainWindow):
         self._write_log(f"{log_text} and prepared {len(columns)} sortable columns.")
 
         if show_ready_message:
-            QMessageBox.information(
-                self,
-                "Ready",
-                "PDFs are loaded. The bid string will update automatically as settings change.",
-            )
-
-        if auto_regenerate:
-            self._schedule_bid_string_regeneration(
-                "Analyzer updated. Generating bid string..."
-            )
+            QMessageBox.information(self, "Ready", "PDFs are loaded. Choose your sorting priority, then export.")
 
     def _handle_bid_string_ready_payload(self, payload: Any) -> None:
         self._set_busy(False)
         if isinstance(payload, dict):
-            revision = payload.get("revision")
-            if revision is not None and revision != self._bid_state_revision:
-                self.bid_string_status_label.setText(
-                    "Settings changed again. Updating bid string..."
-                )
-                return
-
             bid_string = str(payload.get("bid_string") or "")
             number_of_lines = payload.get("number_of_lines")
             copy_after = bool(payload.get("copy_after"))
-            sorted_df = payload.get("df")
-            if sorted_df is not None:
-                self.preview_df = sorted_df
         else:
             bid_string = str(payload)
             number_of_lines = None
@@ -4355,116 +4196,7 @@ class BidGUI(QMainWindow):
     # -------------------------- Bid string actions --------------------------
 
     def _mark_bid_string_stale(self, status_message: str | None = None) -> None:
-        self._schedule_bid_string_regeneration(
-            status_message or "Inputs changed. Updating bid string..."
-        )
-
-    def _schedule_bid_string_regeneration(
-        self,
-        status_message: str = "Updating bid string...",
-        *,
-        copy_after: bool = False,
-    ) -> None:
-        if self._loading_saved_values:
-            return
-
-        self._bid_state_revision += 1
-        self._clear_bid_string(status_message)
-        self.bid_regeneration_copy_after = (
-            self.bid_regeneration_copy_after or copy_after
-        )
-
-        if self.analysis_df is None or not self.analysis_pipeline.has_cached_pdf_data:
-            self.bid_regeneration_pending = False
-            self.bid_string_status_label.setText(
-                "Bid string will generate automatically after the PDFs are loaded."
-            )
-            return
-
-        self.bid_regeneration_pending = True
-        self.bid_regeneration_timer.start(300)
-
-    def _regenerate_bid_string_after_change(self) -> None:
-        if not self.bid_regeneration_pending:
-            return
-
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.bid_regeneration_timer.start(150)
-            return
-
-        try:
-            inputs = self._collect_inputs()
-            self._save_inputs_to_config(inputs)
-        except Exception as exc:
-            self.bid_regeneration_pending = False
-            self.bid_string_status_label.setText(
-                "Automatic bid-string update is waiting for valid inputs."
-            )
-            self._write_log(f"Automatic bid-string update skipped: {exc}")
-            return
-
-        current_key = (inputs["trips_pdf_path"], inputs["lines_pdf_path"])
-        if (
-            self.analysis_df is None
-            or not self.analysis_pipeline.has_cached_pdf_data_for(*current_key)
-        ):
-            self.bid_regeneration_pending = False
-            self.bid_string_status_label.setText(
-                "Load the selected PDFs to generate the bid string."
-            )
-            return
-
-        source_df = self.analysis_df.copy(deep=True)
-        copy_after = self.bid_regeneration_copy_after
-        self.bid_regeneration_pending = False
-        self.bid_regeneration_copy_after = False
-        self.bid_string_status_label.setText("Updating bid string...")
-        self._start_worker(
-            self._bid_string_worker,
-            inputs,
-            copy_after,
-            source_df,
-            self._bid_state_revision,
-        )
-
-    @staticmethod
-    def _sort_analysis_dataframe(
-        source_df: pd.DataFrame,
-        inputs: dict[str, Any],
-    ) -> pd.DataFrame:
-        df = source_df.copy(deep=True)
-        sort_order = inputs.get("sort_order") or []
-        if not sort_order:
-            return df
-
-        sorting_settings = (
-            inputs.get("sorting_settings") or DEFAULT_SORTING_SETTINGS
-        )
-        df = drop_empty_sort_columns(df, check_all_columns=True)
-        return sort_dataframe_by_conditions(
-            df,
-            sort_order,
-            default_mode=sorting_settings["default_mode"],
-            weighting_style=sorting_settings["weighting_style"],
-            soft_max_weight=sorting_settings["soft_max_weight"],
-            soft_min_weight=sorting_settings["soft_min_weight"],
-        )
-
-    def _cached_analysis_snapshot(
-        self,
-        inputs: dict[str, Any],
-    ) -> tuple[pd.DataFrame | None, Any]:
-        current_key = (inputs["trips_pdf_path"], inputs["lines_pdf_path"])
-        if (
-            self.analysis_df is None
-            or not self.analysis_pipeline.has_cached_pdf_data_for(*current_key)
-        ):
-            return None, None
-
-        return (
-            self.analysis_df.copy(deep=True),
-            self.analysis_vacation_ranges,
-        )
+        self._clear_bid_string(status_message or "Inputs changed. Generate the bid string again after sorting.")
 
     def _display_bid_string(self, bid_string: str) -> None:
         self.bid_string_text.setPlainText(bid_string or "")
@@ -4510,15 +4242,8 @@ class BidGUI(QMainWindow):
             self.pdf_status_label.setText("PDFs not loaded for these paths. Loading first, then generating bid string...")
             self._reset_trip_progress("Trips extraction progress: waiting to start...")
 
-        source_df, _vacation_ranges = self._cached_analysis_snapshot(inputs)
         self.bid_string_status_label.setText("Generating bid string...")
-        self._start_worker(
-            self._bid_string_worker,
-            inputs,
-            copy_after,
-            source_df,
-            self._bid_state_revision,
-        )
+        self._start_worker(self._bid_string_worker, inputs, copy_after)
 
     def copy_bid_string(self) -> None:
         if self.latest_bid_string.strip() or self._get_displayed_bid_string():
@@ -4547,10 +4272,9 @@ class BidGUI(QMainWindow):
             return
 
         self.pdf_status_label.setText("Loading PDFs...")
-        self._clear_bid_string("PDFs are loading. The bid string will generate automatically.")
+        self._clear_bid_string("PDFs are loading. Generate the bid string after sorting.")
         self._reset_trip_progress("Trips extraction progress: waiting to start...")
-        self._last_trip_progress_percent = -1
-        self._start_worker(self._load_worker, inputs, True, True)
+        self._start_worker(self._load_worker, inputs, True)
 
     def export_excel(self) -> None:
         try:
@@ -4600,13 +4324,7 @@ class BidGUI(QMainWindow):
                 "Trips extraction progress: waiting to start..."
             )
 
-        source_df, vacation_ranges = self._cached_analysis_snapshot(inputs)
-        self._start_worker(
-            self._export_worker,
-            inputs,
-            source_df,
-            vacation_ranges,
-        )
+        self._start_worker(self._export_worker, inputs)
 
     def open_visualizer(self) -> None:
         try:
@@ -4628,32 +4346,16 @@ class BidGUI(QMainWindow):
         else:
             self.pdf_status_label.setText("Opening visualizer...")
 
-        source_df, vacation_ranges = self._cached_analysis_snapshot(inputs)
-        self._start_worker(
-            self._visualizer_worker,
-            inputs,
-            source_df,
-            vacation_ranges,
-        )
+        self._start_worker(self._visualizer_worker, inputs)
 
-    def _load_worker(
-        self,
-        inputs: dict[str, Any],
-        show_ready_message: bool = True,
-        auto_regenerate: bool = True,
-    ) -> None:
+    def _load_worker(self, inputs: dict[str, Any], show_ready_message: bool = True) -> None:
         try:
-            df, vacation_ranges = self.analysis_pipeline.build_dataframe(
-                inputs,
-                apply_sort=False,
-            )
+            df, _ = self.analysis_pipeline.build_dataframe(inputs, apply_sort=False)
             self.message_queue.put((
                 "loaded",
                 {
                     "df": df,
-                    "vacation_ranges": vacation_ranges,
                     "show_ready_message": show_ready_message,
-                    "auto_regenerate": auto_regenerate,
                     "status_text": "PDFs loaded. Sorting columns are ready."
                     if show_ready_message
                     else "Analyzer refreshed. Sorting columns are ready.",
@@ -4749,22 +4451,9 @@ class BidGUI(QMainWindow):
         self.pdf_status_label.setText("Visualizer opened.")
         self._write_log("Opened Bid Table Viewer with sorted DataFrame.")
 
-    def _visualizer_worker(
-        self,
-        inputs: dict[str, Any],
-        source_df: pd.DataFrame | None = None,
-        vacation_ranges: list[dict[str, Any]] | None = None,
-    ) -> None:
+    def _visualizer_worker(self, inputs: dict[str, Any]) -> None:
         try:
-            if source_df is None:
-                sorted_df, vacation_ranges = self.analysis_pipeline.build_dataframe(
-                    inputs,
-                    apply_sort=True,
-                )
-            else:
-                sorted_df = self._sort_analysis_dataframe(source_df, inputs)
-                self._log("Using cached analyzer values for the visualizer.")
-
+            sorted_df, vacation_ranges = self.analysis_pipeline.build_dataframe(inputs, apply_sort=True)
             self.message_queue.put((
                 "visualizer_ready",
                 {
@@ -4778,21 +4467,9 @@ class BidGUI(QMainWindow):
         except Exception as exc:
             self.message_queue.put(("error", exc))
 
-    def _export_worker(
-        self,
-        inputs: dict[str, Any],
-        source_df: pd.DataFrame | None = None,
-        new_vacation_ranges: list[dict[str, Any]] | None = None,
-    ) -> None:
+    def _export_worker(self, inputs: dict[str, Any]) -> None:
         try:
-            if source_df is None:
-                df, new_vacation_ranges = self.analysis_pipeline.build_dataframe(
-                    inputs,
-                    apply_sort=True,
-                )
-            else:
-                df = self._sort_analysis_dataframe(source_df, inputs)
-                self._log("Using cached analyzer values for Excel export.")
+            df, new_vacation_ranges = self.analysis_pipeline.build_dataframe(inputs, apply_sort=True)
 
             self._log("Generating bid string...")
             bid_string = pf.line_numbers_to_bid_string(df, inputs["number_of_lines_to_bid"])
@@ -4818,28 +4495,11 @@ class BidGUI(QMainWindow):
         except Exception as exc:
             self.message_queue.put(("error", exc))
 
-    def _bid_string_worker(
-        self,
-        inputs: dict[str, Any],
-        copy_after: bool = False,
-        source_df: pd.DataFrame | None = None,
-        revision: int | None = None,
-    ) -> None:
+    def _bid_string_worker(self, inputs: dict[str, Any], copy_after: bool = False) -> None:
         try:
-            if source_df is None:
-                df, _ = self.analysis_pipeline.build_dataframe(
-                    inputs,
-                    apply_sort=True,
-                )
-            else:
-                df = self._sort_analysis_dataframe(source_df, inputs)
-                self._log("Using cached analyzer values for bid-string sorting.")
-
+            df, _ = self.analysis_pipeline.build_dataframe(inputs, apply_sort=True)
             self._log("Generating bid string...")
-            bid_string = pf.line_numbers_to_bid_string(
-                df,
-                inputs["number_of_lines_to_bid"],
-            )
+            bid_string = pf.line_numbers_to_bid_string(df, inputs["number_of_lines_to_bid"])
 
             self.message_queue.put((
                 "bid_string_ready",
@@ -4847,8 +4507,6 @@ class BidGUI(QMainWindow):
                     "bid_string": bid_string,
                     "number_of_lines": inputs["number_of_lines_to_bid"],
                     "copy_after": copy_after,
-                    "df": df,
-                    "revision": revision,
                 },
             ))
         except Exception as exc:
