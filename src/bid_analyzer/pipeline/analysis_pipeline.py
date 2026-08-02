@@ -63,6 +63,7 @@ class AnalysisPipeline:
         log_callback: LogCallback | None = None,
         trip_progress_callback: TripProgressCallback | None = None,
         airports_csv_path: str | Path | None = None,
+        parallel_pdf_extraction: bool | None = None,
     ) -> None:
         self._log_callback = log_callback
         self._trip_progress_callback = trip_progress_callback
@@ -70,6 +71,12 @@ class AnalysisPipeline:
             Path(airports_csv_path)
             if airports_csv_path is not None
             else resource_path("airports.csv")
+        )
+        # Parallel extraction was faster on the user's Windows systems and
+        # sequential extraction did not improve GUI responsiveness in practice.
+        self._parallel_pdf_extraction = (
+            True if parallel_pdf_extraction is None
+            else bool(parallel_pdf_extraction)
         )
 
         self._cached_lines: dict[str, Any] | None = None
@@ -80,6 +87,13 @@ class AnalysisPipeline:
         self._cached_airport_lookup: dict[str, Any] | None = None
         self._cached_unmatched_airports: Any = None
         self._cached_matched_airports_df: pd.DataFrame | None = None
+
+        # Cached after PDF merging plus preference-independent scoring. Dynamic
+        # refreshes use shallow per-line copies because the scoring functions
+        # only add top-level values and read the nested assignments.
+        self._cached_static_master_lines_key: tuple[str, str] | None = None
+        self._cached_static_master_lines: dict[Any, dict[str, Any]] | None = None
+        self._cached_static_dataframe: pd.DataFrame | None = None
 
     @property
     def cached_pdf_key(self) -> tuple[str, str] | None:
@@ -131,6 +145,10 @@ class AnalysisPipeline:
         self._cached_airport_lookup = None
         self._cached_unmatched_airports = None
         self._cached_matched_airports_df = None
+
+        self._cached_static_master_lines_key = None
+        self._cached_static_master_lines = None
+        self._cached_static_dataframe = None
 
     def _log(self, message: str) -> None:
         if self._log_callback is not None:
@@ -212,19 +230,28 @@ class AnalysisPipeline:
             "total_trips": 0,
         })
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            trips_future = executor.submit(
-                self._extract_trips_with_progress,
-                inputs["trips_pdf_path"],
+        if self._parallel_pdf_extraction:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                trips_future = executor.submit(
+                    self._extract_trips_with_progress,
+                    inputs["trips_pdf_path"],
+                )
+                lines_future = executor.submit(
+                    parse_line_report_pdf,
+                    inputs["lines_pdf_path"],
+                    first_calendar_page=3,
+                )
+
+                trips = trips_future.result()
+                lines = lines_future.result()
+        else:
+            trips = self._extract_trips_with_progress(
+                inputs["trips_pdf_path"]
             )
-            lines_future = executor.submit(
-                parse_line_report_pdf,
+            lines = parse_line_report_pdf(
                 inputs["lines_pdf_path"],
                 first_calendar_page=3,
             )
-
-            trips = trips_future.result()
-            lines = lines_future.result()
 
         self._cached_pdf_key = pdf_key
         self._cached_trips = trips
@@ -450,16 +477,77 @@ class AnalysisPipeline:
                 2,
             )
 
+    @staticmethod
+    def _clone_static_master_lines(
+        static_master_lines: dict[Any, dict[str, Any]],
+    ) -> dict[Any, dict[str, Any]]:
+        """Copy only each line's top-level dictionary.
+
+        Nested PPs, assignments, and flights are treated as read-only by the
+        preference-dependent scoring functions. Avoiding deepcopy here removes
+        a large amount of Python/GIL work from every preference refresh.
+        """
+        return {
+            line_number: line_data.copy()
+            for line_number, line_data in static_master_lines.items()
+        }
+
+    @staticmethod
+    def _line_data_for_number(
+        master_lines: dict[Any, dict[str, Any]],
+        line_number: Any,
+    ) -> dict[str, Any]:
+        if line_number in master_lines:
+            return master_lines[line_number]
+
+        text = str(line_number)
+        if text in master_lines:
+            return master_lines[text]
+
+        try:
+            numeric = int(line_number)
+        except (TypeError, ValueError):
+            return {}
+        return master_lines.get(numeric, {})
+
+    def _apply_dynamic_columns(
+        self,
+        base_df: pd.DataFrame,
+        master_lines: dict[Any, dict[str, Any]],
+    ) -> pd.DataFrame:
+        """Update only preference-dependent DataFrame columns."""
+        df = base_df.copy(deep=True)
+        line_data_rows = [
+            self._line_data_for_number(master_lines, line_number)
+            for line_number in df["Line Number"].tolist()
+        ]
+
+        column_fields = {
+            "Extra Vacation Days": ("extra_vacation_days", 0),
+            "Line Type": ("line_type_preference_score", 0),
+            "Training in Days On": ("training_fit_score", 0),
+            "% of Days Off Requested": ("pct_requested_days_off", 0),
+            "Pay": ("tot_pay", 0),
+            "Tax-Free Pay": ("pay_per_diem", 0),
+            "Start bid off": ("bid_start_days_off", 0),
+            "End bid off": ("bid_end_days_off", 0),
+        }
+
+        for column, (field, default) in column_fields.items():
+            df[column] = [
+                line_data.get(field, default)
+                for line_data in line_data_rows
+            ]
+
+        return df
+
     def build_dataframe(
         self,
         inputs: dict[str, Any],
         *,
         apply_sort: bool,
     ) -> tuple[pd.DataFrame, list[dict[str, Any]] | None]:
-        """
-        Extract/cache PDFs, build master_lines, apply processing, create a
-        DataFrame, and optionally sort it.
-        """
+        """Build the analysis DataFrame while reusing static PDF-derived work."""
         trips, lines = self._extract_pdfs(inputs)
 
         bid_period_info = {
@@ -475,21 +563,61 @@ class AnalysisPipeline:
             trips=trips,
         )
 
-        self._log("Creating master lines...")
-        master_lines = creating_master_line(
-            trips,
-            lines,
+        pdf_key = (
+            inputs["trips_pdf_path"],
+            inputs["lines_pdf_path"],
         )
 
-        self._log("Adding blockiness scores...")
-        pf.add_blockiness_scores(
-            master_lines,
-            bid_period_info,
-        )
+        if (
+            self._cached_static_master_lines_key == pdf_key
+            and self._cached_static_master_lines is not None
+            and self._cached_static_dataframe is not None
+        ):
+            self._log("Using cached master lines, calendar, and static scores...")
+            static_master_lines = self._cached_static_master_lines
+        else:
+            self._log("Creating master lines...")
+            static_master_lines = creating_master_line(trips, lines)
 
-        self._log("Adding company-ticket percentages...")
-        pf.add_company_ticket_percentages(master_lines)
+            self._log("Adding blockiness scores...")
+            pf.add_blockiness_scores(static_master_lines, bid_period_info)
 
+            self._log("Adding company-ticket percentages...")
+            pf.add_company_ticket_percentages(static_master_lines)
+
+            self._log("Adding complete-weekends-off percentages...")
+            pf.add_weekends_off_percentage(static_master_lines)
+
+            self._log("Adding international-destination scores...")
+            pf.add_international_destination_scores(
+                static_master_lines,
+                airport_lookup,
+            )
+
+            self._log("Adding average legs per work day...")
+            pf.add_avg_legs_per_work_day(static_master_lines)
+
+            # The GUI always exposes both bid-edge columns. Calculate them once
+            # with the other preference-independent values.
+            self._log("Adding bid-edge days-off scores...")
+            pf.add_bid_edge_days_off(
+                static_master_lines,
+                bid_period_info,
+                edge="both",
+            )
+
+            self._log("Creating cached calendar DataFrame...")
+            self._cached_static_dataframe = master_lines_to_dataframe(
+                static_master_lines,
+                bid_period_info,
+            )
+            self._cached_static_master_lines_key = pdf_key
+            self._cached_static_master_lines = static_master_lines
+
+        master_lines = self._clone_static_master_lines(static_master_lines)
+
+        # Preference-dependent scores are recalculated on every coalesced
+        # refresh, without rebuilding the calendar columns.
         self._log("Adding line-type preference scores...")
         pf.add_line_type_preference_scores(
             master_lines,
@@ -497,23 +625,14 @@ class AnalysisPipeline:
             power_law_coeff=float(
                 inputs.get("line_type_priority_emphasis", 3.0)
             ),
-            top_score=float(
-                inputs.get("line_type_top_score", 100.0)
-            ),
-            bottom_score=float(
-                inputs.get("line_type_bottom_score", 10.0)
-            ),
-            disabled_score=float(
-                inputs.get("line_type_disabled_score", 0.0)
-            ),
+            top_score=float(inputs.get("line_type_top_score", 100.0)),
+            bottom_score=float(inputs.get("line_type_bottom_score", 10.0)),
+            disabled_score=float(inputs.get("line_type_disabled_score", 0.0)),
         )
 
         self._log("Adding estimated pay...")
         try:
-            pf.add_pay(
-                master_lines,
-                inputs["hourly_rate"],
-            )
+            pf.add_pay(master_lines, inputs["hourly_rate"])
         except UnboundLocalError as exc:
             error_text = str(exc)
             if (
@@ -523,25 +642,12 @@ class AnalysisPipeline:
                 raise
 
             self._log(
-                "The current add_pay function hit its local-variable "
-                "'pp' bug. Applying the same documented pay formula "
-                "with the pipeline fallback."
+                "The current add_pay function hit its local-variable 'pp' "
+                "bug. Applying the pipeline fallback."
             )
-            self._add_pay_fallback(
-                master_lines,
-                inputs["hourly_rate"],
-            )
+            self._add_pay_fallback(master_lines, inputs["hourly_rate"])
 
-        self._log("Adding complete-weekends-off percentages...")
-        pf.add_weekends_off_percentage(master_lines)
-
-        self._log("Adding international-destination scores...")
-        pf.add_international_destination_scores(
-            master_lines,
-            airport_lookup,
-        )
-
-        if inputs["requested_dates"] is not None:
+        if inputs.get("requested_dates") is not None:
             self._log("Adding requested-days-off scores...")
             pf.add_requested_days_off_scores(
                 master_lines,
@@ -549,7 +655,7 @@ class AnalysisPipeline:
                 inputs["requested_dates"],
             )
 
-        if inputs["vacation_ranges"] is not None:
+        if inputs.get("vacation_ranges") is not None:
             self._log("Adding vacation scores...")
             new_vacation_ranges = pf.add_vacation_days_off_score(
                 master_lines,
@@ -560,7 +666,7 @@ class AnalysisPipeline:
         else:
             new_vacation_ranges = None
 
-        if inputs["training_start"] is not None:
+        if inputs.get("training_start") is not None:
             self._log("Adding training-fit scores...")
             pf.add_training_fit_score(
                 master_lines,
@@ -569,50 +675,41 @@ class AnalysisPipeline:
                 bid_period_info,
             )
 
-        self._log("Adding average legs per work day...")
-        pf.add_avg_legs_per_work_day(master_lines)
-
-        if inputs["bid_edge"] != "none":
-            self._log("Adding bid-edge days-off scores...")
-            pf.add_bid_edge_days_off(
-                master_lines,
-                bid_period_info,
-                edge=inputs["bid_edge"],
-            )
-
-        self._log("Creating DataFrame...")
-        df = master_lines_to_dataframe(
+        self._log("Updating preference-dependent DataFrame columns...")
+        if self._cached_static_dataframe is None:
+            raise RuntimeError("Static DataFrame cache was not initialized.")
+        df = self._apply_dynamic_columns(
+            self._cached_static_dataframe,
             master_lines,
-            bid_period_info,
         )
 
-        if apply_sort and inputs["sort_order"]:
+        if apply_sort and inputs.get("sort_order"):
             sorting_settings = (
                 inputs.get("sorting_settings")
                 or DEFAULT_SORTING_SETTINGS
             )
 
-            self._log(
-                "Sorting DataFrame "
-                f"({sorting_settings['default_mode']}, "
-                f"{sorting_settings['weighting_style']}, "
-                f"soft weights "
-                f"{sorting_settings['soft_min_weight']}–"
-                f"{sorting_settings['soft_max_weight']})."
-            )
+            valid_sort_order = [
+                rule for rule in inputs["sort_order"]
+                if rule and str(rule[0]) in df.columns
+            ]
+            if valid_sort_order:
+                self._log(
+                    "Sorting DataFrame "
+                    f"({sorting_settings['default_mode']}, "
+                    f"{sorting_settings['weighting_style']}, "
+                    f"soft weights {sorting_settings['soft_min_weight']}–"
+                    f"{sorting_settings['soft_max_weight']})."
+                )
+                df = sort_dataframe_by_conditions(
+                    df,
+                    valid_sort_order,
+                    default_mode=sorting_settings["default_mode"],
+                    weighting_style=sorting_settings["weighting_style"],
+                    soft_max_weight=sorting_settings["soft_max_weight"],
+                    soft_min_weight=sorting_settings["soft_min_weight"],
+                )
 
-            df = drop_empty_sort_columns(
-                df,
-                check_all_columns=True,
-            )
-
-            df = sort_dataframe_by_conditions(
-                df,
-                inputs["sort_order"],
-                default_mode=sorting_settings["default_mode"],
-                weighting_style=sorting_settings["weighting_style"],
-                soft_max_weight=sorting_settings["soft_max_weight"],
-                soft_min_weight=sorting_settings["soft_min_weight"],
-            )
+            df = drop_empty_sort_columns(df, check_all_columns=True)
 
         return df, new_vacation_ranges

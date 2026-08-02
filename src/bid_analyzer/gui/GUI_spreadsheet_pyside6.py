@@ -69,12 +69,37 @@ from PySide6.QtWidgets import (
 
 
 # -----------------------------
+# Application UI scale helpers
+# -----------------------------
+
+def current_ui_scale_percent() -> int:
+    app = QApplication.instance()
+    if app is None:
+        return 100
+    try:
+        return max(80, min(200, int(app.property("ups_ui_scale_percent") or 100)))
+    except (TypeError, ValueError):
+        return 100
+
+
+def ui_px(value: int | float) -> int:
+    return max(1, round(float(value) * current_ui_scale_percent() / 100.0))
+
+
+# -----------------------------
 # Date / formatting helpers
 # -----------------------------
 
 def normalize_date(value) -> Optional[date]:
-    """Convert a column name or user input into a date, when possible."""
-    if value is None or value == "":
+    """Convert one scalar value into a date without testing arrays as booleans."""
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+    elif isinstance(value, (dict, list, tuple, set, pd.Series, pd.Index)):
+        # Ranges and other collections are normalized by their dedicated helper.
         return None
 
     if isinstance(value, datetime):
@@ -85,13 +110,19 @@ def normalize_date(value) -> Optional[date]:
 
     try:
         converted = pd.to_datetime(value, errors="coerce")
+        missing = pd.isna(converted)
+        if bool(missing):
+            return None
+    except (TypeError, ValueError):
+        # Includes NumPy/Pandas' "truth value of an array is ambiguous" case.
+        return None
     except Exception:
         return None
 
-    if pd.isna(converted):
+    try:
+        return converted.date()
+    except Exception:
         return None
-
-    return converted.date()
 
 
 def normalize_date_ranges(ranges) -> list[tuple[date, date]]:
@@ -131,22 +162,64 @@ def normalize_date_ranges(ranges) -> list[tuple[date, date]]:
 
 
 def normalize_date_list(values) -> set[date]:
-    """Normalize a list/set/tuple/Series of individual date values."""
+    """Normalize individual dates; range-like items are handled separately."""
     if values is None:
         return set()
 
-    # Accept either one date-like value or an iterable of date-like values.
     if isinstance(values, (str, date, datetime, pd.Timestamp)):
         values = [values]
 
     result: set[date] = set()
 
-    for value in values:
+    try:
+        iterator = iter(values)
+    except TypeError:
+        iterator = iter([values])
+
+    for value in iterator:
         normalized = normalize_date(value)
         if normalized is not None:
             result.add(normalized)
 
     return result
+
+
+def split_requested_days_off_values(values) -> tuple[set[date], list[tuple[date, date]]]:
+    """Accept old mixed input while preserving explicit requested ranges."""
+    if values is None:
+        return set(), []
+
+    if isinstance(values, (str, date, datetime, pd.Timestamp)):
+        values = [values]
+
+    dates: set[date] = set()
+    ranges: list[tuple[date, date]] = []
+
+    try:
+        iterator = iter(values)
+    except TypeError:
+        iterator = iter([values])
+
+    for item in iterator:
+        is_range = (
+            isinstance(item, dict)
+            and "start" in item
+            and "end" in item
+        ) or (
+            isinstance(item, (tuple, list))
+            and len(item) == 2
+        )
+
+        if is_range:
+            normalized_ranges = normalize_date_ranges([item])
+            ranges.extend(normalized_ranges)
+            continue
+
+        normalized = normalize_date(item)
+        if normalized is not None:
+            dates.add(normalized)
+
+    return dates, ranges
 
 
 def date_ranges_to_date_set(ranges: Iterable[tuple[date, date]]) -> set[date]:
@@ -172,11 +245,15 @@ def date_in_any_range(d: date, ranges: Iterable[tuple[date, date]]) -> bool:
 
 
 def is_blank(value) -> bool:
-    if value is None or value == "":
+    if value is None:
+        return True
+    if isinstance(value, str) and value == "":
         return True
 
     try:
         return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
     except Exception:
         return False
 
@@ -263,6 +340,14 @@ class TableTheme:
     header_background: QColor
     header_text: QColor
     calendar_occupied_fill: QColor
+
+
+UPS_BROWN = "#351C15"
+UPS_BROWN_2 = "#4B2618"
+UPS_GOLD = "#FFB500"
+UPS_TEXT = "#FFF7E6"
+UPS_BLUE = "#1F6FEB"
+UPS_BLUE_ACTIVE = "#1557B0"
 
 
 TABLE_THEMES = {
@@ -362,9 +447,20 @@ class DataFrameTableModel(QAbstractTableModel):
         self.training_start = normalize_date(training_start)
         self.training_end = normalize_date(training_end)
         self.vacation_ranges = normalize_date_ranges(vacation_ranges)
-        self.requested_days_off_ranges = normalize_date_ranges(requested_days_off_ranges)
-        self.requested_days_off_dates = normalize_date_list(requested_days_off_dates)
-        self.requested_days_off_dates.update(date_ranges_to_date_set(self.requested_days_off_ranges))
+
+        mixed_dates, mixed_ranges = split_requested_days_off_values(
+            requested_days_off_dates
+        )
+        explicit_ranges = normalize_date_ranges(requested_days_off_ranges)
+
+        # Preserve order while removing duplicate ranges.
+        self.requested_days_off_ranges = list(
+            dict.fromkeys(explicit_ranges + mixed_ranges)
+        )
+        self.requested_days_off_dates = mixed_dates
+        self.requested_days_off_dates.update(
+            date_ranges_to_date_set(self.requested_days_off_ranges)
+        )
 
         self._columns = list(self._df.columns)
         self._calendar_dates_by_col = self._build_calendar_column_map(calendar_cols)
@@ -1769,7 +1865,7 @@ class ColumnVisibilityDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Hide/Show Columns")
-        self.resize(440, 560)
+        self.resize(ui_px(440), ui_px(560))
 
         self.model = model
         self.list_widget = QListWidget(self)
@@ -1808,13 +1904,13 @@ class ColumnVisibilityDialog(QDialog):
                 border: 1px solid #D0D0D0;
             }
             QScrollBar::handle:vertical {
-                background: #FFFFFF;
-                border: 1px solid #A8A8A8;
+                background: #D9D9D9;
+                border: 1px solid #B8B8B8;
                 border-radius: 6px;
                 min-height: 28px;
             }
             QScrollBar::handle:vertical:hover {
-                background: #F2F2F2;
+                background: #CFCFCF;
             }
             QScrollBar::add-line:vertical,
             QScrollBar::sub-line:vertical {
@@ -1926,7 +2022,7 @@ class LineTypeVisibilityDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Hide/Show Line Types")
-        self.resize(420, 430)
+        self.resize(ui_px(420), ui_px(430))
 
         self.model = model
         self.list_widget = QListWidget(self)
@@ -2071,7 +2167,7 @@ class ExportCompleteDialog(QDialog):
         self.setWindowTitle("Excel Export Complete")
         self.setModal(True)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        self.setMinimumWidth(680)
+        self.setMinimumWidth(ui_px(680))
 
         title = QLabel("Excel file saved successfully.")
         title_font = QFont(title.font())
@@ -2161,6 +2257,44 @@ class BidSpreadsheetViewer(QWidget):
         parent=None,
     ):
         super().__init__(parent)
+
+        # The main application no longer installs its stylesheet globally.
+        # Give the visualizer its original UPS-brown chrome explicitly while
+        # leaving the spreadsheet table free to use its light/dark table theme.
+        self.setObjectName("BidSpreadsheetViewer")
+        self.setStyleSheet(f"""
+            QWidget#BidSpreadsheetViewer {{
+                background: {UPS_BROWN};
+                color: {UPS_TEXT};
+                font-family: Segoe UI, Arial, sans-serif;
+            }}
+            QWidget#BidSpreadsheetViewer QLabel {{
+                background: transparent;
+                color: {UPS_TEXT};
+            }}
+            QWidget#BidSpreadsheetViewer QLineEdit,
+            QWidget#BidSpreadsheetViewer QSpinBox {{
+                background: white;
+                color: black;
+                selection-background-color: {UPS_BLUE};
+                selection-color: white;
+            }}
+            QWidget#BidSpreadsheetViewer QPushButton {{
+                background: {UPS_BLUE};
+                color: white;
+                border: 1px solid {UPS_BLUE};
+                border-radius: 4px;
+                padding: 6px 10px;
+            }}
+            QWidget#BidSpreadsheetViewer QPushButton:hover {{
+                background: {UPS_BLUE_ACTIVE};
+            }}
+            QWidget#BidSpreadsheetViewer QPushButton:disabled {{
+                background: #777777;
+                color: #DDDDDD;
+                border-color: #777777;
+            }}
+        """)
 
         self.calendar_col_width = calendar_col_width
         self.calendar_row_height = calendar_row_height
@@ -2258,7 +2392,7 @@ class BidSpreadsheetViewer(QWidget):
         self.bid_string_preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         self.theme_button = QPushButton()
-        self.theme_button.setMinimumWidth(84)
+        self.theme_button.setMinimumWidth(ui_px(84))
         self.theme_button.clicked.connect(self.toggle_theme)
         self.update_theme_button()
 
@@ -2285,7 +2419,7 @@ class BidSpreadsheetViewer(QWidget):
         self.find_input = QLineEdit()
         self.find_input.setPlaceholderText("Find...")
         self.find_input.setClearButtonEnabled(True)
-        self.find_input.setMaximumWidth(190)
+        self.find_input.setMaximumWidth(ui_px(190))
         self.find_input.textChanged.connect(self.on_find_text_changed)
         self.find_input.returnPressed.connect(self.find_next)
 
@@ -2298,7 +2432,7 @@ class BidSpreadsheetViewer(QWidget):
         self.find_next_button.clicked.connect(self.find_next)
 
         self.find_count_label = QLabel("")
-        self.find_count_label.setMinimumWidth(70)
+        self.find_count_label.setMinimumWidth(ui_px(70))
 
         self.move_up_button = QPushButton("Move Row Up")
         self.move_down_button = QPushButton("Move Row Down")
@@ -3104,6 +3238,27 @@ class BidSpreadsheetWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Bid Spreadsheet Viewer")
         self.resize(1400, 800)
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background: {UPS_BROWN};
+            }}
+            QMenuBar {{
+                background: {UPS_BROWN};
+                color: {UPS_TEXT};
+            }}
+            QMenuBar::item:selected {{
+                background: {UPS_BROWN_2};
+                color: {UPS_GOLD};
+            }}
+            QMenu {{
+                background: white;
+                color: black;
+            }}
+            QMenu::item:selected {{
+                background: {UPS_BLUE};
+                color: white;
+            }}
+        """)
 
         self.viewer = BidSpreadsheetViewer(df, **viewer_kwargs)
         self.setCentralWidget(self.viewer)

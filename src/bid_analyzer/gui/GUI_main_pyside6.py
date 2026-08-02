@@ -91,54 +91,6 @@ from bid_analyzer.core import processing_functions as pf
 from bid_analyzer.resource_paths import resource_path
 
 
-# ---------------------------------------------------------------------------
-# Requested-days compatibility fix
-# ---------------------------------------------------------------------------
-
-def _install_requested_days_dataframe_fix() -> None:
-    """
-    Keep the requested-days score while removing its nested detail payload.
-
-    A multi-day requested range stores a list of several dates inside
-    ``requested_days_off_details``.  Some DataFrame conversion code tests those
-    list-like values with ``if value`` / ``pd.isna(value)``, which produces the
-    NumPy error: "The truth value of an array with more than one element is
-    ambiguous."  The GUI and exported spreadsheet use only the numeric score,
-    so the detail payload is removed before DataFrame conversion.
-    """
-    original = getattr(pf, "add_requested_days_off_scores", None)
-    if original is None or getattr(original, "_ups_gui_dataframe_safe", False):
-        return
-
-    def dataframe_safe_requested_days(
-        master_lines: Any,
-        bid_period_info: Any,
-        requested_dates: Any,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        details_key = kwargs.get("details_key", "requested_days_off_details")
-        result = original(
-            master_lines,
-            bid_period_info,
-            requested_dates,
-            *args,
-            **kwargs,
-        )
-
-        if details_key and isinstance(master_lines, dict):
-            for line_data in master_lines.values():
-                if isinstance(line_data, dict):
-                    line_data.pop(details_key, None)
-
-        return result
-
-    dataframe_safe_requested_days._ups_gui_dataframe_safe = True  # type: ignore[attr-defined]
-    pf.add_requested_days_off_scores = dataframe_safe_requested_days
-
-
-_install_requested_days_dataframe_fix()
-
 
 CONFIG_PATH = Path("bid_config.json")
 
@@ -152,6 +104,44 @@ DEFAULT_SORTING_SETTINGS = {
 
 DEFAULT_NUMBER_OF_LINES_TO_BID = 20
 DEFAULT_HOURLY_RATE = 50.33
+
+# Keep the Sort by choices stable. Every score column produced by
+# master_lines_to_dataframe() is available from startup, even before PDFs are
+# loaded or a related preference has been entered.
+DEFAULT_SORTABLE_COLUMNS = [
+    "Extra Vacation Days",
+    "Line Type",
+    "Training in Days On",
+    "On/Off Blocks",
+    "Total DO",
+    "Total CT",
+    "Avg # of Legs",
+    "Avg CT",
+    "Avg DT",
+    "Avg Rest",
+    "Avg TAFB",
+    "% of Tickets Paid",
+    "% International Destinations",
+    "% Asia Destinations",
+    "% Europoean Destinations",
+    "% South American Destinations",
+    "% Weekends Off",
+    "% of Days Off Requested",
+    "Pay",
+    "Tax-Free Pay",
+    "Start bid off",
+    "End bid off",
+]
+
+# Preference changes are coalesced. The timer restarts on every edit, so
+# clicking a spin-box arrow repeatedly produces one analysis update after the
+# user stops rather than one update per click.
+PREFERENCE_REFRESH_DEBOUNCE_MS = 1400
+
+# Additional in-app scaling on top of the operating system's normal DPI scale.
+# It is applied at startup so all fixed-size widgets are built consistently.
+DEFAULT_UI_SCALE_PERCENT = 100
+UI_SCALE_PERCENT_OPTIONS = (80, 90, 100, 110, 125, 150, 175, 200)
 
 LINE_TYPE_CODES = [
     "TRIPS",
@@ -225,6 +215,68 @@ UPS_GREEN_ACTIVE = "#1B5E20"
 UPS_TEXT = "#FFF7E6"
 UPS_PANEL = "#432116"
 UPS_FIELD_BG = "#FFF8DC"
+
+
+def normalize_ui_scale_percent(value: Any) -> int:
+    try:
+        percent = int(value)
+    except (TypeError, ValueError):
+        percent = DEFAULT_UI_SCALE_PERCENT
+    return max(80, min(200, percent))
+
+
+def current_ui_scale_percent() -> int:
+    app = QApplication.instance()
+    if app is not None:
+        value = app.property("ups_ui_scale_percent")
+        if value is not None:
+            return normalize_ui_scale_percent(value)
+    return DEFAULT_UI_SCALE_PERCENT
+
+
+def ui_px(value: int | float) -> int:
+    return max(1, round(float(value) * current_ui_scale_percent() / 100.0))
+
+
+def ui_pt(value: int | float) -> float:
+    return max(1.0, float(value) * current_ui_scale_percent() / 100.0)
+
+
+COMBO_POPUP_STYLESHEET = f"""
+    QAbstractItemView {{
+        background-color: white;
+        color: black;
+        selection-background-color: {UPS_BLUE};
+        selection-color: white;
+        border: 1px solid #888888;
+        outline: 0;
+    }}
+    QScrollBar:vertical {{
+        background: white;
+        width: {ui_px(16)}px;
+        margin: 0;
+        border: 1px solid #D0D0D0;
+    }}
+    QScrollBar::handle:vertical {{
+        background: #D9D9D9;
+        border: 1px solid #B8B8B8;
+        border-radius: {ui_px(6)}px;
+        min-height: {ui_px(28)}px;
+    }}
+    QScrollBar::handle:vertical:hover {{
+        background: #CFCFCF;
+    }}
+    QScrollBar::add-line:vertical,
+    QScrollBar::sub-line:vertical {{
+        height: 0;
+        border: none;
+        background: none;
+    }}
+    QScrollBar::add-page:vertical,
+    QScrollBar::sub-page:vertical {{
+        background: white;
+    }}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +408,35 @@ def date_to_qdate(value: date) -> QDate:
     return QDate(value.year, value.month, value.day)
 
 
+def split_requested_day_entries(
+    entries: list[dict[str, Any]] | None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Split requested-day UI rows into single dates and inclusive ranges.
+
+    Scoring accepts a mixed list containing strings and tuple ranges.  The
+    visualizer and Excel formatter intentionally use two separate arguments,
+    so tuple ranges must never be passed through ``requested_days_off_dates``.
+    """
+    single_dates: list[str] = []
+    ranges: list[dict[str, str]] = []
+
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+
+        start = str(entry.get("start") or "").strip()
+        end = str(entry.get("end") or "").strip()
+        if not start:
+            continue
+
+        if end and end != start:
+            ranges.append({"start": start, "end": end})
+        else:
+            single_dates.append(start)
+
+    return single_dates, ranges
+
+
 def make_calendar_icon(size: int = 22) -> QIcon:
     """Create a small calendar icon instead of relying on emoji font support."""
     pixmap = QPixmap(size, size)
@@ -438,7 +519,7 @@ class CalendarPopup(QDialog):
         layout.addWidget(self.calendar)
         layout.addLayout(buttons)
 
-        self.resize(360, 300)
+        self.resize(ui_px(360), ui_px(300))
         self._position_near_parent(parent)
 
     def _position_near_parent(self, parent: QWidget) -> None:
@@ -471,17 +552,17 @@ class DateEntry(QWidget):
         super().__init__(parent)
         self.line_edit = QLineEdit(self)
         self.line_edit.setPlaceholderText("YYYY-MM-DD")
-        self.line_edit.setMinimumWidth(max(150, width * 10))
-        self.line_edit.setMaximumWidth(max(175, width * 12))
-        self.line_edit.setMinimumHeight(34)
-        self.line_edit.setStyleSheet("font-size: 11pt; padding: 3px 6px;")
+        self.line_edit.setMinimumWidth(max(ui_px(150), ui_px(width * 10)))
+        self.line_edit.setMaximumWidth(max(ui_px(175), ui_px(width * 12)))
+        self.line_edit.setMinimumHeight(ui_px(34))
+        self.line_edit.setStyleSheet(f"font-size: {ui_pt(11):.1f}pt; padding: {ui_px(3)}px {ui_px(6)}px;")
 
         self.button = QPushButton(self)
-        self.button.setIcon(make_calendar_icon())
-        self.button.setIconSize(QSize(22, 22))
+        self.button.setIcon(make_calendar_icon(ui_px(22)))
+        self.button.setIconSize(QSize(ui_px(22), ui_px(22)))
         self.button.setText("")
         self.button.setToolTip("Open calendar")
-        self.button.setFixedWidth(38)
+        self.button.setFixedWidth(ui_px(38))
         self.button.clicked.connect(self._open_calendar)
 
         layout = QHBoxLayout(self)
@@ -545,7 +626,7 @@ class VacationRangeDialog(QDialog):
         buttons.addWidget(save_button)
         main.addLayout(buttons, 3, 0, 1, 2)
 
-        self.resize(390, 165)
+        self.resize(ui_px(390), ui_px(165))
 
     def _save(self) -> None:
         try:
@@ -627,7 +708,7 @@ class RequestedDateRangeDialog(QDialog):
         buttons.addWidget(save_button)
         main.addLayout(buttons, 5, 0, 1, 2)
 
-        self.resize(540, 240)
+        self.resize(ui_px(540), ui_px(240))
 
     def _save(self) -> None:
         try:
@@ -665,7 +746,7 @@ class ExportCompleteDialog(QDialog):
 
         path_entry = QLineEdit(str(output_path))
         path_entry.setReadOnly(True)
-        path_entry.setMinimumWidth(700)
+        path_entry.setMinimumWidth(ui_px(700))
 
         open_file_button = QPushButton("Open Excel file")
         open_file_button.setObjectName("GreenButton")
@@ -762,7 +843,15 @@ def get_sortable_columns_from_df(df: pd.DataFrame, include_text_columns: bool = 
 # ---------------------------------------------------------------------------
 
 class WheelSafeComboBox(QComboBox):
-    """Combo box that ignores mouse-wheel changes."""
+    """Combo box that ignores wheel changes and styles its popup lazily."""
+
+    def showPopup(self) -> None:
+        # Do not access ``self.view()`` while the main GUI is being constructed.
+        # On Windows, creating dozens of combo popup views at startup can create
+        # brief native popup windows that look like flashing white/dark boxes.
+        # Style the popup only when the user actually opens this combo box.
+        self.view().setStyleSheet(COMBO_POPUP_STYLESHEET)
+        super().showPopup()
 
     def wheelEvent(self, event: Any) -> None:
         # Page scrolling should never accidentally change a sorting selection.
@@ -786,7 +875,7 @@ class NoInternalScrollListWidget(QListWidget):
     def resize_to_all_items(self) -> None:
         count = self.count()
         if count <= 0:
-            self.setFixedHeight(32)
+            self.setFixedHeight(ui_px(32))
             return
 
         row_height = max(
@@ -796,7 +885,7 @@ class NoInternalScrollListWidget(QListWidget):
         spacing = max(0, self.spacing())
         content_height = row_height * count + spacing * max(0, count - 1)
         frame_height = self.frameWidth() * 2
-        self.setFixedHeight(content_height + frame_height + 6)
+        self.setFixedHeight(content_height + frame_height + ui_px(6))
 
 
 class FlatReorderTreeWidget(QTreeWidget):
@@ -981,7 +1070,7 @@ class SortCriteriaListWidget(QWidget):
     def _create_placeholder(self, source_widget: QWidget) -> QFrame:
         placeholder = QFrame(self)
         placeholder.setObjectName("SortDropPlaceholder")
-        placeholder.setFixedHeight(max(46, source_widget.height(), source_widget.sizeHint().height()))
+        placeholder.setFixedHeight(max(ui_px(46), source_widget.height(), source_widget.sizeHint().height()))
         placeholder_layout = QHBoxLayout(placeholder)
         placeholder_layout.setContentsMargins(12, 0, 12, 0)
         placeholder_label = QLabel("Release to place sorting criterion")
@@ -1004,8 +1093,14 @@ class SortCriteriaListWidget(QWidget):
 
             widget = self._widgets.get(self._item_key(item))
             if widget is not None:
-                widget.show()
+                # Add the row to this layout before making it visible.  A newly
+                # created row widget has no parent yet; calling show() first
+                # makes Qt briefly treat it as an independent top-level window.
+                # During startup this happened repeatedly for the sorting and
+                # line-type rows, producing the rapid white/dark window flashes
+                # seen on Windows.
                 self.rows_layout.addWidget(widget)
+                widget.show()
 
         self.rows_layout.invalidate()
         self.rows_layout.activate()
@@ -1203,7 +1298,7 @@ class SortCriteriaDragHandle(QWidget):
         self._hovered = False
         self._pressed = False
 
-        self.setFixedSize(28, 38)
+        self.setFixedSize(ui_px(28), ui_px(38))
         self.setToolTip("Drag to reorder this sorting criterion.")
         self.setCursor(Qt.OpenHandCursor)
 
@@ -1302,8 +1397,17 @@ class BidGUI(QMainWindow):
         apply_window_icon(self)
 
         self.config_data = load_saved_config()
+        self.ui_scale_percent = normalize_ui_scale_percent(
+            self.config_data.get("ui_scale_percent", DEFAULT_UI_SCALE_PERCENT)
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.setProperty("ups_ui_scale_percent", self.ui_scale_percent)
+
         self.message_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.worker_thread: threading.Thread | None = None
+        self._worker_start_pending = False
+        self._active_worker_show_busy = False
 
         self.analysis_pipeline = AnalysisPipeline(
             log_callback=self._log,
@@ -1326,6 +1430,8 @@ class BidGUI(QMainWindow):
 
         self._loading_saved_values = True
         self.preference_refresh_pending = False
+        self._analysis_preferences_dirty = False
+        self._preference_revision = 0
         self.bid_regeneration_pending = False
         self.bid_regeneration_copy_after = False
         self._last_trip_progress_percent = -1
@@ -1354,12 +1460,14 @@ class BidGUI(QMainWindow):
     # -------------------------- UI construction --------------------------
 
     def _setup_style(self) -> None:
+        px = ui_px
+        pt = ui_pt
+
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
                 background: {UPS_BROWN};
                 color: {UPS_TEXT};
                 font-family: Segoe UI, Arial, sans-serif;
-                font-size: 10pt;
             }}
             QScrollArea {{
                 border: none;
@@ -1367,19 +1475,17 @@ class BidGUI(QMainWindow):
             }}
             QScrollArea#MainScrollArea QScrollBar:vertical {{
                 background: white;
-                width: 18px;
+                width: {px(18)}px;
                 margin: 0;
                 border: none;
             }}
             QScrollArea#MainScrollArea QScrollBar::handle:vertical {{
                 background: #9A9A9A;
-                min-height: 30px;
-                margin: 2px;
-                border-radius: 5px;
+                min-height: {px(30)}px;
+                margin: {px(2)}px;
+                border-radius: {px(5)}px;
             }}
-            QScrollArea#MainScrollArea QScrollBar::handle:vertical:hover {{
-                background: #777777;
-            }}
+            QScrollArea#MainScrollArea QScrollBar::handle:vertical:hover {{ background: #777777; }}
             QScrollArea#MainScrollArea QScrollBar::add-line:vertical,
             QScrollArea#MainScrollArea QScrollBar::sub-line:vertical {{
                 height: 0;
@@ -1387,242 +1493,168 @@ class BidGUI(QMainWindow):
                 background: white;
             }}
             QScrollArea#MainScrollArea QScrollBar::add-page:vertical,
-            QScrollArea#MainScrollArea QScrollBar::sub-page:vertical {{
-                background: white;
-            }}
+            QScrollArea#MainScrollArea QScrollBar::sub-page:vertical {{ background: white; }}
             QGroupBox {{
-                border: 2px solid {UPS_GOLD};
-                border-radius: 6px;
-                margin-top: 14px;
-                padding: 10px;
+                border: {px(2)}px solid {UPS_GOLD};
+                border-radius: {px(6)}px;
+                margin-top: {px(14)}px;
+                padding: {px(10)}px;
                 color: {UPS_TEXT};
                 font-weight: bold;
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
+                left: {px(10)}px;
+                padding: 0 {px(4)}px;
                 color: {UPS_GOLD};
                 background: {UPS_BROWN};
             }}
             QLabel#TitleLabel {{
                 color: {UPS_GOLD};
-                font-size: 20pt;
+                font-size: {pt(20):.1f}pt;
                 font-weight: bold;
             }}
-            QLabel#SubtitleLabel {{
-                color: {UPS_TEXT};
-            }}
-            QLabel#ExportTitle {{
-                font-size: 11pt;
-                font-weight: bold;
-            }}
+            QLabel#SubtitleLabel {{ color: {UPS_TEXT}; }}
+            QLabel#ExportTitle {{ font-size: {pt(11):.1f}pt; font-weight: bold; }}
             QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit, QListWidget, QTableWidget, QComboBox {{
                 background: white;
                 color: black;
                 selection-background-color: {UPS_BLUE};
                 selection-color: white;
             }}
-            QComboBox QAbstractItemView {{
-                background-color: white;
-                color: black;
-                selection-background-color: {UPS_BLUE};
-                selection-color: white;
-                border: 1px solid #888888;
-                outline: 0;
-            }}
             QListWidget#LineTypePreferenceList {{
                 background: white;
                 color: black;
-                border: 1px solid #8A8A8A;
-                border-radius: 4px;
-                padding: 2px;
+                border: {px(1)}px solid #8A8A8A;
+                border-radius: {px(4)}px;
+                padding: {px(2)}px;
             }}
             QListWidget#LineTypePreferenceList::item {{
-                min-height: 18px;
-                padding: 1px 7px;
-                border-bottom: 1px solid #E5E5E5;
+                min-height: {px(18)}px;
+                padding: {px(1)}px {px(7)}px;
+                border-bottom: {px(1)}px solid #E5E5E5;
             }}
-            QListWidget#LineTypePreferenceList::item:selected {{
-                background: {UPS_BLUE};
-                color: white;
-            }}
+            QListWidget#LineTypePreferenceList::item:selected {{ background: {UPS_BLUE}; color: white; }}
             QFrame#PreferenceDateCard {{
                 background-color: {UPS_BROWN_2};
-                border: 1px solid #71402E;
-                border-radius: 8px;
+                border: {px(1)}px solid #71402E;
+                border-radius: {px(8)}px;
             }}
-            QLabel#PreferenceCardTitle {{
-                color: {UPS_GOLD};
-                font-size: 11pt;
-                font-weight: bold;
-            }}
-            QLabel#PreferenceCardSubtitle {{
-                color: #E9DDD2;
-            }}
+            QLabel#PreferenceCardTitle {{ color: {UPS_GOLD}; font-size: {pt(11):.1f}pt; font-weight: bold; }}
+            QLabel#PreferenceCardSubtitle {{ color: #E9DDD2; }}
             QLabel#PreferenceCardCount {{
                 color: {UPS_BROWN};
                 background: {UPS_GOLD};
-                border-radius: 9px;
-                padding: 2px 8px;
+                border-radius: {px(9)}px;
+                padding: {px(2)}px {px(8)}px;
                 font-weight: bold;
             }}
             QTableWidget#PreferenceDateTable {{
                 background: white;
                 alternate-background-color: #F4F4F4;
                 color: black;
-                border: 1px solid #C7B9AE;
-                border-radius: 5px;
+                border: {px(1)}px solid #C7B9AE;
+                border-radius: {px(5)}px;
                 gridline-color: #E5E5E5;
             }}
-            QTableWidget#PreferenceDateTable::item {{
-                padding: 7px;
-                font-size: 11pt;
-            }}
-            QWidget#SortCriteriaList {{
-                background: transparent;
-                border: none;
-            }}
-            QFrame#LineTypeNestedGuide {{
-                background-color: {UPS_GOLD};
-                border: none;
-                border-radius: 1px;
-            }}
-            QFrame#LineTypeScoringPanel {{
-                background: transparent;
-                border: none;
-            }}
-            QLabel#LineTypeScoringTitle {{
-                color: #FFB500;
-                font-size: 11pt;
-                font-weight: bold;
-            }}
-            QLabel#LineTypeScoringStatus {{
-                color: #F0E3D5;
-                font-style: italic;
-            }}
+            QTableWidget#PreferenceDateTable::item {{ padding: {px(7)}px; font-size: {pt(11):.1f}pt; }}
+            QWidget#SortCriteriaList {{ background: transparent; border: none; }}
+            QFrame#LineTypeNestedGuide {{ background-color: {UPS_GOLD}; border: none; border-radius: {px(1)}px; }}
+            QFrame#LineTypeScoringPanel {{ background: transparent; border: none; }}
+            QLabel#LineTypeScoringTitle {{ color: #FFB500; font-size: {pt(11):.1f}pt; font-weight: bold; }}
+            QLabel#LineTypeScoringStatus {{ color: #F0E3D5; font-style: italic; }}
             QLabel#LineTypeScoringHint {{
                 color: #E7D8CA;
                 background-color: #4B2618;
-                border: 1px dashed #8A5A3D;
-                border-radius: 6px;
-                padding: 7px 10px;
+                border: {px(1)}px dashed #8A5A3D;
+                border-radius: {px(6)}px;
+                padding: {px(7)}px {px(10)}px;
             }}
             QLabel#LineTypeValueLabel {{
                 color: {UPS_GOLD};
                 background: transparent;
                 border: none;
-                padding: 3px 7px;
+                padding: {px(3)}px {px(7)}px;
                 font-weight: bold;
-                font-size: 10.5pt;
+                font-size: {pt(10.5):.1f}pt;
             }}
-            QLabel#LineTypeSubsortHeader {{
-                color: {UPS_TEXT};
-                font-size: 10.5pt;
-                font-weight: bold;
-            }}
+            QLabel#LineTypeSubsortHeader {{ color: {UPS_TEXT}; font-size: {pt(10.5):.1f}pt; font-weight: bold; }}
             QWidget#SortCriterionCard {{
                 background-color: {UPS_BROWN_2};
-                border: 1px solid #6A3A29;
-                border-radius: 7px;
+                border: {px(1)}px solid #6A3A29;
+                border-radius: {px(7)}px;
             }}
-            QWidget#SortCriterionCard:hover {{
-                background-color: #552C1D;
-                border: 1px solid {UPS_GOLD};
-            }}
-            QWidget#SortCriterionCard[dragging="true"] {{
-                background-color: #5D382A;
-                border: 2px dashed {UPS_GOLD};
-            }}
+            QWidget#SortCriterionCard:hover {{ background-color: #552C1D; border: {px(1)}px solid {UPS_GOLD}; }}
+            QWidget#SortCriterionCard[dragging="true"] {{ background-color: #5D382A; border: {px(2)}px dashed {UPS_GOLD}; }}
             QFrame#SortDropPlaceholder {{
                 background-color: rgba(255, 181, 0, 32);
-                border: 2px dashed {UPS_GOLD};
-                border-radius: 7px;
+                border: {px(2)}px dashed {UPS_GOLD};
+                border-radius: {px(7)}px;
                 color: {UPS_GOLD};
                 font-weight: bold;
             }}
-            QTextEdit#LogText {{
-                background: {UPS_FIELD_BG};
-            }}
+            QTextEdit#LogText {{ background: {UPS_FIELD_BG}; }}
             QHeaderView::section {{
                 background: {UPS_GOLD};
                 color: {UPS_BROWN};
                 font-weight: bold;
-                padding: 4px;
-                border: 1px solid {UPS_BROWN_2};
+                padding: {px(4)}px;
+                border: {px(1)}px solid {UPS_BROWN_2};
             }}
             QPushButton {{
                 background: {UPS_BLUE};
                 color: white;
-                border: 1px solid {UPS_BLUE};
-                border-radius: 4px;
-                padding: 6px 10px;
+                border: {px(1)}px solid {UPS_BLUE};
+                border-radius: {px(4)}px;
+                padding: {px(6)}px {px(10)}px;
             }}
-            QPushButton:hover {{
-                background: {UPS_BLUE_ACTIVE};
-            }}
-            QPushButton:disabled {{
-                background: #777777;
-                color: #dddddd;
-                border-color: #777777;
-            }}
-            QPushButton#GreenButton {{
-                background: {UPS_GREEN};
-                border-color: {UPS_GREEN};
-                font-weight: bold;
-            }}
-            QPushButton#GreenButton:hover {{
-                background: {UPS_GREEN_ACTIVE};
-            }}
+            QPushButton:hover {{ background: {UPS_BLUE_ACTIVE}; }}
+            QPushButton:disabled {{ background: #777777; color: #dddddd; border-color: #777777; }}
+            QPushButton#GreenButton {{ background: {UPS_GREEN}; border-color: {UPS_GREEN}; font-weight: bold; }}
+            QPushButton#GreenButton:hover {{ background: {UPS_GREEN_ACTIVE}; }}
             QProgressBar {{
-                border: 1px solid {UPS_GOLD};
-                border-radius: 4px;
+                border: {px(1)}px solid {UPS_GOLD};
+                border-radius: {px(4)}px;
                 background: {UPS_BROWN_2};
                 color: {UPS_TEXT};
                 text-align: center;
             }}
-            QProgressBar::chunk {{
-                background: {UPS_GOLD};
-            }}
+            QProgressBar::chunk {{ background: {UPS_GOLD}; }}
         """)
 
-        # Combo-box popup lists are separate Qt windows on some platforms.
-        # Applying the same stylesheet at application level keeps every popup
-        # white and readable, including dropdowns opened from dialogs.
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(self.styleSheet())
+        # The stylesheet intentionally stays on the main window rather than
+        # QApplication. Combo popup views are styled directly instead.
 
     def _build_ui(self) -> None:
         scroll_area = QScrollArea(self)
         scroll_area.setObjectName("MainScrollArea")
         scroll_area.setWidgetResizable(True)
-        scroll_area.verticalScrollBar().setStyleSheet("""
-            QScrollBar:vertical {
+        scroll_area.verticalScrollBar().setStyleSheet(f"""
+            QScrollBar:vertical {{
                 background: white;
-                width: 18px;
+                width: {ui_px(18)}px;
                 margin: 0;
                 border: none;
-            }
-            QScrollBar::handle:vertical {
+            }}
+            QScrollBar::handle:vertical {{
                 background: #A0A0A0;
-                min-height: 34px;
-                margin: 2px;
-                border-radius: 6px;
-            }
-            QScrollBar::handle:vertical:hover {
+                min-height: {ui_px(34)}px;
+                margin: {ui_px(2)}px;
+                border-radius: {ui_px(6)}px;
+            }}
+            QScrollBar::handle:vertical:hover {{
                 background: #777777;
-            }
+            }}
             QScrollBar::add-line:vertical,
-            QScrollBar::sub-line:vertical {
+            QScrollBar::sub-line:vertical {{
                 height: 0;
                 border: none;
                 background: white;
-            }
+            }}
             QScrollBar::add-page:vertical,
-            QScrollBar::sub-page:vertical {
+            QScrollBar::sub-page:vertical {{
                 background: white;
-            }
+            }}
         """)
         self.setCentralWidget(scroll_area)
 
@@ -1630,18 +1662,49 @@ class BidGUI(QMainWindow):
         scroll_area.setWidget(self.scrollable_frame)
 
         container = QVBoxLayout(self.scrollable_frame)
-        container.setContentsMargins(14, 14, 14, 14)
-        container.setSpacing(10)
+        container.setContentsMargins(ui_px(14), ui_px(14), ui_px(14), ui_px(14))
+        container.setSpacing(ui_px(10))
 
         header_frame = QWidget()
-        header_layout = QVBoxLayout(header_frame)
+        header_layout = QHBoxLayout(header_frame)
         header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(ui_px(16))
+
+        title_area = QVBoxLayout()
+        title_area.setContentsMargins(0, 0, 0, 0)
+        title_area.setSpacing(ui_px(2))
         title = QLabel("UPS Bid Analyzer")
         title.setObjectName("TitleLabel")
         subtitle = QLabel("Load bid-package PDFs, apply your scoring preferences, and export the ranked Excel file.")
         subtitle.setObjectName("SubtitleLabel")
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        subtitle.setWordWrap(True)
+        title_area.addWidget(title)
+        title_area.addWidget(subtitle)
+
+        scale_area = QVBoxLayout()
+        scale_area.setContentsMargins(0, 0, 0, 0)
+        scale_area.setSpacing(ui_px(2))
+        scale_row = QHBoxLayout()
+        scale_row.setContentsMargins(0, 0, 0, 0)
+        scale_row.addWidget(QLabel("UI size:"))
+        self.ui_scale_combo = WheelSafeComboBox()
+        self.ui_scale_combo.setMinimumWidth(ui_px(105))
+        for percent in UI_SCALE_PERCENT_OPTIONS:
+            self.ui_scale_combo.addItem(f"{percent}%", percent)
+        current_scale_index = self.ui_scale_combo.findData(self.ui_scale_percent)
+        if current_scale_index < 0:
+            self.ui_scale_combo.addItem(f"{self.ui_scale_percent}%", self.ui_scale_percent)
+            current_scale_index = self.ui_scale_combo.findData(self.ui_scale_percent)
+        self.ui_scale_combo.setCurrentIndex(current_scale_index)
+        self.ui_scale_combo.currentIndexChanged.connect(self._on_ui_scale_changed)
+        scale_row.addWidget(self.ui_scale_combo)
+        self.ui_scale_status_label = QLabel("Applies after restarting the app")
+        self.ui_scale_status_label.setStyleSheet("color: #E6D7C5;")
+        scale_area.addLayout(scale_row)
+        scale_area.addWidget(self.ui_scale_status_label)
+
+        header_layout.addLayout(title_area, 1)
+        header_layout.addLayout(scale_area)
         container.addWidget(header_frame)
 
         self._build_pdf_section(container)
@@ -1743,7 +1806,7 @@ class BidGUI(QMainWindow):
         self.vacation_table.setAlternatingRowColors(True)
         self.vacation_table.setShowGrid(False)
         self.vacation_table.verticalHeader().setDefaultSectionSize(36)
-        self.vacation_table.setMinimumHeight(145)
+        self.vacation_table.setMinimumHeight(ui_px(145))
         self.vacation_table.itemChanged.connect(self._on_vacation_table_item_changed)
 
         vacation_card_layout.addLayout(vacation_header)
@@ -1798,7 +1861,7 @@ class BidGUI(QMainWindow):
         self.requested_dates_table.setAlternatingRowColors(True)
         self.requested_dates_table.setShowGrid(False)
         self.requested_dates_table.verticalHeader().setDefaultSectionSize(36)
-        self.requested_dates_table.setMinimumHeight(145)
+        self.requested_dates_table.setMinimumHeight(ui_px(145))
 
         requested_card_layout.addLayout(requested_header)
         requested_card_layout.addWidget(self.requested_dates_table)
@@ -1847,8 +1910,8 @@ class BidGUI(QMainWindow):
         self.hourly_rate_edit.setRange(0.01, 10000.00)
         self.hourly_rate_edit.setSingleStep(1.00)
         self.hourly_rate_edit.setValue(DEFAULT_HOURLY_RATE)
-        self.hourly_rate_edit.setMaximumWidth(125)
-        self.hourly_rate_edit.editingFinished.connect(self._on_hourly_rate_changed)
+        self.hourly_rate_edit.setMaximumWidth(ui_px(125))
+        self.hourly_rate_edit.valueChanged.connect(self._on_hourly_rate_changed)
 
         left_grid.addWidget(QLabel("Training dates:"), 0, 0)
         left_grid.addWidget(training_row, 0, 1)
@@ -1876,7 +1939,7 @@ class BidGUI(QMainWindow):
         self.soft_min_weight = float(DEFAULT_SORTING_SETTINGS["soft_min_weight"])
         self.keep_score_columns = bool(DEFAULT_SORTING_SETTINGS["keep_score_columns"])
 
-        self.sortable_columns: list[str] = []
+        self.sortable_columns: list[str] = list(DEFAULT_SORTABLE_COLUMNS)
         self.sort_criteria_rows: list[dict[str, Any]] = []
         self._sort_row_by_id: dict[int, dict[str, Any]] = {}
         self._next_sort_row_id = 1
@@ -1895,7 +1958,7 @@ class BidGUI(QMainWindow):
         self.priority_emphasis_spin.setRange(self.soft_min_weight, 100.0)
         self.priority_emphasis_spin.setSingleStep(0.25)
         self.priority_emphasis_spin.setValue(self.soft_max_weight)
-        self.priority_emphasis_spin.setMaximumWidth(95)
+        self.priority_emphasis_spin.setMaximumWidth(ui_px(95))
         self.priority_emphasis_spin.setToolTip(
             "Controls how strongly earlier Weighted criteria outrank later ones."
         )
@@ -1919,11 +1982,11 @@ class BidGUI(QMainWindow):
         header_layout.setSpacing(8)
 
         drag_header = QLabel("")
-        drag_header.setFixedWidth(24)
+        drag_header.setFixedWidth(ui_px(24))
 
         number_header = QLabel("#")
         number_header.setObjectName("LineTypeSubsortHeader")
-        number_header.setFixedWidth(28)
+        number_header.setFixedWidth(ui_px(28))
         number_header.setAlignment(Qt.AlignCenter)
 
         column_header = QLabel("Sort by")
@@ -1936,17 +1999,17 @@ class BidGUI(QMainWindow):
         contribution_header.setObjectName("LineTypeSubsortHeader")
         contribution_header.setAlignment(Qt.AlignCenter)
 
-        column_header.setFixedWidth(245)
-        direction_header.setFixedWidth(130)
-        mode_header.setFixedWidth(225)
-        contribution_header.setFixedWidth(100)
+        column_header.setFixedWidth(ui_px(245))
+        direction_header.setFixedWidth(ui_px(130))
+        mode_header.setFixedWidth(ui_px(225))
+        contribution_header.setFixedWidth(ui_px(100))
 
         header_layout.addWidget(drag_header)
         header_layout.addWidget(number_header)
         header_layout.addWidget(column_header)
         header_layout.addWidget(direction_header)
         remove_header = QLabel("")
-        remove_header.setFixedWidth(78)
+        remove_header.setFixedWidth(ui_px(78))
 
         header_layout.addWidget(mode_header)
         header_layout.addWidget(contribution_header)
@@ -2002,7 +2065,7 @@ class BidGUI(QMainWindow):
         self.line_type_priority_emphasis_spin.setValue(
             DEFAULT_LINE_TYPE_PRIORITY_EMPHASIS
         )
-        self.line_type_priority_emphasis_spin.setMaximumWidth(95)
+        self.line_type_priority_emphasis_spin.setMaximumWidth(ui_px(95))
         self.line_type_priority_emphasis_spin.setToolTip(
             "Bigger values separate the highest line-type preferences more strongly."
         )
@@ -2024,25 +2087,25 @@ class BidGUI(QMainWindow):
         line_type_header_layout.setSpacing(8)
 
         line_type_drag_header = QLabel("")
-        line_type_drag_header.setFixedWidth(24)
+        line_type_drag_header.setFixedWidth(ui_px(24))
         line_type_number_header = QLabel("#")
         line_type_number_header.setObjectName("LineTypeSubsortHeader")
-        line_type_number_header.setFixedWidth(28)
+        line_type_number_header.setFixedWidth(ui_px(28))
         line_type_number_header.setAlignment(Qt.AlignCenter)
         line_type_on_header = QLabel("On / Off")
         line_type_on_header.setObjectName("LineTypeSubsortHeader")
-        line_type_on_header.setFixedWidth(76)
+        line_type_on_header.setFixedWidth(ui_px(76))
         line_type_on_header.setAlignment(Qt.AlignCenter)
         line_type_name_header = QLabel("Line type")
         line_type_name_header.setObjectName("LineTypeSubsortHeader")
-        line_type_name_header.setFixedWidth(320)
+        line_type_name_header.setFixedWidth(ui_px(320))
         line_type_equal_header = QLabel("Same as previous")
         line_type_equal_header.setObjectName("LineTypeSubsortHeader")
-        line_type_equal_header.setFixedWidth(160)
+        line_type_equal_header.setFixedWidth(ui_px(160))
         line_type_equal_header.setAlignment(Qt.AlignCenter)
         line_type_score_header = QLabel("Score")
         line_type_score_header.setObjectName("LineTypeSubsortHeader")
-        line_type_score_header.setFixedWidth(100)
+        line_type_score_header.setFixedWidth(ui_px(100))
         line_type_score_header.setAlignment(Qt.AlignCenter)
 
         line_type_header_layout.addWidget(line_type_drag_header)
@@ -2092,7 +2155,7 @@ class BidGUI(QMainWindow):
         nested_layout.setSpacing(8)
         nested_guide = QFrame()
         nested_guide.setObjectName("LineTypeNestedGuide")
-        nested_guide.setFixedWidth(3)
+        nested_guide.setFixedWidth(ui_px(3))
         nested_guide.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         nested_content = QWidget()
         nested_content_layout = QVBoxLayout(nested_content)
@@ -2177,7 +2240,7 @@ class BidGUI(QMainWindow):
         self.number_of_lines_edit = QSpinBox()
         self.number_of_lines_edit.setRange(1, 9999)
         self.number_of_lines_edit.setValue(DEFAULT_NUMBER_OF_LINES_TO_BID)
-        self.number_of_lines_edit.setMaximumWidth(90)
+        self.number_of_lines_edit.setMaximumWidth(ui_px(90))
         self.number_of_lines_edit.valueChanged.connect(
             lambda _value: self._schedule_bid_string_regeneration(
                 "Number of bid lines changed. Updating bid string..."
@@ -2191,7 +2254,7 @@ class BidGUI(QMainWindow):
         bid_string_row.addWidget(QLabel("Bid string:"), alignment=Qt.AlignTop)
         self.bid_string_text = QTextEdit()
         self.bid_string_text.setReadOnly(True)
-        self.bid_string_text.setMinimumHeight(100)
+        self.bid_string_text.setMinimumHeight(ui_px(100))
         bid_string_row.addWidget(self.bid_string_text, 1)
         layout.addLayout(bid_string_row)
 
@@ -2238,7 +2301,7 @@ class BidGUI(QMainWindow):
         self.log_text = QTextEdit()
         self.log_text.setObjectName("LogText")
         self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(180)
+        self.log_text.setMinimumHeight(ui_px(180))
         layout.addWidget(self.log_text)
         container.addWidget(log_frame, 1)
 
@@ -2306,6 +2369,21 @@ class BidGUI(QMainWindow):
 
         saved_sort_order = self.config_data.get("sort_order", [])
         self._set_sort_order(saved_sort_order)
+
+    def _on_ui_scale_changed(self, _index: int) -> None:
+        percent = normalize_ui_scale_percent(self.ui_scale_combo.currentData())
+        if percent == self.ui_scale_percent:
+            return
+
+        self.ui_scale_percent = percent
+        self.config_data["ui_scale_percent"] = percent
+        save_config(self.config_data)
+        self.ui_scale_status_label.setText(
+            f"{percent}% saved — restart the app to apply"
+        )
+        self.ui_scale_status_label.setStyleSheet(
+            f"color: {UPS_GOLD}; font-weight: bold;"
+        )
 
     # -------------------------- Browse buttons --------------------------
 
@@ -2767,7 +2845,7 @@ class BidGUI(QMainWindow):
 
         row_widget = QWidget()
         row_widget.setObjectName("SortCriterionCard")
-        row_widget.setMinimumHeight(46)
+        row_widget.setMinimumHeight(ui_px(46))
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(6, 3, 6, 3)
         row_layout.setSpacing(8)
@@ -2780,7 +2858,7 @@ class BidGUI(QMainWindow):
         drag_handle.setToolTip("Drag to reorder this line type.")
 
         number_label = QLabel("—")
-        number_label.setFixedWidth(28)
+        number_label.setFixedWidth(ui_px(28))
         number_label.setAlignment(Qt.AlignCenter)
 
         enabled_checkbox = QCheckBox()
@@ -2794,7 +2872,7 @@ class BidGUI(QMainWindow):
         display_label = LINE_TYPE_DISPLAY_LABELS.get(code, code)
         line_type_field = QLabel(display_label)
         line_type_field.setObjectName("LineTypeValueLabel")
-        line_type_field.setFixedWidth(320)
+        line_type_field.setFixedWidth(ui_px(320))
         line_type_field.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         line_type_field.setToolTip(
             f"Internal line-type code: {code}. This description is display-only."
@@ -2812,7 +2890,7 @@ class BidGUI(QMainWindow):
         )
 
         score_label = QLabel("—")
-        score_label.setFixedWidth(100)
+        score_label.setFixedWidth(ui_px(100))
         score_label.setAlignment(Qt.AlignCenter)
 
         row_layout.addWidget(drag_handle)
@@ -3075,11 +3153,14 @@ class BidGUI(QMainWindow):
         if not hasattr(self, "line_type_rows_list"):
             return
         self._update_line_type_preference_preview()
-        self._save_line_type_preferences_to_config()
+        self.config_data["line_type_priority_emphasis"] = round(
+            float(self.line_type_priority_emphasis_spin.value()),
+            2,
+        )
         if self._loading_saved_values:
             return
         self._schedule_preference_refresh(
-            "Line-type preference emphasis changed. Analyzer values will refresh automatically."
+            "Line-type preference emphasis changed. Analyzer update queued..."
         )
 
     def _reset_line_type_preferences(self) -> None:
@@ -3138,14 +3219,13 @@ class BidGUI(QMainWindow):
 
     # Preference persistence and automatic column refresh ---------------
 
-    def _on_hourly_rate_changed(self) -> None:
+    def _on_hourly_rate_changed(self, _value: float | None = None) -> None:
         if self._loading_saved_values:
             return
         hourly_rate = round(float(self.hourly_rate_edit.value()), 2)
         self.config_data["hourly_rate"] = hourly_rate
-        save_config(self.config_data)
         self._schedule_preference_refresh(
-            "Hourly pay rate changed. Updating analyzer and bid string..."
+            "Hourly pay rate changed. Analyzer update queued..."
         )
 
     def _on_date_preferences_changed(self, status_message: str) -> None:
@@ -3157,29 +3237,46 @@ class BidGUI(QMainWindow):
         if self._loading_saved_values:
             return
 
-        # Underlying score values changed, so cancel any lightweight sort-only
-        # regeneration and rebuild the analysis once from the cached PDFs.
+        # Do not rebuild the Sort by combo boxes and do not blank the current
+        # bid string. Mark the analysis values stale, then perform one quiet
+        # update after the user stops editing.
         self._bid_state_revision += 1
+        self._preference_revision += 1
+        self._analysis_preferences_dirty = True
         self.bid_regeneration_timer.stop()
         self.bid_regeneration_pending = False
         self.bid_regeneration_copy_after = False
-        self._clear_bid_string(status_message)
         self.preference_refresh_pending = True
-        self.preference_refresh_timer.start(450)
+        self.bid_string_status_label.setText(status_message)
+
+        if self.analysis_pipeline.has_cached_pdf_data:
+            self.pdf_status_label.setText(
+                "Preferences changed. Analyzer update queued."
+            )
+        else:
+            self.pdf_status_label.setText(
+                "Preferences saved. Load the PDFs to calculate the new values."
+            )
+
+        self.preference_refresh_timer.start(PREFERENCE_REFRESH_DEBOUNCE_MS)
 
     def _refresh_after_preference_change(self) -> None:
         if not self.preference_refresh_pending:
             return
 
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.preference_refresh_timer.start(200)
+        if self._worker_start_pending or (
+            self.worker_thread and self.worker_thread.is_alive()
+        ):
+            self.preference_refresh_timer.start(250)
             return
 
         if not self.analysis_pipeline.has_cached_pdf_data:
             self.preference_refresh_pending = False
-            self.pdf_status_label.setText(
-                "Preferences saved. Load the PDFs to build the updated sorting columns."
-            )
+            try:
+                inputs = self._collect_inputs()
+                self._save_inputs_to_config(inputs)
+            except Exception:
+                pass
             return
 
         try:
@@ -3188,16 +3285,27 @@ class BidGUI(QMainWindow):
         except Exception as exc:
             self.preference_refresh_pending = False
             self.pdf_status_label.setText(
-                "Preference refresh is waiting for complete, valid inputs."
+                "Preference update is waiting for complete, valid inputs."
             )
-            self._write_log(f"Automatic preference refresh skipped: {exc}")
+            self._write_log(f"Automatic preference update skipped: {exc}")
             return
 
+        revision = self._preference_revision
         self.preference_refresh_pending = False
-        self.pdf_status_label.setText(
-            "Preferences changed. Refreshing analyzer and bid string."
+        self.pdf_status_label.setText("Updating analyzer values in the background...")
+
+        started = self._start_worker(
+            self._load_worker,
+            inputs,
+            False,
+            True,
+            revision,
+            show_busy=False,
+            warn_if_busy=False,
         )
-        self._start_worker(self._load_worker, inputs, False, True)
+        if not started:
+            self.preference_refresh_pending = True
+            self.preference_refresh_timer.start(250)
 
     # -------------------------- Sorting criteria rows --------------------------
 
@@ -3290,7 +3398,7 @@ class BidGUI(QMainWindow):
 
         row_widget = QWidget()
         row_widget.setObjectName("SortCriterionCard")
-        row_widget.setMinimumHeight(46)
+        row_widget.setMinimumHeight(ui_px(46))
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(6, 3, 6, 3)
         row_layout.setSpacing(8)
@@ -3302,25 +3410,25 @@ class BidGUI(QMainWindow):
         )
 
         number_label = QLabel()
-        number_label.setFixedWidth(28)
+        number_label.setFixedWidth(ui_px(28))
         number_label.setAlignment(Qt.AlignCenter)
 
         column_combo = WheelSafeComboBox()
-        column_combo.setFixedWidth(245)
+        column_combo.setFixedWidth(ui_px(245))
         column_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         column_combo.addItem("Select column...", "")
         for column in self.sortable_columns:
             column_combo.addItem(column, column)
 
         direction_combo = WheelSafeComboBox()
-        direction_combo.setFixedWidth(130)
+        direction_combo.setFixedWidth(ui_px(130))
         direction_combo.addItems(SORT_DIRECTION_LABEL_TO_VALUE.keys())
 
         mode_combo = WheelSafeComboBox()
-        mode_combo.setFixedWidth(225)
+        mode_combo.setFixedWidth(ui_px(225))
 
         contribution_label = QLabel("—")
-        contribution_label.setFixedWidth(100)
+        contribution_label.setFixedWidth(ui_px(100))
         contribution_label.setAlignment(Qt.AlignCenter)
         contribution_label.setToolTip(
             "Calculated by get_sort_percent_contributions() using the current "
@@ -3328,7 +3436,7 @@ class BidGUI(QMainWindow):
         )
 
         remove_button = QPushButton("Remove")
-        remove_button.setFixedWidth(78)
+        remove_button.setFixedWidth(ui_px(78))
 
         row_layout.addWidget(drag_handle)
         row_layout.addWidget(number_label)
@@ -3682,45 +3790,13 @@ class BidGUI(QMainWindow):
             else:
                 row["contribution_label"].setText(f"{numeric:.2f}%")
 
-    def _refresh_available_columns_list(self, columns: list[str]) -> None:
-        self.sortable_columns = [str(column) for column in columns]
+    def _refresh_available_columns_list(self, _columns: list[str] | None = None) -> None:
+        """Compatibility hook: Sort by choices are fixed from application startup."""
+        self.sortable_columns = list(DEFAULT_SORTABLE_COLUMNS)
 
-        for row in self.sort_criteria_rows:
-            combo: QComboBox = row["column_combo"]
-            selected = str(combo.currentData() or "").strip()
-
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem("Select column...", "")
-            for column in self.sortable_columns:
-                combo.addItem(column, column)
-
-            if selected:
-                index = combo.findData(selected)
-                if index < 0:
-                    combo.addItem(selected, selected)
-                    index = combo.findData(selected)
-                combo.setCurrentIndex(index)
-            combo.blockSignals(False)
-
-        self._update_sort_percentages()
-        self._update_line_type_scoring_panel_visibility()
-
-    def _clean_sort_order_for_columns(self, columns: list[str]) -> None:
-        valid_columns = {str(column) for column in columns}
-        current_order = self._get_sort_order_from_rows(validate=False)
-
-        valid_order = [rule for rule in current_order if rule[0] in valid_columns]
-        skipped = [rule[0] for rule in current_order if rule[0] not in valid_columns]
-
-        if skipped:
-            self._write_log(
-                "Skipped saved sorting columns not found in this DataFrame: "
-                + ", ".join(skipped)
-            )
-
-        self._set_sort_order(valid_order)
-        self.sort_order = valid_order
+    def _clean_sort_order_for_columns(self, _columns: list[str] | None = None) -> None:
+        """Keep saved rules; every supported score column is always available."""
+        return
 
     # -------------------------- Sorting settings --------------------------
 
@@ -3733,7 +3809,6 @@ class BidGUI(QMainWindow):
 
         settings = self._get_sorting_settings()
         self.config_data["sorting_settings"] = settings
-        save_config(self.config_data)
         self._schedule_bid_string_regeneration(
             "Priority emphasis changed. Updating bid string..."
         )
@@ -3837,12 +3912,14 @@ class BidGUI(QMainWindow):
         layout.addWidget(intro, 0, 0, 1, 3)
 
         default_mode_combo = QComboBox()
+        default_mode_combo.view().setStyleSheet(COMBO_POPUP_STYLESHEET)
         default_mode_combo.addItems(list(DEFAULT_MODE_DESCRIPTIONS))
         default_mode_combo.setCurrentText(str(current["default_mode"]))
         default_tip = "strict: " + DEFAULT_MODE_DESCRIPTIONS["strict"] + "\n\nweighted: " + DEFAULT_MODE_DESCRIPTIONS["weighted"]
         default_mode_combo.setToolTip(default_tip)
 
         weighting_style_combo = QComboBox()
+        weighting_style_combo.view().setStyleSheet(COMBO_POPUP_STYLESHEET)
         weighting_style_combo.addItems(list(WEIGHTING_STYLE_DESCRIPTIONS))
         weighting_style_combo.setCurrentText(str(current["weighting_style"]))
         weighting_tip = (
@@ -3916,7 +3993,7 @@ class BidGUI(QMainWindow):
         cancel_button.clicked.connect(dialog.reject)
         save_button.clicked.connect(save_and_close)
 
-        dialog.resize(620, 260)
+        dialog.resize(ui_px(620), ui_px(260))
         dialog.exec()
 
     # -------------------------- Validation / config --------------------------
@@ -3942,6 +4019,11 @@ class BidGUI(QMainWindow):
         requested_dates = self._get_requested_dates_for_scoring()
         if not requested_dates:
             requested_dates = None
+
+        (
+            requested_days_off_dates,
+            requested_days_off_ranges,
+        ) = split_requested_day_entries(requested_date_entries)
 
         training_start = validate_date_or_blank(self.training_start_entry.text(), "Training start")
         training_end = validate_date_or_blank(self.training_end_entry.text(), "Training end")
@@ -3972,6 +4054,8 @@ class BidGUI(QMainWindow):
             "vacation_ranges": vacation_ranges,
             "requested_date_entries": requested_date_entries,
             "requested_dates": requested_dates,
+            "requested_days_off_dates": requested_days_off_dates,
+            "requested_days_off_ranges": requested_days_off_ranges,
             "training_start": training_start,
             "training_end": training_end,
             "hourly_rate": hourly_rate,
@@ -4136,15 +4220,30 @@ class BidGUI(QMainWindow):
         ):
             button.setEnabled(not busy)
 
+        # Avoid QProgressBar's native indeterminate animation on Windows.  That
+        # animation creates a transient native paint surface on some systems and
+        # is the source of the white rectangle seen when a refresh begins.
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         if busy:
-            self.progress.setRange(0, 0)
+            self.progress.setFormat("Working…")
         else:
-            self.progress.setRange(0, 100)
-            self.progress.setValue(0)
+            self.progress.setFormat("%p%")
             if self.preference_refresh_pending:
                 QTimer.singleShot(120, self._refresh_after_preference_change)
             elif self.bid_regeneration_pending:
                 QTimer.singleShot(120, self._regenerate_bid_string_after_change)
+
+    def _finish_worker_ui(self) -> None:
+        """Finish a worker without repainting controls for quiet auto-updates."""
+        if self._active_worker_show_busy:
+            self._set_busy(False)
+        else:
+            if self.preference_refresh_pending:
+                QTimer.singleShot(120, self._refresh_after_preference_change)
+            elif self.bid_regeneration_pending:
+                QTimer.singleShot(120, self._regenerate_bid_string_after_change)
+        self._active_worker_show_busy = False
 
     def _log(self, message: str) -> None:
         self.message_queue.put(("log", message))
@@ -4175,7 +4274,7 @@ class BidGUI(QMainWindow):
             if event == "log":
                 self._write_log(str(payload))
             elif event == "error":
-                self._set_busy(False)
+                self._finish_worker_ui()
                 self.pdf_status_label.setText("Error. See status box below.")
                 self._write_log(f"ERROR: {payload}")
                 QMessageBox.critical(self, "Error", str(payload))
@@ -4184,7 +4283,7 @@ class BidGUI(QMainWindow):
             elif event == "bid_string_ready":
                 self._handle_bid_string_ready_payload(payload)
             elif event == "visualizer_ready":
-                self._set_busy(False)
+                self._finish_worker_ui()
                 if isinstance(payload, dict):
                     self.preview_df = payload.get("df")
                 try:
@@ -4200,30 +4299,46 @@ class BidGUI(QMainWindow):
             self._handle_trip_progress(latest_trip_progress)
 
     def _handle_loaded_payload(self, payload: Any) -> None:
-        self._set_busy(False)
+        self._finish_worker_ui()
         if isinstance(payload, dict):
             df = payload["df"]
             vacation_ranges = payload.get("vacation_ranges")
             show_ready_message = payload.get("show_ready_message", True)
             auto_regenerate = payload.get("auto_regenerate", True)
-            status_text = payload.get("status_text") or "PDFs loaded. Sorting columns are ready."
+            preference_revision = payload.get("preference_revision")
+            status_text = payload.get("status_text") or "PDFs loaded. Analyzer values are ready."
             log_text = payload.get("log_text") or "Loaded PDFs"
         else:
             df = payload
             vacation_ranges = None
             show_ready_message = True
             auto_regenerate = True
-            status_text = "PDFs loaded. Sorting columns are ready."
+            preference_revision = None
+            status_text = "PDFs loaded. Analyzer values are ready."
             log_text = "Loaded PDFs"
+
+        # A newer edit occurred while this background calculation was running.
+        # Ignore the stale result and let the coalesced refresh run once more.
+        if (
+            preference_revision is not None
+            and preference_revision != self._preference_revision
+        ):
+            self._write_log(
+                "Discarded an outdated analyzer refresh because preferences changed again."
+            )
+            if self.preference_refresh_pending:
+                QTimer.singleShot(150, self._refresh_after_preference_change)
+            return
 
         self.analysis_df = df
         self.analysis_vacation_ranges = vacation_ranges
         self.preview_df = df
-        columns = get_sortable_columns_from_df(df)
-        self._refresh_available_columns_list(columns)
-        self._clean_sort_order_for_columns(columns)
+        self._analysis_preferences_dirty = False
         self.pdf_status_label.setText(status_text)
-        self._write_log(f"{log_text} and prepared {len(columns)} sortable columns.")
+        self._write_log(
+            f"{log_text}. Sort by choices remain fixed at "
+            f"{len(DEFAULT_SORTABLE_COLUMNS)} supported columns."
+        )
 
         if show_ready_message:
             QMessageBox.information(
@@ -4238,7 +4353,7 @@ class BidGUI(QMainWindow):
             )
 
     def _handle_bid_string_ready_payload(self, payload: Any) -> None:
-        self._set_busy(False)
+        self._finish_worker_ui()
         if isinstance(payload, dict):
             revision = payload.get("revision")
             if revision is not None and revision != self._bid_state_revision:
@@ -4269,7 +4384,7 @@ class BidGUI(QMainWindow):
             self._copy_bid_string_to_clipboard()
 
     def _handle_exported_payload(self, payload: Any) -> None:
-        self._set_busy(False)
+        self._finish_worker_ui()
         if isinstance(payload, dict):
             output_path = payload.get("output_path")
             bid_string = str(payload.get("bid_string") or "")
@@ -4291,13 +4406,43 @@ class BidGUI(QMainWindow):
             self._write_log("Generated bid string: " + bid_string)
         self._show_export_complete_dialog(output_path)
 
-    def _start_worker(self, target: Callable[..., None], *args: Any) -> None:
-        if self.worker_thread and self.worker_thread.is_alive():
-            QMessageBox.warning(self, "Busy", "A job is already running.")
-            return
+    def _start_worker(
+        self,
+        target: Callable[..., None],
+        *args: Any,
+        show_busy: bool = True,
+        warn_if_busy: bool = True,
+    ) -> bool:
+        if (
+            self._worker_start_pending
+            or (self.worker_thread and self.worker_thread.is_alive())
+        ):
+            if warn_if_busy:
+                QMessageBox.warning(self, "Busy", "A job is already running.")
+            return False
 
-        self._set_busy(True)
-        self.worker_thread = threading.Thread(target=target, args=args, daemon=True)
+        self._active_worker_show_busy = bool(show_busy)
+        if show_busy:
+            self._set_busy(True)
+
+        self._worker_start_pending = True
+        QTimer.singleShot(
+            0,
+            lambda target=target, args=args: self._launch_worker(target, args),
+        )
+        return True
+
+    def _launch_worker(
+        self,
+        target: Callable[..., None],
+        args: tuple[Any, ...],
+    ) -> None:
+        self._worker_start_pending = False
+        self.worker_thread = threading.Thread(
+            target=target,
+            args=args,
+            daemon=True,
+        )
         self.worker_thread.start()
 
     def _open_file_with_default_app(self, file_path: str | Path) -> None:
@@ -4419,13 +4564,18 @@ class BidGUI(QMainWindow):
         self.bid_regeneration_pending = False
         self.bid_regeneration_copy_after = False
         self.bid_string_status_label.setText("Updating bid string...")
-        self._start_worker(
+        started = self._start_worker(
             self._bid_string_worker,
             inputs,
             copy_after,
             source_df,
             self._bid_state_revision,
+            show_busy=False,
+            warn_if_busy=False,
         )
+        if not started:
+            self.bid_regeneration_pending = True
+            self.bid_regeneration_timer.start(150)
 
     @staticmethod
     def _sort_analysis_dataframe(
@@ -4440,15 +4590,25 @@ class BidGUI(QMainWindow):
         sorting_settings = (
             inputs.get("sorting_settings") or DEFAULT_SORTING_SETTINGS
         )
-        df = drop_empty_sort_columns(df, check_all_columns=True)
-        return sort_dataframe_by_conditions(
+        valid_sort_order = [
+            rule for rule in sort_order
+            if rule and str(rule[0]) in df.columns
+        ]
+        if not valid_sort_order:
+            return drop_empty_sort_columns(df, check_all_columns=True)
+
+        # Sort first. A fixed Sort by option may legitimately contain all zeros
+        # for the current bid; dropping empty columns before sorting would make
+        # that otherwise valid selection raise a missing-column error.
+        df = sort_dataframe_by_conditions(
             df,
-            sort_order,
+            valid_sort_order,
             default_mode=sorting_settings["default_mode"],
             weighting_style=sorting_settings["weighting_style"],
             soft_max_weight=sorting_settings["soft_max_weight"],
             soft_min_weight=sorting_settings["soft_min_weight"],
         )
+        return drop_empty_sort_columns(df, check_all_columns=True)
 
     def _cached_analysis_snapshot(
         self,
@@ -4457,6 +4617,7 @@ class BidGUI(QMainWindow):
         current_key = (inputs["trips_pdf_path"], inputs["lines_pdf_path"])
         if (
             self.analysis_df is None
+            or self._analysis_preferences_dirty
             or not self.analysis_pipeline.has_cached_pdf_data_for(*current_key)
         ):
             return None, None
@@ -4550,7 +4711,13 @@ class BidGUI(QMainWindow):
         self._clear_bid_string("PDFs are loading. The bid string will generate automatically.")
         self._reset_trip_progress("Trips extraction progress: waiting to start...")
         self._last_trip_progress_percent = -1
-        self._start_worker(self._load_worker, inputs, True, True)
+        self._start_worker(
+            self._load_worker,
+            inputs,
+            True,
+            True,
+            self._preference_revision,
+        )
 
     def export_excel(self) -> None:
         try:
@@ -4641,6 +4808,7 @@ class BidGUI(QMainWindow):
         inputs: dict[str, Any],
         show_ready_message: bool = True,
         auto_regenerate: bool = True,
+        preference_revision: int | None = None,
     ) -> None:
         try:
             df, vacation_ranges = self.analysis_pipeline.build_dataframe(
@@ -4658,6 +4826,7 @@ class BidGUI(QMainWindow):
                     if show_ready_message
                     else "Analyzer refreshed. Sorting columns are ready.",
                     "log_text": "Loaded PDFs" if show_ready_message else "Refreshed analyzer",
+                    "preference_revision": preference_revision,
                 },
             ))
         except Exception as exc:
@@ -4709,6 +4878,7 @@ class BidGUI(QMainWindow):
         training_end = payload.get("training_end")
         vacation_ranges = payload.get("vacation_ranges") or []
         requested_days_off_dates = payload.get("requested_days_off_dates") or []
+        requested_days_off_ranges = payload.get("requested_days_off_ranges") or []
 
         viewer_class = self._get_bid_spreadsheet_viewer_class()
 
@@ -4719,7 +4889,8 @@ class BidGUI(QMainWindow):
                 training_start=training_start,
                 training_end=training_end,
                 vacation_ranges=vacation_ranges,
-                requested_days_off_dates= requested_days_off_dates,
+                requested_days_off_dates=requested_days_off_dates,
+                requested_days_off_ranges=requested_days_off_ranges,
             )
         except TypeError:
             # Fallback for a QWidget-based viewer that expects parent=None and a later load_dataframe call.
@@ -4733,7 +4904,8 @@ class BidGUI(QMainWindow):
                 training_start=training_start,
                 training_end=training_end,
                 vacation_ranges=vacation_ranges,
-                requested_days_off_dates= requested_days_off_dates,
+                requested_days_off_dates=requested_days_off_dates,
+                requested_days_off_ranges=requested_days_off_ranges,
             )
 
         if isinstance(viewer_window, QWidget):
@@ -4772,7 +4944,8 @@ class BidGUI(QMainWindow):
                     "training_start": inputs["training_start"],
                     "training_end": inputs["training_end"],
                     "vacation_ranges": vacation_ranges,
-                    "requested_days_off_dates": inputs["requested_dates"],
+                    "requested_days_off_dates": inputs["requested_days_off_dates"],
+                    "requested_days_off_ranges": inputs["requested_days_off_ranges"],
                 },
             ))
         except Exception as exc:
@@ -4804,7 +4977,8 @@ class BidGUI(QMainWindow):
                 training_start=inputs["training_start"],
                 training_end=inputs["training_end"],
                 vacation_ranges=new_vacation_ranges,
-                requested_days_off_dates=inputs["requested_dates"],
+                requested_days_off_dates=inputs["requested_days_off_dates"],
+                requested_days_off_ranges=inputs["requested_days_off_ranges"],
             )
 
             self.message_queue.put((
@@ -4856,6 +5030,17 @@ class BidGUI(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    saved = load_saved_config()
+    percent = normalize_ui_scale_percent(
+        saved.get("ui_scale_percent", DEFAULT_UI_SCALE_PERCENT)
+    )
+    app.setProperty("ups_ui_scale_percent", percent)
+    app.setProperty("ups_ui_scale_initialized", True)
+    font = app.font()
+    base_point_size = font.pointSizeF() if font.pointSizeF() > 0 else 10.0
+    font.setPointSizeF(base_point_size * percent / 100.0)
+    app.setFont(font)
+
     window = BidGUI()
     window.show()
     sys.exit(app.exec())

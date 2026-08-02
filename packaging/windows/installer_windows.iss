@@ -9,7 +9,7 @@
 ; ============================================================
 
 #define MyAppName "UPS Bid Analyzer"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.1.0"
 #define MyAppPublisher "Jerome Leluc"
 #define MyAppExeName "Bid_Analyzer.exe"
 
