@@ -163,11 +163,19 @@ def make_trip_crops(page):
 
 def split_route(route_raw):
     """
+    Splits a route into departure, arrival, and any route-specific flags.
+
     Examples:
         SDF-PHL         -> departure SDF, arrival PHL, route_flags []
-        SDF-IRO-PHL     -> departure SDF, arrival PHL, route_flags ['IRO']
         SDF-BDL(C)      -> departure SDF, arrival BDL, route_flags ['C']
-        SDF-IRO-BDL(C)  -> departure SDF, arrival BDL, route_flags ['IRO', 'C']
+
+    Note:
+        IRO is not part of route_raw. In the Trips PDF it appears as a
+        separate token after the route, for example:
+
+            SDF-CGN IRO
+
+        parse_flight_line() detects that token and stores it in route_flags.
     """
     parts = route_raw.split("-")
 
@@ -175,10 +183,6 @@ def split_route(route_raw):
     route_flags = []
 
     for part in parts:
-        if part == "IRO":
-            route_flags.append("IRO")
-            continue
-
         # Handles airport with parenthetical flag, like BDL(C)
         match = re.match(r"^([A-Z]{3})(?:\(([A-Z]+)\))?$", part)
 
@@ -201,14 +205,30 @@ def split_route(route_raw):
 
 def parse_flight_line(line):
     """
-    Extracts only:
-    - flight
-    - route_raw
-    - departure
-    - arrival
-    - route_flags, such as IRO
-    - start
-    - end
+    Extracts:
+        - flight
+        - route_raw
+        - departure
+        - arrival
+        - route_flags
+        - start
+        - end
+
+    IRO is treated as a route flag and is expected after the route,
+    separated by whitespace.
+
+    Examples:
+        201 SDF-CGN IRO ...
+            route_raw   = "SDF-CGN"
+            departure   = "SDF"
+            arrival     = "CGN"
+            route_flags = ["IRO"]
+
+        340 SDF-SJU ...
+            route_raw   = "SDF-SJU"
+            departure   = "SDF"
+            arrival     = "SJU"
+            route_flags = []
     """
 
     match = re.match(r"^\d+\s+\([^)]*\)[A-Za-z]{0,2}\s+(.*)$", line)
@@ -218,8 +238,15 @@ def parse_flight_line(line):
 
     body = match.group(1)
 
+    # Route examples:
+    #     SDF-CGN
+    #     DFW-CDG
+    #     SDF-BDL(C)
+    #
+    # IRO is intentionally NOT included in this match because it is a
+    # separate flag printed after the route.
     route_match = re.search(
-        r"[A-Z]{3}(?:\([A-Z]\))?(?:-(?:IRO|[A-Z]{3}(?:\([A-Z]\))?))+",
+        r"[A-Z]{3}(?:\([A-Z]\))?(?:-[A-Z]{3}(?:\([A-Z]\))?)+",
         body,
     )
 
@@ -230,6 +257,18 @@ def parse_flight_line(line):
     route_raw = route_match.group(0)
     after_route = body[route_match.end():].strip()
 
+    departure, arrival, route_flags = split_route(route_raw)
+
+    # IRO appears as a separate token immediately after the route:
+    #     SDF-CGN IRO
+    #
+    # Save it in route_flags, then remove it before parsing the times.
+    iro_match = re.match(r"^IRO(?:\s+|$)", after_route)
+
+    if iro_match:
+        route_flags.append("IRO")
+        after_route = after_route[iro_match.end():].strip()
+
     time_match = re.match(
         rf"(?P<start>{TIME_RE})\s+(?P<end>{TIME_RE})",
         after_route,
@@ -237,8 +276,6 @@ def parse_flight_line(line):
 
     if not time_match:
         return None
-
-    departure, arrival, route_flags = split_route(route_raw)
 
     return {
         "flight": flight,
@@ -249,7 +286,6 @@ def parse_flight_line(line):
         "start": clean_time(time_match.group("start")),
         "end": clean_time(time_match.group("end")),
     }
-
 
 def parse_trip_text(text):
     """
