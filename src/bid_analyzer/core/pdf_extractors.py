@@ -218,7 +218,8 @@ def parse_flight_line(line):
     separated by whitespace.
 
     Examples:
-        201 SDF-CGN IRO ...
+        1 (Mo)Mo 201 SDF-CGN IRO ...
+        10(We)Tu 067 SGN-HKG IRO ...
             route_raw   = "SDF-CGN"
             departure   = "SDF"
             arrival     = "CGN"
@@ -231,7 +232,7 @@ def parse_flight_line(line):
             route_flags = []
     """
 
-    match = re.match(r"^\d+\s+\([^)]*\)[A-Za-z]{0,2}\s+(.*)$", line)
+    match = re.match(r"^\d+\s*\([^)]*\)[A-Za-z]{0,2}\s+(.*)$", line)
 
     if not match:
         return None

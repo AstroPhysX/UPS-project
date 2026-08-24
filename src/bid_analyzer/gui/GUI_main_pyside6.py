@@ -127,6 +127,7 @@ DEFAULT_SORTABLE_COLUMNS = [
     "% South American Destinations",
     "% Weekends Off",
     "% of Days Off Requested",
+    "% of IRO",
     "Pay",
     "Tax-Free Pay",
     "Start bid off",

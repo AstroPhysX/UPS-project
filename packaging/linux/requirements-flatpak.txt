@@ -1,0 +1,5 @@
+# PySide6 and shiboken6 are supplied by io.qt.PySide.BaseApp.
+# The generator resolves and locks all transitive dependencies.
+pandas
+pdfplumber
+openpyxl

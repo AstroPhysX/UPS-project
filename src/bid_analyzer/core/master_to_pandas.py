@@ -465,6 +465,7 @@ def master_lines_to_dataframe(
             "% South American Destinations": line_data.get("pct_dest_SA",math.nan),
             "% Weekends Off": line_data.get("pct_weekends_off",0),
             r"% of Days Off Requested": line_data.get("pct_requested_days_off",0),
+            r"% of IRO": line_data.get("pct_iro",0),
             "Pay": line_data.get("tot_pay",0),
             "Tax-Free Pay":line_data.get("pay_per_diem")
         })
@@ -475,20 +476,6 @@ def master_lines_to_dataframe(
         if include_end_bid_off:
             row.update({"End bid off":line_data.get("bid_end_days_off",0)})
 
-        """
-        row = {
-            "Line Number": line_number,
-            "Extra Vacation Days": line_data.get("extra_vacation_days", 0),
-            "Training": line_data.get("training_fit_score", 0),
-            "Blockiness": line_data.get("blockiness_score", 0),
-            "Total DO": line_data.get("tot_DO", 0),
-            "% tickets paid": line_data.get("company_ticket_pct", 0),
-            "Premium": line_data.get("tot_premium")
-        }
-
-        for d in bid_dates:
-            row[d.strftime(date_col_format)] = date_values[d]
-        """
         rows.append(row)
 
     return pd.DataFrame(rows).sort_values("Line Number").reset_index(drop=True)

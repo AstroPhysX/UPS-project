@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=UPS Bid Analyzer
+GenericName=Flight Bid Analyzer
+Comment=Analyze, rank, visualize, and export UPS bid lines
+Exec=io.github.aleluc.BidAnalyzer
+Icon=io.github.aleluc.BidAnalyzer
+Terminal=false
+Categories=Office;Utility;
+Keywords=UPS;pilot;bid;lines;trips;schedule;PDF;Excel;
+StartupNotify=true

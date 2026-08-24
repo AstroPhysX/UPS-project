@@ -98,6 +98,210 @@ def to_date(value):
         return datetime.strptime(value, "%Y-%m-%d").date()
 
 #Blockiness score using Red flag without category scores--------------------------------------------------------------------------------------------------------------------------------------
+def collect_line_trip_blocks_for_gap_check(line):
+    """
+    Collects all trip blocks across the whole line, not just inside one PP.
+    This allows us to detect PP1 -> PP2 touching-trip gaps.
+    """
+
+    trip_blocks = []
+
+    for pp_index, pp in enumerate(line["PPs"]):
+        pp_name = pp.get("pp", f"PP{pp_index + 1}")
+
+        for assignment in pp.get("assignments", []):
+            if "flights" not in assignment:
+                continue
+
+            trip_start_dt = parse_master_datetime(assignment.get("trip_start"))
+            trip_end_dt = parse_master_datetime(assignment.get("trip_end"))
+
+            if trip_start_dt is None and assignment.get("flights"):
+                trip_start_dt = parse_master_datetime(
+                    assignment["flights"][0].get("start_datetime")
+                )
+
+            if trip_end_dt is None and assignment.get("flights"):
+                trip_end_dt = parse_master_datetime(
+                    assignment["flights"][-1].get("end_datetime")
+                )
+
+            if trip_start_dt is None or trip_end_dt is None:
+                continue
+
+            trip_blocks.append({
+                "pp": pp_name,
+                "pp_index": pp_index,
+                "trip_id": assignment.get("trip_id"),
+
+                "start_date": trip_start_dt.date(),
+                "end_date": trip_end_dt.date(),
+
+                "start_datetime": trip_start_dt.isoformat(timespec="minutes"),
+                "end_datetime": trip_end_dt.isoformat(timespec="minutes"),
+
+                "days_gone": (trip_end_dt.date() - trip_start_dt.date()).days + 1,
+            })
+
+    return sorted(
+        trip_blocks,
+        key=lambda block: parse_master_datetime(block["start_datetime"])
+    )
+
+def calculate_cross_pp_touching_trip_gap_penalty(
+    line_trip_blocks,
+    max_touching_trip_gap_hours=8,
+    penalty_per_extra_hour=1.5,
+    max_penalty_per_gap=25,
+):
+    """
+    Penalizes touching-trip gaps that cross from one PP to another.
+
+    This catches cases like:
+        PP1 trip ends Oct 3 at 17:55
+        PP2 trip starts Oct 4 at 15:47
+
+    The normal PP-by-PP scoring cannot see that pair.
+    """
+
+    penalty = 0
+
+    for i in range(1, len(line_trip_blocks)):
+        previous_block = line_trip_blocks[i - 1]
+        next_block = line_trip_blocks[i]
+
+        # Only this helper handles cross-PP pairs.
+        # Same-PP pairs are already handled inside the PP scoring logic.
+        if previous_block["pp_index"] == next_block["pp_index"]:
+            continue
+
+        calendar_days_off = (
+            next_block["start_date"] - previous_block["end_date"]
+        ).days - 1
+
+        if calendar_days_off > 0:
+            continue
+
+        gap_hours = hours_between_work_blocks(
+            previous_block,
+            next_block
+        )
+
+        if gap_hours is None:
+            continue
+
+        if gap_hours > max_touching_trip_gap_hours:
+            extra_hours = gap_hours - max_touching_trip_gap_hours
+            gap_penalty = extra_hours * penalty_per_extra_hour
+            gap_penalty = min(gap_penalty, max_penalty_per_gap)
+
+            penalty += gap_penalty
+
+    return penalty
+
+def parse_master_datetime(value):
+    """
+    Parses datetime strings stored in master_lines.
+
+    Expected:
+        '2026-09-06T12:03'
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+def hours_between_work_blocks(previous_block, next_block):
+    """
+    Returns the actual hour gap between two trip/work blocks.
+
+    Uses:
+        previous_block["end_datetime"]
+        next_block["start_datetime"]
+
+    Returns None if either datetime is missing.
+    """
+    previous_end = parse_master_datetime(previous_block.get("end_datetime"))
+    next_start = parse_master_datetime(next_block.get("start_datetime"))
+
+    if previous_end is None or next_start is None:
+        return None
+
+    gap_hours = (next_start - previous_end).total_seconds() / 3600
+
+    if gap_hours < 0:
+        return None
+
+    return gap_hours
+
+def calculate_touching_trip_gap_penalty(
+    work_blocks,
+    max_touching_trip_gap_hours=24,
+    penalty_per_extra_hour=0.75,
+    max_penalty_per_gap=25,
+):
+    """
+    Penalizes adjacent trips that look connected by calendar dates
+    but have a large actual hour gap between them.
+
+    Example:
+        Trip 1 ends Monday 04:00
+        Trip 2 starts Tuesday 22:00
+
+    Date-based logic says:
+        0 full days off
+
+    But actual gap is:
+        42 hours
+
+    If max_touching_trip_gap_hours = 24:
+        penalty is based on 18 extra hours.
+    """
+
+    penalty = 0
+
+    work_blocks = sorted(
+        work_blocks,
+        key=lambda block: block["start_date"]
+    )
+
+    for i in range(1, len(work_blocks)):
+        previous_block = work_blocks[i - 1]
+        next_block = work_blocks[i]
+
+        calendar_days_off = (
+            next_block["start_date"] - previous_block["end_date"]
+        ).days - 1
+
+        # Only apply this penalty when the calendar says the trips are
+        # touching or nearly touching with no full off day.
+        if calendar_days_off > 0:
+            continue
+
+        gap_hours = hours_between_work_blocks(
+            previous_block,
+            next_block
+        )
+
+        if gap_hours is None:
+            continue
+
+        if gap_hours > max_touching_trip_gap_hours:
+            extra_hours = gap_hours - max_touching_trip_gap_hours
+
+            gap_penalty = extra_hours * penalty_per_extra_hour
+            gap_penalty = min(gap_penalty, max_penalty_per_gap)
+
+            penalty += gap_penalty
+
+    return penalty
+
 def weighted_block_average(lengths):
     """
     Rewards larger blocks.
@@ -141,15 +345,21 @@ def block_quality(lengths):
 
     return (weighted * harmonic) ** 0.5
 
-def merge_touching_work_blocks(work_blocks):
+def merge_touching_work_blocks(
+    work_blocks,
+    max_touching_trip_gap_hours=None,
+):
     """
-    Merges work blocks that have no real day off between them.
+    Merges work blocks that have no real full day off between them.
 
-    Example:
-        5 on, 0 off, 2 on
-        becomes:
-        7 on
+    New behavior:
+        If two trip blocks are touching by date, but the actual hour gap
+        is larger than max_touching_trip_gap_hours, do NOT merge them.
+
+    This lets the blockiness score notice awkward large gaps between
+    back-to-back trips.
     """
+
     if not work_blocks:
         return []
 
@@ -164,7 +374,18 @@ def merge_touching_work_blocks(work_blocks):
             block["start_date"] - previous["end_date"]
         ).days - 1
 
-        if days_off_between <= 0:
+        should_merge = days_off_between <= 0
+
+        if should_merge and max_touching_trip_gap_hours is not None:
+            gap_hours = hours_between_work_blocks(previous, block)
+
+            if (
+                gap_hours is not None
+                and gap_hours > max_touching_trip_gap_hours
+            ):
+                should_merge = False
+
+        if should_merge:
             previous["end_date"] = max(
                 previous["end_date"],
                 block["end_date"]
@@ -173,6 +394,14 @@ def merge_touching_work_blocks(work_blocks):
             previous["days_gone"] = (
                 previous["end_date"] - previous["start_date"]
             ).days + 1
+
+            previous_end_dt = parse_master_datetime(previous.get("end_datetime"))
+            block_end_dt = parse_master_datetime(block.get("end_datetime"))
+
+            if previous_end_dt is None or (
+                block_end_dt is not None and block_end_dt > previous_end_dt
+            ):
+                previous["end_datetime"] = block.get("end_datetime")
 
         else:
             merged.append(block.copy())
@@ -300,6 +529,9 @@ def add_blockiness_scores(
     vto_fixed_score=10,
     vor_fixed_score=0,
     round_to_nearest=5,
+    max_touching_trip_gap_hours=8,
+    touching_trip_gap_penalty_per_hour=1,
+    max_touching_trip_gap_penalty=25,
 ):
     """
     Adds:
@@ -333,6 +565,15 @@ def add_blockiness_scores(
 
         pp_scores = []
 
+        line_trip_blocks = collect_line_trip_blocks_for_gap_check(line)
+
+        cross_pp_touching_trip_gap_penalty = calculate_cross_pp_touching_trip_gap_penalty(
+            line_trip_blocks,
+            max_touching_trip_gap_hours=max_touching_trip_gap_hours,
+            penalty_per_extra_hour=touching_trip_gap_penalty_per_hour,
+            max_penalty_per_gap=max_touching_trip_gap_penalty,
+        )
+
         for pp_index, pp in enumerate(line["PPs"]):
 
             pp_name = pp.get("pp", f"PP{pp_index + 1}")
@@ -364,9 +605,14 @@ def add_blockiness_scores(
                     trip_start = min(start_dates)
                     trip_end = max(end_dates)
 
+                    trip_start_dt = parse_master_datetime(assignment.get("trip_start"))
+                    trip_end_dt = parse_master_datetime(assignment.get("trip_end"))
+
                     trip_blocks.append({
                         "start_date": trip_start,
                         "end_date": trip_end,
+                        "start_datetime": assignment.get("trip_start"),
+                        "end_datetime": assignment.get("trip_end"),
                         "days_gone": (trip_end - trip_start).days + 1,
                     })
 
@@ -445,7 +691,17 @@ def add_blockiness_scores(
             # --------------------------------------------------------
             # No work blocks
             # --------------------------------------------------------
-            work_blocks = merge_touching_work_blocks(work_blocks)
+            touching_trip_gap_penalty = calculate_touching_trip_gap_penalty(
+                work_blocks,
+                max_touching_trip_gap_hours=max_touching_trip_gap_hours,
+                penalty_per_extra_hour=touching_trip_gap_penalty_per_hour,
+                max_penalty_per_gap=max_touching_trip_gap_penalty,
+            )
+
+            work_blocks = merge_touching_work_blocks(
+                work_blocks,
+                max_touching_trip_gap_hours=max_touching_trip_gap_hours,
+            )
             work_blocks.sort(key=lambda block: block["start_date"])
 
             if not work_blocks:
@@ -507,6 +763,8 @@ def add_blockiness_scores(
                 internal_off_gaps=internal_off_gaps,
             )
 
+            penalty += touching_trip_gap_penalty
+
             pp_score = raw_bonus - penalty
 
             # Keep score controlled.
@@ -521,6 +779,10 @@ def add_blockiness_scores(
             blockiness_score = sum(pp_scores) / len(pp_scores)
         else:
             blockiness_score = 0
+
+        # Apply cross-PP penalty after the PP scores are averaged.
+        blockiness_score -= cross_pp_touching_trip_gap_penalty
+        blockiness_score = max(0, blockiness_score)
 
         bucketed_blockiness_score = int(blockiness_score // round_to_nearest) * round_to_nearest
 
@@ -1359,12 +1621,19 @@ def line_numbers_to_bid_string(df, number_of_lines, column="Line Number"):
     Takes the first `number_of_lines` entries from the line number column
     and returns a compressed bid string.
 
-    Example:
+    Rules:
+        - Single numbers stay unchanged.
+        - Two consecutive numbers stay separate.
+        - Three or more consecutive numbers are compressed with "=".
+
+    Examples:
         [3, 5, 1, 7, 8, 9, 10, 19]
         -> "3 5 1 7=10 19"
+
+        [3, 4, 8, 9, 10]
+        -> "3 4 8=10"
     """
 
-    # Get only the requested number of line numbers
     line_numbers = (
         df[column]
         .head(number_of_lines)
@@ -1377,27 +1646,47 @@ def line_numbers_to_bid_string(df, number_of_lines, column="Line Number"):
         return ""
 
     parts = []
+
     start = line_numbers[0]
     previous = line_numbers[0]
 
     for number in line_numbers[1:]:
-        if number == previous + 2:
-            # Continue the current range
+
+        # Continue a consecutive sequence
+        if number == previous + 1:
             previous = number
+            continue
+
+        # Close the previous sequence
+        sequence_length = previous - start + 1
+
+        if sequence_length == 1:
+            # Single number
+            parts.append(str(start))
+
+        elif sequence_length == 2:
+            # Consecutive pair: keep both numbers separate
+            parts.append(str(start))
+            parts.append(str(previous))
+
         else:
-            # Close the previous range
-            if start == previous:
-                parts.append(str(start))
-            else:
-                parts.append(f"{start}={previous}")
+            # 3+ consecutive numbers: compress into a range
+            parts.append(f"{start}={previous}")
 
-            # Start a new range
-            start = number
-            previous = number
+        # Start a new sequence
+        start = number
+        previous = number
 
-    # Close the final range
-    if start == previous:
+    # Close the final sequence
+    sequence_length = previous - start + 1
+
+    if sequence_length == 1:
         parts.append(str(start))
+
+    elif sequence_length == 2:
+        parts.append(str(start))
+        parts.append(str(previous))
+
     else:
         parts.append(f"{start}={previous}")
 
@@ -3136,3 +3425,57 @@ def add_weekends_off_percentage(
             line_data["weekends_worked_count"] = weekends_worked
             line_data["weekends_ignored_count"] = weekends_ignored
             line_data["weekends_counted"] = weekends_counted
+
+#% IRO
+def add_iro_percentage(master_lines):
+    """
+    Adds the percentage of eligible flight legs flown as IRO to each line.
+
+    Excludes:
+        - Deadhead flights
+        - SBA / SBG assignments
+
+    Adds:
+        pct_iro
+    """
+
+    for line in master_lines.values():
+        total_flights = 0
+        iro_flights = 0
+
+        for pp in line.get("PPs", []):
+            for assignment in pp.get("assignments", []):
+
+                for flight in assignment.get("flights", []):
+                    route_flags = flight.get("route_flags", []) or []
+                    code = flight.get("code")
+
+                    # SBA / SBG aren't normal flight legs.
+                    if code and (
+                        str(code).upper().startswith("SBA")
+                        or str(code).upper().startswith("SBG")
+                    ):
+                        continue
+
+                    # Deadheads aren't operating flight legs.
+                    if any(
+                        str(flag).upper().startswith("DH ")
+                        for flag in route_flags
+                    ):
+                        continue
+
+                    total_flights += 1
+
+                    if "IRO" in {
+                        str(flag).upper()
+                        for flag in route_flags
+                    }:
+                        iro_flights += 1
+
+        if total_flights > 0:
+            line["pct_iro"] = round(
+                (iro_flights / total_flights) * 100,
+                1
+            )
+        else:
+            line["pct_iro"] = 0.0

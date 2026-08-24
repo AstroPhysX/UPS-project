@@ -585,6 +585,9 @@ class AnalysisPipeline:
             self._log("Adding company-ticket percentages...")
             pf.add_company_ticket_percentages(static_master_lines)
 
+            self._log("Adding IRO percentages...")
+            pf.add_iro_percentage(static_master_lines)
+
             self._log("Adding complete-weekends-off percentages...")
             pf.add_weekends_off_percentage(static_master_lines)
 

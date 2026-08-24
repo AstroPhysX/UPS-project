@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.aleluc.BidAnalyzer</id>
+  <name>UPS Bid Analyzer</name>
+  <summary>Analyze and rank UPS pilot bid lines</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+
+  <developer id="io.github.aleluc">
+    <name>Jerome Leluc</name>
+  </developer>
+
+  <description>
+    <p>
+      UPS Bid Analyzer imports UPS Trips and Lines PDF reports, combines their
+      scheduling data, applies pilot preferences, ranks bid lines, provides an
+      interactive visualizer, generates a bid string, and exports results to
+      Microsoft Excel format.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">io.github.aleluc.BidAnalyzer.desktop</launchable>
+
+  <categories>
+    <category>Office</category>
+    <category>Utility</category>
+  </categories>
+
+  <releases>
+    <release version="1.0.0" date="2026-08-02"/>
+  </releases>
+
+  <content_rating type="oars-1.1"/>
+</component>
