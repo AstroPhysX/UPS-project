@@ -1056,6 +1056,49 @@ def parse_pp(words, pp_anchor, bid_start):
             "index": i,
             "date": actual_date.isoformat(),
             "center": word_center(date_word),
+            "overflow": False,
+        })
+
+    # UPS sometimes prints a trip that starts on the Sunday immediately
+    # following the 28-day PP in the narrow "-" column at the far right
+    # of the preceding PP row.  The trip bar then continues in the next PP,
+    # but the trip number itself may NOT be repeated there.
+    #
+    # Example from bid period 2606, SDF line 18:
+    #     trip 1300 is printed just after Sat 03 and starts Sun 04 at 0600.
+    #
+    # The normal 28 date headers do not include that Sunday, so the old
+    # parser rejected the trip number as being too far to the right.
+    #
+    # Add one synthetic date column using the normal calendar-column spacing.
+    # Intentionally add ONLY one overflow day.  The PDF also shows the next
+    # Monday as visual context, but trips there are normally repeated in the
+    # next PP row; including it here would create duplicates.
+    centers = [col["center"] for col in columns]
+    spacings = [
+        centers[i + 1] - centers[i]
+        for i in range(len(centers) - 1)
+        if centers[i + 1] > centers[i]
+    ]
+
+    if spacings:
+        sorted_spacings = sorted(spacings)
+        mid = len(sorted_spacings) // 2
+
+        if len(sorted_spacings) % 2:
+            column_spacing = sorted_spacings[mid]
+        else:
+            column_spacing = (
+                sorted_spacings[mid - 1] + sorted_spacings[mid]
+            ) / 2
+
+        overflow_index = len(columns)
+
+        columns.append({
+            "index": overflow_index,
+            "date": (pp_start + timedelta(days=overflow_index)).isoformat(),
+            "center": centers[-1] + column_spacing,
+            "overflow": True,
         })
 
     assignment_words = find_assignment_words(
@@ -1164,6 +1207,60 @@ def parse_line_report_page(page, bid_start, domicile):
 
         for pp_anchor in pp_anchors:
             pp_data.append(parse_pp(block_words, pp_anchor, bid_start))
+
+        # A trip printed in PP1's synthetic overflow-Sunday column actually
+        # starts on the first day of PP2.  Move that assignment into PP2 so
+        # downstream code sees it in the pay period that contains its date.
+        #
+        # Do this after both rows have been parsed because the trip number may
+        # exist only in the PP1 overflow even though its green trip bar is
+        # drawn in PP2 (for example SDF line 18 / trip 1300).
+        if len(pp_data) >= 2:
+            pp2_start = bid_start + timedelta(days=28)
+            pp2_start_iso = pp2_start.isoformat()
+
+            spill_to_pp2 = [
+                assignment
+                for assignment in pp_data[0]["assignments"]
+                if assignment["date"] >= pp2_start_iso
+            ]
+
+            if spill_to_pp2:
+                pp_data[0]["assignments"] = [
+                    assignment
+                    for assignment in pp_data[0]["assignments"]
+                    if assignment["date"] < pp2_start_iso
+                ]
+
+                existing_pp2 = {
+                    (
+                        assignment.get("date"),
+                        assignment.get("type"),
+                        assignment.get("value"),
+                        assignment.get("start_time"),
+                    )
+                    for assignment in pp_data[1]["assignments"]
+                }
+
+                for assignment in spill_to_pp2:
+                    key = (
+                        assignment.get("date"),
+                        assignment.get("type"),
+                        assignment.get("value"),
+                        assignment.get("start_time"),
+                    )
+
+                    if key not in existing_pp2:
+                        pp_data[1]["assignments"].append(assignment)
+                        existing_pp2.add(key)
+
+                pp_data[1]["assignments"].sort(
+                    key=lambda assignment: (
+                        assignment.get("date", ""),
+                        assignment.get("start_time") or "",
+                        str(assignment.get("value", "")),
+                    )
+                )
 
         parsed_lines.append({
             "line_number": line_block["line_number"],

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=UPS Bid Analyzer
+Comment=Analyze and rank UPS bid lines
+Exec=com.upsbidanalyzer.BidAnalyzer
+Icon=com.upsbidanalyzer.BidAnalyzer
+Terminal=false
+Categories=Utility;
+StartupNotify=true

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=UPS Bid Analyzer
+Comment=Analyze and rank UPS bid lines
+Exec=io.github.aleluc.BidAnalyzer
+Icon=io.github.aleluc.BidAnalyzer
+Terminal=false
+Categories=Utility;
+StartupNotify=true

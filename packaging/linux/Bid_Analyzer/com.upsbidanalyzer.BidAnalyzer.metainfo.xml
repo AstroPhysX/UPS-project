@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.upsbidanalyzer.BidAnalyzer</id>
+  <name>UPS Bid Analyzer</name>
+  <summary>Analyze and rank UPS bid lines</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+
+  <developer id="upsbidanalyzer">
+    <name>UPS Bid Analyzer Project</name>
+  </developer>
+
+  <description>
+    <p>Desktop application for analyzing and ranking UPS bid lines.</p>
+  </description>
+
+  <launchable type="desktop-id">com.upsbidanalyzer.BidAnalyzer.desktop</launchable>
+
+  <releases>
+    <release version="1.0.0" date="@BUILD_DATE@">
+      <description>
+        <p>Current UPS Bid Analyzer Flatpak build.</p>
+      </description>
+    </release>
+  </releases>
+</component>

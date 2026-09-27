@@ -134,7 +134,7 @@ ENV/
 env.bak/
 venv.bak/
 /ups-venv
-
+/packaging/linux/repo
 # Spyder project settings
 .spyderproject
 .spyproject
@@ -166,4 +166,11 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Flatpak generated files/cache
+packaging/linux/Bid_Analyzer/.flatpak-builder/
+packaging/linux/Bid_Analyzer/build-dir/
+packaging/linux/Bid_Analyzer/repo/
 
+# Locally generated installer
+packaging/linux/installer/*
+!packaging/linux/installer/.gitkeep

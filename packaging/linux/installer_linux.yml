@@ -1,0 +1,81 @@
+id: com.upsbidanalyzer.BidAnalyzer
+runtime: org.kde.Platform
+runtime-version: '6.11'
+sdk: org.kde.Sdk
+base: io.qt.PySide.BaseApp
+base-version: '6.11'
+command: com.upsbidanalyzer.BidAnalyzer
+
+build-options:
+  env:
+    - BASEAPP_REMOVE_WEBENGINE=1
+
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --filesystem=home
+  - --filesystem=/media
+  - --filesystem=/run/media
+
+cleanup-commands:
+  - /app/cleanup-BaseApp.sh
+
+modules:
+  - Bid_Analyzer/pypi-dependencies.json
+
+  - name: ups-bid-analyzer
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/lib/ups-bid-analyzer
+      - cp -a src /app/lib/ups-bid-analyzer/
+      - python3 -m compileall -q /app/lib/ups-bid-analyzer/src
+
+      - install -Dm755 packaging/linux/Bid_Analyzer/ups-bid-analyzer-launcher.sh /app/bin/com.upsbidanalyzer.BidAnalyzer
+      - install -Dm644 packaging/linux/Bid_Analyzer/com.upsbidanalyzer.BidAnalyzer.desktop /app/share/applications/com.upsbidanalyzer.BidAnalyzer.desktop
+
+      # Stamp the build date into AppStream metadata so Flatseal displays
+      # both Version and Last Updated.
+      - install -d /app/share/metainfo
+      - >-
+        BUILD_DATE="$(date -u +%Y-%m-%d)";
+        sed "s/@BUILD_DATE@/${BUILD_DATE}/g"
+        packaging/linux/Bid_Analyzer/com.upsbidanalyzer.BidAnalyzer.metainfo.xml
+        > /app/share/metainfo/com.upsbidanalyzer.BidAnalyzer.metainfo.xml
+
+      # Export a full hicolor icon set from the high-quality logo.png.
+      # The largest native-size copy is preserved whenever possible.
+      - >-
+        python3 -c 'from pathlib import Path; import shutil; from PySide6.QtCore import Qt; from PySide6.QtGui import QImage; srcp=Path("src/bid_analyzer/resources/logo.png"); img=QImage(str(srcp)); assert not img.isNull(), "Could not read logo.png"; w,h=img.width(),img.height(); assert w==h, f"logo.png must be square, got {w}x{h}"; assert w>=256, f"logo.png must be at least 256x256, got {w}x{h}"; sizes=[32,48,64,128,256,512]; sizes=[s for s in sizes if s<=w]; appid="com.upsbidanalyzer.BidAnalyzer"; [(Path(f"/app/share/icons/hicolor/{s}x{s}/apps").mkdir(parents=True,exist_ok=True), shutil.copy2(srcp, Path(f"/app/share/icons/hicolor/{s}x{s}/apps/{appid}.png")) if s==w else img.scaled(s,s,Qt.KeepAspectRatio,Qt.SmoothTransformation).save(f"/app/share/icons/hicolor/{s}x{s}/apps/{appid}.png","PNG")) for s in sizes]'
+
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - .git/*
+          - .idea
+          - .idea/*
+          - .vscode
+          - .vscode/*
+          - .pytest_cache
+          - .pytest_cache/*
+          - __pycache__
+          - '*.pyc'
+          - ups-venv
+          - ups-venv/*
+          - .venv
+          - .venv/*
+          - build
+          - build/*
+          - packaging/windows
+          - packaging/windows/*
+          - packaging/linux/installer
+          - packaging/linux/installer/*
+          - packaging/linux/Bid_Analyzer/.flatpak-builder
+          - packaging/linux/Bid_Analyzer/.flatpak-builder/*
+          - packaging/linux/Bid_Analyzer/build-dir
+          - packaging/linux/Bid_Analyzer/build-dir/*
+          - packaging/linux/Bid_Analyzer/repo
+          - packaging/linux/Bid_Analyzer/repo/*

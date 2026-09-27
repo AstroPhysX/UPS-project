@@ -6,6 +6,10 @@ rem UPS Bid Analyzer - Windows application and installer build
 rem
 rem File location:
 rem     packaging\windows\build_windows_with_installer.bat
+rem
+rem This script works both:
+rem   - locally on Windows
+rem   - inside GitHub Actions
 rem ============================================================
 
 set "WINDOWS_PACKAGING_DIR=%~dp0"
@@ -68,6 +72,12 @@ echo.
 echo Installer output:
 echo   %INSTALLER_DIR%
 echo.
+
+if /i "%GITHUB_ACTIONS%"=="true" (
+    echo Build environment:
+    echo   GitHub Actions
+    echo.
+)
 
 rem ------------------------------------------------------------
 rem Validate required files and tools.
@@ -136,6 +146,7 @@ if exist "%DIST_DIR%\%APP_NAME%" (
 if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 if not exist "%SPEC_DIR%" mkdir "%SPEC_DIR%"
+if not exist "%INSTALLER_DIR%" mkdir "%INSTALLER_DIR%"
 
 rem ------------------------------------------------------------
 rem Build the PyInstaller --onedir application.
@@ -201,9 +212,16 @@ echo Installer:
 echo   %INSTALLER_EXE%
 echo.
 
-start "" "%INSTALLER_DIR%"
+rem ------------------------------------------------------------
+rem Interactive local convenience only.
+rem GitHub Actions has no Explorer window and must never pause.
+rem ------------------------------------------------------------
 
-pause
+if /i not "%GITHUB_ACTIONS%"=="true" (
+    start "" "%INSTALLER_DIR%"
+    pause
+)
+
 exit /b 0
 
 
@@ -214,5 +232,10 @@ echo BUILD FAILED
 echo ============================================================
 echo Review the messages above for the cause.
 echo.
-pause
+
+rem Never pause an automated GitHub Actions runner.
+if /i not "%GITHUB_ACTIONS%"=="true" (
+    pause
+)
+
 exit /b 1

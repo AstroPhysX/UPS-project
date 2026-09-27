@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.aleluc.BidAnalyzer</id>
+  <name>UPS Bid Analyzer</name>
+  <summary>Analyze and rank UPS bid lines</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <description><p>Desktop application for analyzing and ranking UPS bid lines.</p></description>
+  <launchable type="desktop-id">io.github.aleluc.BidAnalyzer.desktop</launchable>
+</component>
